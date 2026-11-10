@@ -73,12 +73,21 @@ struct Settings {
     std::wstring srcTitle;
     bool hasRegion = false;
     RECT region{};         // virtual-screen coordinates, physical pixels
-    // webcam
-    int  view = 0;         // 0 = screen, 1 = webcam, 2 = screen + webcam in a corner
+    int  winCapture = 0;   // window source: 0 = from the screen, 1 = straight from the window (PrintWindow)
+    // what is shown
+    int  mainSrc = 0;      // big picture: 0 = screen, 1 = webcam, 2 = media files
+    int  pipSrc = 0;       // small window: 0 = none, 1 = screen, 2 = webcam, 3 = media files
     std::wstring camLink, camName;
     bool camMirror = true;
-    int  pipCorner = 0;    // 0 = bottom right, 1 = bottom left, 2 = top right, 3 = top left
-    int  pipSize = 1;      // index into kPipSize
+    int  pipCorner = 0;    // last preset: 0 = bottom right, 1 = bottom left, 2 = top right, 3 = top left
+    int  pipSize = 1;      // last preset: index into kPipSize
+    int  pipX = -1, pipY = -1, pipW = 2500;  // small window: top-left and width, 1/10000 of the frame
+    int  pipShape = 0;     // kShapes
+    int  frameShape = 0;   // kShapes, for the whole frame
+    int  shapeColor = 0;   // colour outside a shape, index into kShapeColors
+    // media files
+    std::vector<std::wstring> media;
+    int  imageSec = 1;     // index into kImageSec
     // overlays
     bool textOn = false;
     std::wstring text;
@@ -93,6 +102,43 @@ static const double kZoom[] = {1.0, 1.25, 1.5, 2.0, 3.0, 4.0};
 static const int    kZoomCount = 6;
 static const double kPipSize[] = {0.20, 0.25, 0.33};
 static const double kLogoSize[] = {0.10, 0.15, 0.20, 0.30};
+static const int    kImageSec[] = {3, 5, 10, 30, 60};
+// 0 rectangle, 1 rounded, 2 circle, 3 hexagon, 4 octagon
+static const int    kShapeCount = 5;
+static const COLORREF kShapeColors[] = {RGB(0, 0, 0), RGB(255, 255, 255), RGB(0, 177, 64), RGB(40, 42, 48)};
+static bool SquareShape(int shape) { return shape >= 2; }
+
+static int ScreenNeeded(const Settings& s) { return s.mainSrc == 0 || s.pipSrc == 1; }
+static bool CamNeeded(const Settings& s) { return s.mainSrc == 1 || s.pipSrc == 2; }
+static bool MediaNeeded(const Settings& s) { return s.mainSrc == 2 || s.pipSrc == 3; }
+
+// Small window rectangle in output pixels (16:9, or square for circle/hexagon/octagon)
+static RECT PipRect(const Settings& s, int W, int H) {
+    int pw = (std::max)(32, MulDiv(W, std::clamp(s.pipW, 500, 9000), 10000));
+    int ph = SquareShape(s.pipShape) ? pw : pw * 9 / 16;
+    if (ph > H - 8) {
+        ph = H - 8;
+        pw = SquareShape(s.pipShape) ? ph : ph * 16 / 9;
+    }
+    const int m = (std::max)(8, H / 30);
+    int x = s.pipX < 0 ? W - m - pw : MulDiv(W, s.pipX, 10000);
+    int y = s.pipY < 0 ? H - m - ph : MulDiv(H, s.pipY, 10000);
+    x = std::clamp(x, 0, W - pw);
+    y = std::clamp(y, 0, H - ph);
+    return RECT{x, y, x + pw, y + ph};
+}
+
+// Snap the small window to a corner preset
+static void PipPreset(Settings& s, int W, int H) {
+    s.pipW = static_cast<int>(10000 * kPipSize[std::clamp(s.pipSize, 0, 2)]);
+    s.pipX = s.pipY = 0;
+    RECT r = PipRect(s, W, H);
+    const int pw = r.right - r.left, ph = r.bottom - r.top, m = (std::max)(8, H / 30);
+    const int x = (s.pipCorner == 1 || s.pipCorner == 3) ? m : W - m - pw;
+    const int y = (s.pipCorner == 2 || s.pipCorner == 3) ? m : H - m - ph;
+    s.pipX = MulDiv(x, 10000, W);
+    s.pipY = MulDiv(y, 10000, H);
+}
 
 static void OutSize(int quality, int aspect, int* w, int* h) {
     static const int sz[2][4][2] = {
@@ -216,12 +262,44 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
     s.region.right = IniInt(sec, L"Right", s.region.right);
     s.region.bottom = IniInt(sec, L"Bottom", s.region.bottom);
     if (s.region.right - s.region.left < 16 || s.region.bottom - s.region.top < 16) s.hasRegion = false;
-    s.view = std::clamp(IniInt(sec, L"View", s.view), 0, 2);
+    s.winCapture = std::clamp(IniInt(sec, L"WindowCapture", s.winCapture), 0, 1);
+    const int oldView = IniInt(sec, L"View", -1);  // v0.3
+    s.mainSrc = IniInt(sec, L"MainSrc", -1);
+    s.pipSrc = IniInt(sec, L"PipSrc", -1);
+    if (s.mainSrc < 0 || s.pipSrc < 0) {
+        s.mainSrc = oldView == 1 ? 1 : 0;
+        s.pipSrc = oldView == 2 ? 2 : 0;
+    }
+    s.mainSrc = std::clamp(s.mainSrc, 0, 2);
+    s.pipSrc = std::clamp(s.pipSrc, 0, 3);
     s.camLink = IniStr(sec, L"CamLink");
     s.camName = IniStr(sec, L"CamName");
     s.camMirror = IniInt(sec, L"CamMirror", s.camMirror) != 0;
     s.pipCorner = std::clamp(IniInt(sec, L"PipCorner", s.pipCorner), 0, 3);
     s.pipSize = std::clamp(IniInt(sec, L"PipSize", s.pipSize), 0, 2);
+    s.pipX = IniInt(sec, L"PipX", -1);
+    s.pipY = IniInt(sec, L"PipY", -1);
+    s.pipW = IniInt(sec, L"PipW", -1);
+    if (s.pipX < 0 || s.pipY < 0 || s.pipW < 0) {  // v0.3 settings: start from the corner preset
+        int W, H;
+        OutSize(s.quality, s.aspect, &W, &H);
+        PipPreset(s, W, H);
+    }
+    s.pipX = std::clamp(s.pipX, 0, 10000);
+    s.pipY = std::clamp(s.pipY, 0, 10000);
+    s.pipW = std::clamp(s.pipW, 500, 9000);
+    s.pipShape = std::clamp(IniInt(sec, L"PipShape", s.pipShape), 0, kShapeCount - 1);
+    s.frameShape = std::clamp(IniInt(sec, L"FrameShape", s.frameShape), 0, kShapeCount - 1);
+    s.shapeColor = std::clamp(IniInt(sec, L"ShapeColor", s.shapeColor), 0, 3);
+    s.imageSec = std::clamp(IniInt(sec, L"ImageSeconds", s.imageSec), 0, 4);
+    s.media.clear();
+    const int mc = std::clamp(IniInt(sec, L"MediaCount", 0), 0, 500);
+    for (int i = 0; i < mc; ++i) {
+        wchar_t k[24];
+        swprintf(k, 24, L"Media%d", i);
+        std::wstring f = IniStr(sec, k);
+        if (!f.empty()) s.media.push_back(f);
+    }
     s.textOn = IniInt(sec, L"TextOn", s.textOn) != 0;
     s.text = IniStr(sec, L"Text");
     s.textPos = std::clamp(IniInt(sec, L"TextPos", s.textPos), 0, 5);
@@ -251,12 +329,28 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
     IniSetInt(sec, L"Top", s.region.top);
     IniSetInt(sec, L"Right", s.region.right);
     IniSetInt(sec, L"Bottom", s.region.bottom);
-    IniSetInt(sec, L"View", s.view);
+    IniSetInt(sec, L"WindowCapture", s.winCapture);
+    IniSetInt(sec, L"MainSrc", s.mainSrc);
+    IniSetInt(sec, L"PipSrc", s.pipSrc);
+    WritePrivateProfileStringW(sec, L"View", nullptr, IniPath().c_str());
     IniSetStr(sec, L"CamLink", s.camLink);
     IniSetStr(sec, L"CamName", s.camName);
     IniSetInt(sec, L"CamMirror", s.camMirror ? 1 : 0);
     IniSetInt(sec, L"PipCorner", s.pipCorner);
     IniSetInt(sec, L"PipSize", s.pipSize);
+    IniSetInt(sec, L"PipX", s.pipX);
+    IniSetInt(sec, L"PipY", s.pipY);
+    IniSetInt(sec, L"PipW", s.pipW);
+    IniSetInt(sec, L"PipShape", s.pipShape);
+    IniSetInt(sec, L"FrameShape", s.frameShape);
+    IniSetInt(sec, L"ShapeColor", s.shapeColor);
+    IniSetInt(sec, L"ImageSeconds", s.imageSec);
+    IniSetInt(sec, L"MediaCount", static_cast<int>(s.media.size()));
+    for (size_t i = 0; i < s.media.size(); ++i) {
+        wchar_t k[24];
+        swprintf(k, 24, L"Media%d", static_cast<int>(i));
+        IniSetStr(sec, k, s.media[i]);
+    }
     IniSetInt(sec, L"TextOn", s.textOn ? 1 : 0);
     IniSetStr(sec, L"Text", s.text);
     IniSetInt(sec, L"TextPos", s.textPos);
@@ -429,7 +523,7 @@ static std::vector<CamDevice> EnumWebcams() {
     return v;
 }
 
-struct Webcam {
+struct FrameSource {
     std::thread           th;
     std::atomic<bool>     stop{false};
     std::atomic<int>      status{0};  // 0 off, 1 opening, 2 running, 3 failed
@@ -440,7 +534,8 @@ struct Webcam {
     std::wstring          link;
     ULONGLONG             failedAt = 0;
 };
-static Webcam g_web;
+static FrameSource g_web;    // real webcam
+static FrameSource g_media;  // media files player
 
 static void WebcamThread(std::wstring link) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -610,7 +705,7 @@ static void WebcamStop() {
 static std::atomic<bool> g_streaming{false};
 static void WebcamSync() {
     Settings s = GetSettings();
-    const bool want = g_streaming && s.view != 0 && !s.camLink.empty();
+    const bool want = g_streaming && CamNeeded(s) && !s.camLink.empty();
     if (g_web.th.joinable()) {
         const bool dead = g_web.status == 3;
         if (!want || g_web.link != s.camLink || dead) {
@@ -630,6 +725,315 @@ static void WebcamSync() {
         g_web.th = std::thread(WebcamThread, s.camLink);
     }
     if (!want && g_web.status == 3) g_web.status = 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// Media files player: pictures, animated GIF, video (Media Foundation, no sound)
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_mediaSkip{false};
+static std::atomic<int>  g_mediaIndex{0};
+static std::atomic<int>  g_mediaGen{0};     // bumped when the list changes
+static int               g_mediaRunGen = -1;
+static std::mutex        g_mediaNameMx;
+static std::wstring      g_mediaNow;        // file name on screen now
+
+static void MediaPublish(const uint8_t* bgra, int w, int h) {
+    {
+        std::lock_guard<std::mutex> lk(g_media.mx);
+        g_media.buf.assign(bgra, bgra + static_cast<size_t>(w) * h * 4);
+        g_media.w = w;
+        g_media.h = h;
+    }
+    ++g_media.seq;
+    g_media.status = 2;
+}
+
+static bool MediaWait(ULONGLONG ms) {  // false = stop or skip requested
+    const ULONGLONG end = GetTickCount64() + ms;
+    while (GetTickCount64() < end) {
+        if (g_media.stop || g_mediaSkip) return false;
+        Sleep(15);
+    }
+    return !(g_media.stop || g_mediaSkip);
+}
+
+static bool LoadImageScaled(const std::wstring& path, int maxW, int maxH, REFWICPixelFormatGUID fmt,
+                            std::vector<uint8_t>& out, int* ow, int* oh);
+
+static std::wstring LowerExt(const std::wstring& f) {
+    size_t d = f.find_last_of(L'.');
+    std::wstring e = d == std::wstring::npos ? L"" : f.substr(d + 1);
+    for (auto& c : e) c = static_cast<wchar_t>(towlower(c));
+    return e;
+}
+
+static bool IsVideoFile(const std::wstring& f) {
+    static const wchar_t* v[] = {L"mp4", L"m4v", L"mov", L"avi", L"wmv", L"mkv", L"webm", L"mpg", L"mpeg", L"ts", L"3gp"};
+    const std::wstring e = LowerExt(f);
+    for (auto* x : v)
+        if (e == x) return true;
+    return false;
+}
+
+static UINT PropUInt(IWICMetadataQueryReader* q, const wchar_t* name, UINT def) {
+    if (!q) return def;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    UINT v = def;
+    if (SUCCEEDED(q->GetMetadataByName(name, &pv))) {
+        if (pv.vt == VT_UI2) v = pv.uiVal;
+        else if (pv.vt == VT_UI1) v = pv.bVal;
+        else if (pv.vt == VT_UI4) v = pv.ulVal;
+    }
+    PropVariantClear(&pv);
+    return v;
+}
+
+static bool PlayImage(const std::wstring& f, int seconds) {
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    if (!LoadImageScaled(f, 1920, 1920, GUID_WICPixelFormat32bppBGR, px, &w, &h)) return false;
+    MediaPublish(px.data(), w, h);
+    MediaWait(static_cast<ULONGLONG>(seconds) * 1000);
+    return true;
+}
+
+static bool PlayGif(const std::wstring& f, int seconds) {
+    IWICImagingFactory* fac = nullptr;
+    IWICBitmapDecoder* dec = nullptr;
+    bool ok = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))) &&
+        SUCCEEDED(fac->CreateDecoderFromFilename(f.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &dec))) {
+        UINT n = 0;
+        dec->GetFrameCount(&n);
+        IWICMetadataQueryReader* gq = nullptr;
+        dec->GetMetadataQueryReader(&gq);
+        int W = static_cast<int>(PropUInt(gq, L"/logscrdesc/Width", 0));
+        int H = static_cast<int>(PropUInt(gq, L"/logscrdesc/Height", 0));
+        SafeRelease(gq);
+        std::vector<uint8_t> canvas;
+        const ULONGLONG until = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
+        bool first = true;
+        while (n > 0 && !g_media.stop && !g_mediaSkip) {
+            for (UINT i = 0; i < n && !g_media.stop && !g_mediaSkip; ++i) {
+                IWICBitmapFrameDecode* fr = nullptr;
+                IWICFormatConverter* cv = nullptr;
+                IWICMetadataQueryReader* q = nullptr;
+                if (FAILED(dec->GetFrame(i, &fr))) break;
+                fr->GetMetadataQueryReader(&q);
+                const int fx = static_cast<int>(PropUInt(q, L"/imgdesc/Left", 0));
+                const int fy = static_cast<int>(PropUInt(q, L"/imgdesc/Top", 0));
+                UINT delay = PropUInt(q, L"/grctlext/Delay", 10) * 10;
+                const UINT disposal = PropUInt(q, L"/grctlext/Disposal", 0);
+                if (delay < 20) delay = 100;
+                UINT fw = 0, fh = 0;
+                fr->GetSize(&fw, &fh);
+                if (W <= 0 || H <= 0) {
+                    W = static_cast<int>(fw);
+                    H = static_cast<int>(fh);
+                }
+                if (canvas.size() != static_cast<size_t>(W) * H * 4) canvas.assign(static_cast<size_t>(W) * H * 4, 0);
+                std::vector<uint8_t> px(static_cast<size_t>(fw) * fh * 4);
+                if (SUCCEEDED(fac->CreateFormatConverter(&cv)) &&
+                    SUCCEEDED(cv->Initialize(fr, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                             WICBitmapPaletteTypeCustom)) &&
+                    SUCCEEDED(cv->CopyPixels(nullptr, fw * 4, static_cast<UINT>(px.size()), px.data()))) {
+                    std::vector<uint8_t> before;
+                    if (disposal == 3) before = canvas;
+                    for (UINT y = 0; y < fh; ++y) {
+                        const int cy = fy + static_cast<int>(y);
+                        if (cy < 0 || cy >= H) continue;
+                        for (UINT x = 0; x < fw; ++x) {
+                            const int cx = fx + static_cast<int>(x);
+                            if (cx < 0 || cx >= W) continue;
+                            const uint8_t* sp = px.data() + (static_cast<size_t>(y) * fw + x) * 4;
+                            uint8_t* dp = canvas.data() + (static_cast<size_t>(cy) * W + cx) * 4;
+                            const int inv = 255 - sp[3];
+                            for (int c = 0; c < 3; ++c) dp[c] = static_cast<uint8_t>(sp[c] + dp[c] * inv / 255);
+                            dp[3] = 255;
+                        }
+                    }
+                    MediaPublish(canvas.data(), W, H);
+                    ok = true;
+                    if (disposal == 2) {  // restore to background
+                        for (UINT y = 0; y < fh; ++y) {
+                            const int cy = fy + static_cast<int>(y);
+                            if (cy < 0 || cy >= H) continue;
+                            for (UINT x = 0; x < fw; ++x) {
+                                const int cx = fx + static_cast<int>(x);
+                                if (cx >= 0 && cx < W)
+                                    std::memset(canvas.data() + (static_cast<size_t>(cy) * W + cx) * 4, 0, 4);
+                            }
+                        }
+                    } else if (disposal == 3) {
+                        canvas.swap(before);
+                    }
+                }
+                SafeRelease(q);
+                SafeRelease(cv);
+                SafeRelease(fr);
+                if (!ok) break;
+                MediaWait(delay);
+            }
+            if (!ok || n == 1 || GetTickCount64() >= until) break;
+            if (first) first = false;
+        }
+        if (n == 1 && ok) MediaWait(static_cast<ULONGLONG>(seconds) * 1000);
+    }
+    SafeRelease(dec);
+    SafeRelease(fac);
+    return ok;
+}
+
+static bool PlayVideo(const std::wstring& f) {
+    IMFAttributes* ra = nullptr;
+    IMFSourceReader* rd = nullptr;
+    IMFMediaType* outType = nullptr;
+    IMFMediaType* cur = nullptr;
+    const DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+    bool ok = false;
+    UINT32 w = 0, h = 0;
+    LONG defStride = 0;
+    do {
+        if (FAILED(MFCreateAttributes(&ra, 1))) break;
+        ra->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+        if (FAILED(MFCreateSourceReaderFromURL(f.c_str(), ra, &rd))) break;
+        rd->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+        rd->SetStreamSelection(stream, TRUE);
+        if (FAILED(MFCreateMediaType(&outType))) break;
+        outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        if (FAILED(rd->SetCurrentMediaType(stream, nullptr, outType))) break;
+        if (FAILED(rd->GetCurrentMediaType(stream, &cur))) break;
+        MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &w, &h);
+        UINT32 st = 0;
+        if (SUCCEEDED(cur->GetUINT32(MF_MT_DEFAULT_STRIDE, &st))) defStride = static_cast<LONG>(st);
+        ok = w && h;
+    } while (false);
+    bool played = false;
+    if (ok) {
+        std::vector<uint8_t> local(static_cast<size_t>(w) * h * 4);
+        const ULONGLONG t0 = GetTickCount64();
+        LONGLONG firstTs = -1;
+        while (!g_media.stop && !g_mediaSkip) {
+            DWORD si = 0, flags = 0;
+            LONGLONG ts = 0;
+            IMFSample* sample = nullptr;
+            HRESULT hr = rd->ReadSample(stream, 0, &si, &flags, &ts, &sample);
+            if (FAILED(hr) || (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
+                SafeRelease(sample);
+                break;
+            }
+            if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
+                SafeRelease(cur);
+                if (SUCCEEDED(rd->GetCurrentMediaType(stream, &cur))) {
+                    MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &w, &h);
+                    UINT32 st = 0;
+                    defStride = SUCCEEDED(cur->GetUINT32(MF_MT_DEFAULT_STRIDE, &st)) ? static_cast<LONG>(st) : 0;
+                    local.assign(static_cast<size_t>(w) * h * 4, 0);
+                }
+            }
+            if (!sample) continue;
+            if (firstTs < 0) firstTs = ts;
+            // pace by the timestamps
+            const LONGLONG dueMs = (ts - firstTs) / 10000;
+            const LONGLONG nowMs = static_cast<LONGLONG>(GetTickCount64() - t0);
+            if (dueMs > nowMs && !MediaWait(static_cast<ULONGLONG>(dueMs - nowMs))) {
+                sample->Release();
+                break;
+            }
+            IMFMediaBuffer* mb = nullptr;
+            if (SUCCEEDED(sample->ConvertToContiguousBuffer(&mb))) {
+                BYTE* scan0 = nullptr;
+                LONG pitch = 0;
+                IMF2DBuffer* b2 = nullptr;
+                BYTE* raw = nullptr;
+                DWORD len = 0;
+                bool locked2d = false, locked = false;
+                if (SUCCEEDED(mb->QueryInterface(IID_PPV_ARGS(&b2))) && SUCCEEDED(b2->Lock2D(&scan0, &pitch))) {
+                    locked2d = true;
+                } else if (SUCCEEDED(mb->Lock(&raw, nullptr, &len))) {
+                    locked = true;
+                    pitch = defStride ? defStride : static_cast<LONG>(w * 4);
+                    scan0 = pitch < 0 ? raw + static_cast<size_t>(h - 1) * static_cast<size_t>(-pitch) : raw;
+                    if (len < static_cast<size_t>(std::labs(pitch)) * h) scan0 = nullptr;
+                }
+                if (scan0) {
+                    for (UINT32 y = 0; y < h; ++y)
+                        std::memcpy(local.data() + static_cast<size_t>(y) * w * 4,
+                                    scan0 + static_cast<ptrdiff_t>(y) * pitch, static_cast<size_t>(w) * 4);
+                    MediaPublish(local.data(), static_cast<int>(w), static_cast<int>(h));
+                    played = true;
+                }
+                if (locked2d) b2->Unlock2D();
+                if (locked) mb->Unlock();
+                SafeRelease(b2);
+                mb->Release();
+            }
+            sample->Release();
+        }
+    }
+    SafeRelease(cur);
+    SafeRelease(outType);
+    SafeRelease(rd);
+    SafeRelease(ra);
+    return played;
+}
+
+static void MediaThread(std::vector<std::wstring> files, int seconds) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int failedInRow = 0;
+    while (!g_media.stop) {
+        const int n = static_cast<int>(files.size());
+        const int idx = ((g_mediaIndex % n) + n) % n;
+        const std::wstring& f = files[idx];
+        {
+            std::lock_guard<std::mutex> lk(g_mediaNameMx);
+            size_t p = f.find_last_of(L"\\/");
+            g_mediaNow = p == std::wstring::npos ? f : f.substr(p + 1);
+        }
+        g_mediaSkip = false;
+        bool ok;
+        if (IsVideoFile(f)) ok = PlayVideo(f);
+        else if (LowerExt(f) == L"gif") ok = PlayGif(f, seconds);
+        else ok = PlayImage(f, seconds);
+        if (g_media.stop) break;
+        if (ok) {
+            failedInRow = 0;
+        } else if (++failedInRow >= n) {
+            g_media.status = 3;  // nothing in the list can be shown
+            failedInRow = 0;
+            MediaWait(2000);
+        }
+        g_mediaSkip = false;
+        g_mediaIndex = idx + 1;
+    }
+    CoUninitialize();
+}
+
+static void MediaStop() {
+    if (g_media.th.joinable()) {
+        g_media.stop = true;
+        g_media.th.join();
+    }
+    g_media.status = 0;
+}
+
+static void MediaSync() {
+    Settings s = GetSettings();
+    const bool want = g_streaming && MediaNeeded(s) && !s.media.empty();
+    if (g_media.th.joinable() && (!want || g_mediaRunGen != g_mediaGen)) MediaStop();
+    if (want && !g_media.th.joinable()) {
+        g_media.stop = false;
+        g_media.status = 1;
+        g_mediaRunGen = g_mediaGen;
+        g_media.th = std::thread(MediaThread, s.media, kImageSec[std::clamp(s.imageSec, 0, 4)]);
+    }
+}
+
+static void MediaNext() {
+    g_mediaSkip = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +1190,72 @@ static void DrawCard(HDC dc, int W, int H, const wchar_t* text) {
     DeleteObject(f);
 }
 
+// Shape coverage mask (0..255), 2x2 supersampled. Circle/polygons sit in the centred square.
+static void BuildMask(int w, int h, int shape, std::vector<uint8_t>& m) {
+    m.assign(static_cast<size_t>(w) * h, 255);
+    if (shape <= 0) return;
+    const double side = (std::min)(w, h);
+    const double cx = w / 2.0, cy = h / 2.0;
+    int n = 0;
+    double rot = 0;
+    if (shape == 3) { n = 6; rot = 0; }                  // hexagon, flat top and bottom
+    if (shape == 4) { n = 8; rot = 3.14159265358979 / 8; }  // octagon, flat sides
+    double nx[8], ny[8], ap = 0;
+    if (n) {
+        const double R = side / 2.0;
+        ap = R * std::cos(3.14159265358979 / n);
+        if (shape == 3) ap = (std::min)(ap, side / 2.0);
+        for (int k = 0; k < n; ++k) {
+            const double a = rot + (k + 0.5) * 2 * 3.14159265358979 / n;
+            nx[k] = std::cos(a);
+            ny[k] = std::sin(a);
+        }
+        if (shape == 3) {  // a hexagon is wider than tall: scale so it touches the square's sides
+            ap = side / 2.0 * std::cos(3.14159265358979 / 6);
+        }
+    }
+    const double rr = side * 0.14;  // rounded corner radius
+    for (int y = 0; y < h; ++y) {
+        uint8_t* row = m.data() + static_cast<size_t>(y) * w;
+        for (int x = 0; x < w; ++x) {
+            int inside = 0;
+            for (int sy = 0; sy < 2; ++sy)
+                for (int sx = 0; sx < 2; ++sx) {
+                    const double px = x + 0.25 + sx * 0.5, py = y + 0.25 + sy * 0.5;
+                    bool in;
+                    if (shape == 1) {
+                        const double qx = (std::max)(0.0, std::fabs(px - cx) - (w / 2.0 - rr));
+                        const double qy = (std::max)(0.0, std::fabs(py - cy) - (h / 2.0 - rr));
+                        in = qx * qx + qy * qy <= rr * rr;
+                    } else if (shape == 2) {
+                        const double dx = px - cx, dy = py - cy, r = side / 2.0;
+                        in = dx * dx + dy * dy <= r * r;
+                    } else {
+                        in = true;
+                        for (int k = 0; k < n && in; ++k)
+                            if ((px - cx) * nx[k] + (py - cy) * ny[k] > ap) in = false;
+                    }
+                    inside += in ? 1 : 0;
+                }
+            row[x] = static_cast<uint8_t>(inside * 255 / 4);
+        }
+    }
+}
+
+struct MaskCache {
+    int w = -1, h = -1, shape = -1;
+    std::vector<uint8_t> m;
+    const std::vector<uint8_t>& Get(int cw, int ch, int sh) {
+        if (cw != w || ch != h || sh != shape) {
+            BuildMask(cw, ch, sh, m);
+            w = cw;
+            h = ch;
+            shape = sh;
+        }
+        return m;
+    }
+};
+
 class Renderer {
 public:
     Renderer(int w, int h) : W(w), H(h) { screenDC = GetDC(nullptr); }
@@ -794,39 +1264,27 @@ public:
         if (screenDC) ReleaseDC(nullptr, screenDC);
     }
 
-    // src: screen rectangle (views 0 and 2), cam: latest webcam frame or nullptr, camMsg: shown when cam is missing.
-    // false = the screen grab failed.
-    bool Frame(const Settings& s, const RECT* src, const CamImage* cam, const wchar_t* camMsg, uint8_t* outBGR) {
+    struct Inputs {
+        const RECT* screen;      // screen/window rectangle, nullptr = not available now
+        const CamImage* cam;     // webcam frame or nullptr
+        const CamImage* media;   // media frame or nullptr
+        const wchar_t* camMsg;
+        const wchar_t* mediaMsg;
+    };
+
+    // false = the screen grab for the big picture failed
+    bool Frame(const Settings& s, const Inputs& in, uint8_t* outBGR) {
         if (!screenDC) return false;
         const bool swap = (s.rotation & 1) != 0;
         const int cw = swap ? H : W, ch = swap ? W : H;
         if (!canvas.Ensure(screenDC, cw, ch) || !out.Ensure(screenDC, W, H)) return false;
         canvas.Clear();
         const double zoom = kZoom[std::clamp(s.zoom, 0, kZoomCount - 1)];
-
-        if (s.view == 1) {
-            if (cam && UploadCam(*cam)) {
-                FitRect f = ComputeFit(0, 0, cam->w, cam->h, zoom, s.fit, cw, ch);
-                StretchBlt(canvas.dc, f.dx, f.dy, f.dw, f.dh, camSurf.dc, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
-            } else {
-                DrawCard(canvas.dc, cw, ch, camMsg);
-            }
-        } else {
-            if (!src) return false;
-            FitRect f = ComputeFit(src->left, src->top, src->right - src->left, src->bottom - src->top, zoom, s.fit,
-                                   cw, ch);
-            BOOL ok;
-            if (f.dw == f.sw && f.dh == f.sh)
-                ok = BitBlt(canvas.dc, f.dx, f.dy, f.dw, f.dh, screenDC, f.sx, f.sy, SRCCOPY);
-            else
-                ok = StretchBlt(canvas.dc, f.dx, f.dy, f.dw, f.dh, screenDC, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
-            if (!ok) return false;
-            if (s.cursor) DrawCursor(f);
-        }
+        if (!DrawSource(s.mainSrc, s, in, canvas.dc, cw, ch, zoom, s.fit, s.cursor)) return false;
         GdiFlush();
         Convert(s.rotation, s.mirror);
-
-        if (s.view == 2) DrawPip(s, cam, camMsg);
+        if (s.pipSrc != 0) DrawPip(s, in);
+        if (s.frameShape != 0) ApplyFrameShape(s);
         if (!s.logo.empty()) DrawLogo(s);
         if (s.textOn && !s.text.empty()) DrawTextOverlay(s);
         GdiFlush();
@@ -856,21 +1314,66 @@ public:
         Pack(outBGR);
     }
 
+    void CamChanged() { camFresh = false; }
+    void MediaChanged() { mediaFresh = false; }
+
 private:
-    bool UploadCam(const CamImage& cam) {
-        if (!cam.bgra || cam.w < 1 || cam.h < 1) return false;
-        if (cam.bgra == camSrc && cam.w == camSurf.w && cam.h == camSurf.h && camSeqUploaded) return true;
-        if (!camSurf.Ensure(screenDC, cam.w, cam.h)) return false;
-        std::memcpy(camSurf.bits, cam.bgra, static_cast<size_t>(cam.w) * cam.h * 4);
-        camSrc = cam.bgra;
-        camSeqUploaded = true;
+    bool Upload(Surface& surf, bool& fresh, const CamImage& img) {
+        if (!img.bgra || img.w < 1 || img.h < 1) return false;
+        if (fresh && img.w == surf.w && img.h == surf.h) return true;
+        if (!surf.Ensure(screenDC, img.w, img.h)) return false;
+        std::memcpy(surf.bits, img.bgra, static_cast<size_t>(img.w) * img.h * 4);
+        fresh = true;
         return true;
     }
 
-public:
-    void CamChanged() { camSeqUploaded = false; }
+    // kind: 0 screen, 1 webcam, 2 media. Draws into dst (dw x dh) with zoom and fit.
+    bool DrawSource(int kind, const Settings& s, const Inputs& in, HDC dst, int dw, int dh, double zoom, int fit,
+                    bool cursor) {
+        if (kind == 1 || kind == 2) {
+            const CamImage* img = kind == 1 ? in.cam : in.media;
+            Surface& surf = kind == 1 ? camSurf : mediaSurf;
+            bool& fresh = kind == 1 ? camFresh : mediaFresh;
+            if (img && Upload(surf, fresh, *img)) {
+                FitRect f = ComputeFit(0, 0, img->w, img->h, zoom, fit, dw, dh);
+                StretchBlt(dst, f.dx, f.dy, f.dw, f.dh, surf.dc, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
+            } else {
+                DrawCard(dst, dw, dh, kind == 1 ? in.camMsg : in.mediaMsg);
+            }
+            return true;
+        }
+        if (!in.screen) return false;
+        const RECT& r = *in.screen;
+        HDC srcDC = screenDC;
+        int ox = 0, oy = 0;  // source DC origin in screen coordinates
+        if (s.srcMode == 1 && s.winCapture == 1) {
+            if (!GrabWindow(s.srcWindow)) return false;
+            srcDC = winSurf.dc;
+            ox = winRect.left;
+            oy = winRect.top;
+        }
+        FitRect f = ComputeFit(r.left - ox, r.top - oy, r.right - r.left, r.bottom - r.top, zoom, fit, dw, dh);
+        BOOL ok;
+        if (f.dw == f.sw && f.dh == f.sh)
+            ok = BitBlt(dst, f.dx, f.dy, f.dw, f.dh, srcDC, f.sx, f.sy, SRCCOPY);
+        else
+            ok = StretchBlt(dst, f.dx, f.dy, f.dw, f.dh, srcDC, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
+        if (!ok) return false;
+        if (cursor && dst == canvas.dc) DrawCursor(f, ox, oy);
+        return true;
+    }
 
-private:
+    // Window straight from its own surface: works when it is covered or moved off screen
+    bool GrabWindow(HWND hwnd) {
+        if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return false;
+        RECT wr;
+        if (!GetWindowRect(hwnd, &wr)) return false;
+        const int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+        if (ww < 16 || wh < 16 || !winSurf.Ensure(screenDC, ww, wh)) return false;
+        winRect = wr;
+        return PrintWindow(hwnd, winSurf.dc, 2 /* PW_RENDERFULLCONTENT */) != FALSE;
+    }
+
     // canvas (BGRA) -> out (BGRA, W x H) with clockwise rotation and horizontal mirror
     void Convert(int rot, bool mirror) {
         const int CW = canvas.w, CH = canvas.h;
@@ -909,39 +1412,76 @@ private:
         }
     }
 
+    // blend src (BGRA, w x h) into out at (x, y) through a coverage mask
+    void BlendMasked(const uint8_t* src, int w, int h, const std::vector<uint8_t>& m, int x0, int y0) {
+        for (int y = 0; y < h; ++y) {
+            const int oy = y0 + y;
+            if (oy < 0 || oy >= H) continue;
+            const uint8_t* mp = m.data() + static_cast<size_t>(y) * w;
+            const uint8_t* sp = src + static_cast<size_t>(y) * w * 4;
+            uint8_t* dp = out.bits + static_cast<size_t>(oy) * W * 4;
+            for (int x = 0; x < w; ++x) {
+                const int ox = x0 + x;
+                const int a = mp[x];
+                if (ox < 0 || ox >= W || a == 0) continue;
+                uint8_t* d = dp + static_cast<size_t>(ox) * 4;
+                const uint8_t* q = sp + static_cast<size_t>(x) * 4;
+                if (a == 255) {
+                    d[0] = q[0]; d[1] = q[1]; d[2] = q[2];
+                } else {
+                    for (int c = 0; c < 3; ++c) d[c] = static_cast<uint8_t>((q[c] * a + d[c] * (255 - a)) / 255);
+                }
+            }
+        }
+    }
+
+    void FillMasked(COLORREF col, int w, int h, const std::vector<uint8_t>& m, int x0, int y0) {
+        std::vector<uint8_t> solid(static_cast<size_t>(w) * h * 4);
+        for (size_t i = 0; i < solid.size(); i += 4) {
+            solid[i] = GetBValue(col);
+            solid[i + 1] = GetGValue(col);
+            solid[i + 2] = GetRValue(col);
+            solid[i + 3] = 255;
+        }
+        BlendMasked(solid.data(), w, h, m, x0, y0);
+    }
+
+    void DrawPip(const Settings& s, const Inputs& in) {
+        RECT r = PipRect(s, W, H);
+        const int pw = r.right - r.left, ph = r.bottom - r.top;
+        if (!pipSurf.Ensure(screenDC, pw, ph)) return;
+        pipSurf.Clear();
+        // pip kinds 1 screen, 2 webcam, 3 media -> source kinds 0, 1, 2
+        if (!DrawSource(s.pipSrc - 1, s, in, pipSurf.dc, pw, ph, 1.0, 1, false))
+            DrawCard(pipSurf.dc, pw, ph, L"Нет картинки");
+        GdiFlush();
+        const int b = (std::max)(2, H / 360);
+        const auto& bm = pipBorderMask.Get(pw + 2 * b, ph + 2 * b, s.pipShape);
+        FillMasked(RGB(255, 255, 255), pw + 2 * b, ph + 2 * b, bm, r.left - b, r.top - b);
+        const auto& m = pipMask.Get(pw, ph, s.pipShape);
+        BlendMasked(pipSurf.bits, pw, ph, m, r.left, r.top);
+    }
+
+    void ApplyFrameShape(const Settings& s) {
+        const auto& m = frameMask.Get(W, H, s.frameShape);
+        const COLORREF col = kShapeColors[std::clamp(s.shapeColor, 0, 3)];
+        const int cb = GetBValue(col), cg = GetGValue(col), cr = GetRValue(col);
+        uint8_t* p = out.bits;
+        const size_t n = static_cast<size_t>(W) * H;
+        for (size_t i = 0; i < n; ++i, p += 4) {
+            const int a = m[i];
+            if (a == 255) continue;
+            p[0] = static_cast<uint8_t>((p[0] * a + cb * (255 - a)) / 255);
+            p[1] = static_cast<uint8_t>((p[1] * a + cg * (255 - a)) / 255);
+            p[2] = static_cast<uint8_t>((p[2] * a + cr * (255 - a)) / 255);
+        }
+    }
+
     RECT CornerRect(int corner, int w, int h) const {
         const int m = (std::max)(8, H / 30);
         const int x = (corner == 1 || corner == 3) ? m : W - m - w;
         const int y = (corner == 2 || corner == 3) ? m : H - m - h;
         return RECT{x, y, x + w, y + h};
-    }
-
-    void DrawPip(const Settings& s, const CamImage* cam, const wchar_t* camMsg) {
-        const int pw = static_cast<int>(W * kPipSize[std::clamp(s.pipSize, 0, 2)]);
-        int ph = pw * 9 / 16;
-        if (cam && cam->w > 0) ph = pw * cam->h / cam->w;
-        ph = (std::min)(ph, H / 2);
-        RECT r = CornerRect(s.pipCorner, pw, ph);
-        RECT border = r;
-        const int b = (std::max)(2, H / 360);
-        InflateRect(&border, b, b);
-        FillRect(out.dc, &border, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
-        if (cam && UploadCam(*cam)) {
-            StretchBlt(out.dc, r.left, r.top, pw, ph, camSurf.dc, 0, 0, cam->w, cam->h, SRCCOPY);
-        } else {
-            HBRUSH bg = CreateSolidBrush(RGB(30, 32, 38));
-            FillRect(out.dc, &r, bg);
-            DeleteObject(bg);
-            HFONT f = CreateFontW(-(std::max)(12, ph / 8), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH,
-                                  L"Segoe UI");
-            HGDIOBJ old = SelectObject(out.dc, f);
-            SetBkMode(out.dc, TRANSPARENT);
-            SetTextColor(out.dc, RGB(220, 220, 220));
-            DrawTextW(out.dc, camMsg, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            SelectObject(out.dc, old);
-            DeleteObject(f);
-        }
     }
 
     void DrawLogo(const Settings& s) {
@@ -990,7 +1530,6 @@ private:
         const int col = s.textPos % 3, row = s.textPos / 3;
         const int x = col == 0 ? m : col == 1 ? (W - bw) / 2 : W - m - bw;
         const int y = row == 0 ? m : H - m - bh;
-        // darken the box behind the text
         GdiFlush();
         for (int yy = (std::max)(0, y); yy < (std::min)(H, y + bh); ++yy) {
             uint8_t* p = out.bits + (static_cast<size_t>(yy) * W + (std::max)(0, x)) * 4;
@@ -1007,7 +1546,7 @@ private:
         SelectObject(out.dc, old);
     }
 
-    void DrawCursor(const FitRect& f) {
+    void DrawCursor(const FitRect& f, int ox, int oy) {
         CURSORINFO ci{};
         ci.cbSize = sizeof(ci);
         if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
@@ -1023,8 +1562,8 @@ private:
             ch = bm.bmHeight / 2;
         }
         const double scale = static_cast<double>(f.dw) / f.sw;
-        const int x = static_cast<int>(std::lround((ci.ptScreenPos.x - static_cast<int>(ii.xHotspot) - f.sx) * scale)) + f.dx;
-        const int y = static_cast<int>(std::lround((ci.ptScreenPos.y - static_cast<int>(ii.yHotspot) - f.sy) * scale)) + f.dy;
+        const int x = static_cast<int>(std::lround((ci.ptScreenPos.x - ox - static_cast<int>(ii.xHotspot) - f.sx) * scale)) + f.dx;
+        const int y = static_cast<int>(std::lround((ci.ptScreenPos.y - oy - static_cast<int>(ii.yHotspot) - f.sy) * scale)) + f.dy;
         const int sw = (std::max)(1, static_cast<int>(std::lround(cw * scale)));
         const int sh = (std::max)(1, static_cast<int>(std::lround(ch * scale)));
         int saved = SaveDC(canvas.dc);
@@ -1037,9 +1576,10 @@ private:
 
     int W, H;
     HDC screenDC = nullptr;
-    Surface canvas, out, camSurf;
-    const uint8_t* camSrc = nullptr;
-    bool camSeqUploaded = false;
+    Surface canvas, out, camSurf, mediaSurf, pipSurf, winSurf;
+    RECT winRect{};
+    bool camFresh = false, mediaFresh = false;
+    MaskCache frameMask, pipMask, pipBorderMask;
     std::wstring logoPath;
     int logoMaxW = 0, logoMaxH = 0, logoW = 0, logoH = 0;
     bool logoOk = false;
@@ -1071,13 +1611,21 @@ static const wchar_t* WebcamMessage(const Settings& s) {
     }
 }
 
+static const wchar_t* MediaMessage(const Settings& s) {
+    if (s.media.empty()) return L"Список медиафайлов пуст";
+    switch (g_media.status.load()) {
+    case 3: return L"Не удалось открыть файлы";
+    default: return L"Открываю файл…";
+    }
+}
+
 static void SenderLoop(int W, int H) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::vector<uint8_t> frame(static_cast<size_t>(W) * H * 3, 0);
     std::unique_ptr<Renderer> rnd(new Renderer(W, H));
-    std::vector<uint8_t> camBuf;
-    int camW = 0, camH = 0;
-    uint64_t camSeq = 0;
+    std::vector<uint8_t> camBuf, mediaBuf;
+    int camW = 0, camH = 0, mediaW = 0, mediaH = 0;
+    uint64_t camSeq = 0, mediaSeq = 0;
     std::wstring pauseKey;
     int fails = 0, frames = 0;
     ULONGLONG fpsT0 = GetTickCount64(), prevT = 0;
@@ -1087,43 +1635,45 @@ static void SenderLoop(int W, int H) {
             rnd.reset(new Renderer(W, H));
             pauseKey.clear();
             camSeq = 0;
+            mediaSeq = 0;
             fails = 0;
         }
         Settings s = GetSettings();
         if (g_streaming) {
             pauseKey.clear();
-            const CamImage* cam = nullptr;
-            CamImage ci{};
-            if (s.view != 0 && g_web.status == 2) {
-                const uint64_t q = g_web.seq;
-                if (q != camSeq) {
-                    std::lock_guard<std::mutex> lk(g_web.mx);
-                    camBuf = g_web.buf;
-                    camW = g_web.w;
-                    camH = g_web.h;
-                    camSeq = q;
-                    rnd->CamChanged();
+            auto fetch = [&](FrameSource& fs, bool need, std::vector<uint8_t>& buf, int& w, int& h, uint64_t& seq,
+                             bool cam, CamImage& img) -> const CamImage* {
+                if (!need || fs.status != 2) return nullptr;
+                const uint64_t q = fs.seq;
+                if (q != seq) {
+                    std::lock_guard<std::mutex> lk(fs.mx);
+                    buf = fs.buf;
+                    w = fs.w;
+                    h = fs.h;
+                    seq = q;
+                    if (cam) rnd->CamChanged(); else rnd->MediaChanged();
                 }
-                if (!camBuf.empty()) {
-                    ci = CamImage{camBuf.data(), camW, camH};
-                    cam = &ci;
-                }
-            }
-            const wchar_t* msg = WebcamMessage(s);
-            if (s.view == 1) {
-                g_sourceLost = false;
-                rnd->Frame(s, nullptr, cam, msg, frame.data());
+                if (buf.empty()) return nullptr;
+                img = CamImage{buf.data(), w, h};
+                return &img;
+            };
+            CamImage ci{}, mi{};
+            Renderer::Inputs in{};
+            in.cam = fetch(g_web, CamNeeded(s), camBuf, camW, camH, camSeq, true, ci);
+            in.media = fetch(g_media, MediaNeeded(s), mediaBuf, mediaW, mediaH, mediaSeq, false, mi);
+            in.camMsg = WebcamMessage(s);
+            in.mediaMsg = MediaMessage(s);
+            RECT src;
+            const bool haveScreen = ScreenNeeded(s) && ResolveSource(s, &src);
+            in.screen = haveScreen ? &src : nullptr;
+            if (s.mainSrc == 0 && !haveScreen) {
+                g_sourceLost = true;  // keep the last frame
             } else {
-                RECT src;
-                if (ResolveSource(s, &src)) {
-                    g_sourceLost = false;
-                    if (rnd->Frame(s, &src, cam, msg, frame.data()))
-                        fails = 0;
-                    else if (++fails >= 15)  // ~0.5 s of failures: rebuild capture
-                        g_resetCapture = true;
-                } else {
-                    g_sourceLost = true;  // keep the last frame
-                }
+                g_sourceLost = ScreenNeeded(s) && !haveScreen;
+                if (rnd->Frame(s, in, frame.data()))
+                    fails = 0;
+                else if (++fails >= 15)  // ~0.5 s of failures: rebuild capture
+                    g_resetCapture = true;
             }
         } else if (s.pauseMode != 0) {
             std::wstring key = std::to_wstring(s.pauseMode) + L"|" + s.pauseImage;
@@ -1551,7 +2101,7 @@ static void UpdateFrame() {
     if (!g_frame || g_frameMoving) return;
     Settings s = GetSettings();
     RECT r;
-    if (g_streaming && s.view != 1 && ResolveSource(s, &r)) {
+    if (g_streaming && ScreenNeeded(s) && ResolveSource(s, &r)) {
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
         GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi);
@@ -1576,7 +2126,77 @@ static void UpdateFrame() {
 // ---------------------------------------------------------------------------
 // Preview control
 // ---------------------------------------------------------------------------
+// Preview geometry (frame -> preview control) from the last paint, for dragging the small window
+static double g_pvScale = 0;
+static int g_pvX = 0, g_pvY = 0, g_pvW = 0, g_pvH = 0;
+static int g_pipDrag = 0;  // 0 none, 1 move, 2 resize
+static POINT g_pipDragStart{};
+static Settings g_pipDragSet;
+static void OnPipDragged();  // main window: save + refresh
+
+static int PipHit(int mx, int my) {
+    Settings s = GetSettings();
+    if (s.pipSrc == 0 || g_pvScale <= 0) return 0;
+    RECT r = PipRect(s, g_pvW, g_pvH);
+    const int l = g_pvX + static_cast<int>(r.left * g_pvScale), t = g_pvY + static_cast<int>(r.top * g_pvScale);
+    const int rr = g_pvX + static_cast<int>(r.right * g_pvScale), b = g_pvY + static_cast<int>(r.bottom * g_pvScale);
+    const int grip = 10;
+    if (mx >= rr - grip && mx <= rr + 4 && my >= b - grip && my <= b + 4) return 2;
+    if (mx >= l && mx < rr && my >= t && my < b) return 1;
+    return 0;
+}
+
 static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_SETCURSOR: {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        const int hit = g_pipDrag ? g_pipDrag : PipHit(pt.x, pt.y);
+        if (hit) {
+            SetCursor(LoadCursor(nullptr, hit == 2 ? IDC_SIZENWSE : IDC_SIZEALL));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN: {
+        const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
+        g_pipDrag = PipHit(x, y);
+        if (g_pipDrag) {
+            g_pipDragStart = POINT{x, y};
+            g_pipDragSet = GetSettings();
+            SetCapture(hwnd);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (g_pipDrag && g_pvScale > 0) {
+            const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
+            const double dx = (x - g_pipDragStart.x) / g_pvScale, dy = (y - g_pipDragStart.y) / g_pvScale;
+            Settings base = g_pipDragSet;
+            RECT r0 = PipRect(base, g_pvW, g_pvH);
+            std::lock_guard<std::mutex> lk(g_setMx);
+            if (g_pipDrag == 1) {
+                const int nx = std::clamp(static_cast<int>(r0.left + dx), 0, g_pvW - static_cast<int>(r0.right - r0.left));
+                const int ny = std::clamp(static_cast<int>(r0.top + dy), 0, g_pvH - static_cast<int>(r0.bottom - r0.top));
+                g_set.pipX = MulDiv(nx, 10000, g_pvW);
+                g_set.pipY = MulDiv(ny, 10000, g_pvH);
+            } else {
+                const int nw = std::clamp(static_cast<int>((r0.right - r0.left) + (std::max)(dx, dy)), g_pvW / 20,
+                                          g_pvW - static_cast<int>(r0.left));
+                g_set.pipW = std::clamp(MulDiv(nw, 10000, g_pvW), 500, 9000);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        if (g_pipDrag) {
+            g_pipDrag = 0;
+            if (msg == WM_LBUTTONUP) ReleaseCapture();
+            OnPipDragged();
+        }
+        return 0;
+    }
     if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
@@ -1596,6 +2216,11 @@ static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                              static_cast<double>(rc.bottom) / g_prevH);
                 const int dw = static_cast<int>(g_prevW * sc), dh = static_cast<int>(g_prevH * sc);
                 const int dx = (rc.right - dw) / 2, dy = (rc.bottom - dh) / 2;
+                g_pvScale = sc;
+                g_pvX = dx;
+                g_pvY = dy;
+                g_pvW = g_prevW;
+                g_pvH = g_prevH;
                 BITMAPINFO bi{};
                 bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
                 bi.bmiHeader.biWidth = g_prevW;
@@ -1633,6 +2258,9 @@ enum HotkeyAction {
     HA_PROFILE2,
     HA_PROFILE3,
     HA_PROFILE4,
+    HA_SWAP,
+    HA_MEDIA_NEXT,
+    HA_HIDE_WINDOW,
     HA_COUNT
 };
 
@@ -1647,13 +2275,16 @@ static const HotkeyDef kHotkeys[HA_COUNT] = {
     {L"Выбрать область", MOD_CONTROL | MOD_SHIFT, VK_F6},
     {L"Следующий монитор", MOD_CONTROL | MOD_SHIFT, VK_F7},
     {L"Курсор вкл/выкл", MOD_CONTROL | MOD_SHIFT, VK_F8},
-    {L"Экран ↔ веб-камера", MOD_CONTROL | MOD_SHIFT, VK_F9},
+    {L"Большая картинка: экран ↔ камера", MOD_CONTROL | MOD_SHIFT, VK_F9},
     {L"Камера в углу вкл/выкл", MOD_CONTROL | MOD_SHIFT, VK_F10},
     {L"Надпись вкл/выкл", MOD_CONTROL | MOD_SHIFT, VK_F11},
-    {L"Профиль 1", MOD_CONTROL | MOD_SHIFT, '1'},
-    {L"Профиль 2", MOD_CONTROL | MOD_SHIFT, '2'},
-    {L"Профиль 3", MOD_CONTROL | MOD_SHIFT, '3'},
-    {L"Профиль 4", MOD_CONTROL | MOD_SHIFT, '4'},
+    {L"Сцена 1", MOD_CONTROL | MOD_SHIFT, '1'},
+    {L"Сцена 2", MOD_CONTROL | MOD_SHIFT, '2'},
+    {L"Сцена 3", MOD_CONTROL | MOD_SHIFT, '3'},
+    {L"Сцена 4", MOD_CONTROL | MOD_SHIFT, '4'},
+    {L"Поменять большое и малое", MOD_CONTROL | MOD_SHIFT, VK_F12},
+    {L"Следующий медиафайл", MOD_CONTROL | MOD_SHIFT, '5'},
+    {L"Спрятать / вернуть окно", 0, 0},
 };
 
 static UINT g_hk[HA_COUNT];  // (MOD_* << 8) | vk, 0 = none
@@ -1746,14 +2377,21 @@ enum {
     IDC_SRC_LABEL, IDC_SRC_VALUE, IDC_SELECT, IDC_MONITOR, IDC_WINDOW,
     IDC_Q_LABEL, IDC_QUALITY, IDC_A_LABEL, IDC_ASPECT, IDC_FPS_LABEL, IDC_FPS,
     IDC_FIT_LABEL, IDC_FIT, IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM,
-    IDC_MIRROR, IDC_CURSOR,
-    // page 1: webcam and overlays
-    IDC_VIEW_LABEL, IDC_VIEW, IDC_CAM_LABEL, IDC_CAMDEV, IDC_PIP_LABEL, IDC_PIPCORNER, IDC_PIPSIZE, IDC_CAMMIRROR,
+    IDC_MIRROR, IDC_CURSOR, IDC_SHAPE_LABEL, IDC_FRAMESHAPE, IDC_SHAPECOLOR,
+    IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN,
+    // page 1: layers
+    IDC_VIEW_LABEL, IDC_VIEW, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP,
+    IDC_CAM_LABEL, IDC_CAMDEV, IDC_PIP_LABEL, IDC_PIPCORNER, IDC_PIPSIZE, IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE,
+    IDC_CAMMIRROR,
     IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE,
     IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE, IDC_LOGO_NAME,
-    // page 2: profiles and hotkeys
+    IDC_PIP_HINT,
+    // page 2: media files
+    IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN, IDC_IMGSEC_LABEL, IDC_IMGSEC,
+    IDC_MEDIA_NEXT, IDC_MEDIA_NOW, IDC_MEDIA_HINT,
+    // page 3: scenes and keys
     IDC_PROF_LABEL, IDC_PROFILE, IDC_PROF_LOAD, IDC_PROF_SAVE, IDC_PROF_DEL, IDC_PROF_HINT,
-    IDC_HK_EDIT, IDC_HK_LIST,
+    IDC_HK_EDIT, IDC_AUTOSTART, IDC_AUTOSTREAM, IDC_JSON_EXPORT, IDC_JSON_IMPORT, IDC_HK_LIST,
     // right column
     IDC_PREV_LABEL, IDC_FPS_VALUE, IDC_PREVIEW, IDC_START, IDC_STATUS,
     IDC_PAUSE_LABEL, IDC_PAUSE, IDC_PAUSE_IMG, IDC_INSTALL, IDC_UNINSTALL,
@@ -1776,13 +2414,18 @@ static std::vector<CamDevice> g_camList;
 
 static const int kPage0[] = {IDC_SRC_LABEL, IDC_SRC_VALUE, IDC_SELECT, IDC_MONITOR, IDC_WINDOW, IDC_Q_LABEL,
                              IDC_QUALITY, IDC_A_LABEL, IDC_ASPECT, IDC_FPS_LABEL, IDC_FPS, IDC_FIT_LABEL, IDC_FIT,
-                             IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM, IDC_MIRROR, IDC_CURSOR};
-static const int kPage1[] = {IDC_VIEW_LABEL, IDC_VIEW, IDC_CAM_LABEL, IDC_CAMDEV, IDC_PIP_LABEL, IDC_PIPCORNER,
-                             IDC_PIPSIZE, IDC_CAMMIRROR, IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL,
-                             IDC_TEXTPOS, IDC_TEXTSIZE, IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL,
-                             IDC_LOGOCORNER, IDC_LOGOSIZE, IDC_LOGO_NAME};
-static const int kPage2[] = {IDC_PROF_LABEL, IDC_PROFILE, IDC_PROF_LOAD, IDC_PROF_SAVE, IDC_PROF_DEL,
-                             IDC_PROF_HINT, IDC_HK_EDIT, IDC_HK_LIST};
+                             IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM, IDC_MIRROR, IDC_CURSOR,
+                             IDC_SHAPE_LABEL, IDC_FRAMESHAPE, IDC_SHAPECOLOR, IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN};
+static const int kPage1[] = {IDC_VIEW_LABEL, IDC_VIEW, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP, IDC_CAM_LABEL,
+                             IDC_CAMDEV, IDC_PIP_LABEL, IDC_PIPCORNER, IDC_PIPSIZE, IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE,
+                             IDC_CAMMIRROR, IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL, IDC_TEXTPOS,
+                             IDC_TEXTSIZE, IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL,
+                             IDC_LOGOCORNER, IDC_LOGOSIZE, IDC_LOGO_NAME, IDC_PIP_HINT};
+static const int kPage2[] = {IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN,
+                             IDC_IMGSEC_LABEL, IDC_IMGSEC, IDC_MEDIA_NEXT, IDC_MEDIA_NOW, IDC_MEDIA_HINT};
+static const int kPage3[] = {IDC_PROF_LABEL, IDC_PROFILE, IDC_PROF_LOAD, IDC_PROF_SAVE, IDC_PROF_DEL,
+                             IDC_PROF_HINT, IDC_HK_EDIT, IDC_AUTOSTART, IDC_AUTOSTREAM, IDC_JSON_EXPORT,
+                             IDC_JSON_IMPORT, IDC_HK_LIST};
 
 static bool OnTabPage(int id) { return id >= IDC_SRC_LABEL && id <= IDC_HK_LIST; }
 
@@ -1790,8 +2433,8 @@ static int S(int v) { return MulDiv(v, static_cast<int>(g_dpi), 96); }
 static HWND Ctl(int id) { return GetDlgItem(g_main, id); }
 
 static void SetTextIfChanged(HWND h, const std::wstring& text) {
-    wchar_t cur[2048] = {};
-    GetWindowTextW(h, cur, 2048);
+    wchar_t cur[4096] = {};
+    GetWindowTextW(h, cur, 4096);
     if (text != cur) SetWindowTextW(h, text.c_str());
 }
 
@@ -1802,54 +2445,71 @@ static void MakeFont() {
                          L"Segoe UI");
 }
 
-static const int kClientW = 800, kClientH = 484;
+static const int kClientW = 800, kClientH = 500;
 
 static void Layout() {
     struct L { int id, x, y, w, h; };
     const int lx = 24, cx = 172, cw = 210;  // label x, control x, control width on the tab pages
     const L items[] = {
-        {IDC_TAB, 10, 8, 384, 468},
+        {IDC_TAB, 10, 8, 384, 484},
         // page 0
         {IDC_SRC_LABEL, lx, 46, 70, 20},
         {IDC_SRC_VALUE, lx + 72, 46, 286, 20},
         {IDC_SELECT, lx, 70, 116, 28},
         {IDC_MONITOR, lx + 121, 70, 116, 28},
         {IDC_WINDOW, lx + 242, 70, 116, 28},
-        {IDC_Q_LABEL, lx, 116, 145, 20}, {IDC_QUALITY, cx, 112, cw, 200},
-        {IDC_A_LABEL, lx, 148, 145, 20}, {IDC_ASPECT, cx, 144, cw, 200},
-        {IDC_FPS_LABEL, lx, 180, 145, 20}, {IDC_FPS, cx, 176, cw, 200},
-        {IDC_FIT_LABEL, lx, 212, 145, 20}, {IDC_FIT, cx, 208, cw, 200},
-        {IDC_ROT_LABEL, lx, 244, 145, 20}, {IDC_ROT, cx, 240, cw, 200},
-        {IDC_ZOOM_LABEL, lx, 276, 145, 20}, {IDC_ZOOM, cx, 272, cw, 200},
-        {IDC_MIRROR, lx, 308, 150, 22}, {IDC_CURSOR, cx, 308, cw, 22},
+        {IDC_Q_LABEL, lx, 114, 145, 20}, {IDC_QUALITY, cx, 110, cw, 200},
+        {IDC_A_LABEL, lx, 144, 145, 20}, {IDC_ASPECT, cx, 140, cw, 200},
+        {IDC_FPS_LABEL, lx, 174, 145, 20}, {IDC_FPS, cx, 170, cw, 200},
+        {IDC_FIT_LABEL, lx, 204, 145, 20}, {IDC_FIT, cx, 200, cw, 200},
+        {IDC_ROT_LABEL, lx, 234, 145, 20}, {IDC_ROT, cx, 230, cw, 200},
+        {IDC_ZOOM_LABEL, lx, 264, 145, 20}, {IDC_ZOOM, cx, 260, cw, 200},
+        {IDC_SHAPE_LABEL, lx, 294, 145, 20}, {IDC_FRAMESHAPE, cx, 290, 128, 200}, {IDC_SHAPECOLOR, cx + 134, 290, 76, 200},
+        {IDC_MIRROR, lx, 324, 150, 22}, {IDC_CURSOR, cx, 324, cw, 22},
+        {IDC_WCAP_LABEL, lx, 362, 145, 20}, {IDC_WINCAP, cx, 358, cw, 200},
+        {IDC_HIDEWIN, cx, 392, cw, 28},
         // page 1
         {IDC_VIEW_LABEL, lx, 50, 145, 20}, {IDC_VIEW, cx, 46, cw, 200},
-        {IDC_CAM_LABEL, lx, 82, 145, 20}, {IDC_CAMDEV, cx, 78, cw, 240},
-        {IDC_PIP_LABEL, lx, 114, 145, 20}, {IDC_PIPCORNER, cx, 110, 128, 200}, {IDC_PIPSIZE, cx + 134, 110, 76, 200},
-        {IDC_CAMMIRROR, lx, 144, 340, 22},
-        {IDC_TEXT_LABEL, lx, 186, 145, 20}, {IDC_TEXT, cx, 182, cw, 24},
-        {IDC_TEXTON, lx, 214, 340, 22},
-        {IDC_TPOS_LABEL, lx, 248, 145, 20}, {IDC_TEXTPOS, cx, 244, 128, 200}, {IDC_TEXTSIZE, cx + 134, 244, 76, 200},
-        {IDC_LOGO_LABEL, lx, 292, 145, 20}, {IDC_LOGO_PICK, cx, 288, 128, 28}, {IDC_LOGO_CLEAR, cx + 134, 288, 76, 28},
-        {IDC_LPOS_LABEL, lx, 328, 145, 20}, {IDC_LOGOCORNER, cx, 324, 128, 200}, {IDC_LOGOSIZE, cx + 134, 324, 76, 200},
-        {IDC_LOGO_NAME, lx, 358, 358, 20},
+        {IDC_PIPSRC_LABEL, lx, 82, 145, 20}, {IDC_PIPSRC, cx, 78, 128, 200}, {IDC_SWAP, cx + 134, 77, 76, 26},
+        {IDC_CAM_LABEL, lx, 114, 145, 20}, {IDC_CAMDEV, cx, 110, cw, 240},
+        {IDC_PIP_LABEL, lx, 146, 145, 20}, {IDC_PIPCORNER, cx, 142, 128, 200}, {IDC_PIPSIZE, cx + 134, 142, 76, 200},
+        {IDC_PIPSHAPE_LABEL, lx, 178, 145, 20}, {IDC_PIPSHAPE, cx, 174, cw, 200},
+        {IDC_CAMMIRROR, lx, 206, 340, 22},
+        {IDC_TEXT_LABEL, lx, 242, 145, 20}, {IDC_TEXT, cx, 238, cw, 24},
+        {IDC_TEXTON, lx, 268, 340, 22},
+        {IDC_TPOS_LABEL, lx, 300, 145, 20}, {IDC_TEXTPOS, cx, 296, 128, 200}, {IDC_TEXTSIZE, cx + 134, 296, 76, 200},
+        {IDC_LOGO_LABEL, lx, 338, 145, 20}, {IDC_LOGO_PICK, cx, 334, 128, 28}, {IDC_LOGO_CLEAR, cx + 134, 334, 76, 28},
+        {IDC_LPOS_LABEL, lx, 374, 145, 20}, {IDC_LOGOCORNER, cx, 370, 128, 200}, {IDC_LOGOSIZE, cx + 134, 370, 76, 200},
+        {IDC_LOGO_NAME, lx, 404, 358, 20},
+        {IDC_PIP_HINT, lx, 430, 358, 54},
         // page 2
+        {IDC_MEDIA_LIST, lx, 46, 358, 236},
+        {IDC_MEDIA_ADD, lx, 290, 116, 28}, {IDC_MEDIA_DEL, lx + 121, 290, 116, 28},
+        {IDC_MEDIA_UP, lx + 242, 290, 56, 28}, {IDC_MEDIA_DOWN, lx + 302, 290, 56, 28},
+        {IDC_IMGSEC_LABEL, lx, 334, 145, 20}, {IDC_IMGSEC, cx, 330, cw, 200},
+        {IDC_MEDIA_NEXT, lx, 366, 200, 28},
+        {IDC_MEDIA_NOW, lx, 402, 358, 20},
+        {IDC_MEDIA_HINT, lx, 426, 358, 60},
+        // page 3
         {IDC_PROF_LABEL, lx, 50, 90, 20}, {IDC_PROFILE, lx + 92, 46, 266, 240},
-        {IDC_PROF_LOAD, lx, 82, 116, 28}, {IDC_PROF_SAVE, lx + 121, 82, 116, 28}, {IDC_PROF_DEL, lx + 242, 82, 116, 28},
-        {IDC_PROF_HINT, lx, 120, 358, 56},
-        {IDC_HK_EDIT, lx, 184, 220, 30},
-        {IDC_HK_LIST, lx, 224, 358, 240},
+        {IDC_PROF_LOAD, lx, 80, 116, 28}, {IDC_PROF_SAVE, lx + 121, 80, 116, 28}, {IDC_PROF_DEL, lx + 242, 80, 116, 28},
+        {IDC_PROF_HINT, lx, 116, 358, 58},
+        {IDC_AUTOSTART, lx, 180, 358, 22},
+        {IDC_AUTOSTREAM, lx, 204, 358, 22},
+        {IDC_JSON_EXPORT, lx, 234, 176, 28}, {IDC_JSON_IMPORT, lx + 182, 234, 176, 28},
+        {IDC_HK_EDIT, lx, 270, 240, 28},
+        {IDC_HK_LIST, lx, 304, 358, 178},
         // right column
         {IDC_PREV_LABEL, 406, 14, 220, 20},
         {IDC_FPS_VALUE, 630, 14, 160, 20},
         {IDC_PREVIEW, 406, 40, 384, 216},
         {IDC_START, 406, 266, 384, 40},
-        {IDC_STATUS, 406, 314, 384, 56},
-        {IDC_PAUSE_LABEL, 406, 382, 150, 20},
-        {IDC_PAUSE, 560, 378, 230, 200},
-        {IDC_PAUSE_IMG, 560, 410, 230, 28},
-        {IDC_INSTALL, 406, 448, 189, 28},
-        {IDC_UNINSTALL, 601, 448, 189, 28},
+        {IDC_STATUS, 406, 314, 384, 70},
+        {IDC_PAUSE_LABEL, 406, 398, 150, 20},
+        {IDC_PAUSE, 560, 394, 230, 200},
+        {IDC_PAUSE_IMG, 560, 426, 230, 28},
+        {IDC_INSTALL, 406, 464, 189, 28},
+        {IDC_UNINSTALL, 601, 464, 189, 28},
     };
     for (const auto& it : items) {
         HWND h = Ctl(it.id);
@@ -1868,8 +2528,8 @@ static void ShowPage(int page) {
     show(kPage0, ARRAYSIZE(kPage0), page == 0);
     show(kPage1, ARRAYSIZE(kPage1), page == 1);
     show(kPage2, ARRAYSIZE(kPage2), page == 2);
+    show(kPage3, ARRAYSIZE(kPage3), page == 3);
 }
-
 static int ComboSel(int id) { return static_cast<int>(SendMessageW(Ctl(id), CB_GETCURSEL, 0, 0)); }
 static void ComboSet(int id, int sel) { SendMessageW(Ctl(id), CB_SETCURSEL, sel, 0); }
 static void CheckSet(int id, bool on) { SendMessageW(Ctl(id), BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0); }
@@ -1914,6 +2574,49 @@ static void FillProfileCombo(const std::wstring& select) {
 }
 
 // settings -> controls (after hotkeys, profiles, startup)
+// --- autostart with Windows (HKCU Run)
+static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static bool AutostartOn() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD sz = sizeof(buf), type = 0;
+    const bool on = RegQueryValueExW(k, L"WVC", nullptr, &type, reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS;
+    RegCloseKey(k);
+    return on && wcsstr(buf, ExePath().c_str()) != nullptr;
+}
+
+static bool SetAutostart(bool on) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+        return false;
+    LONG rc;
+    if (on) {
+        std::wstring cmd = L"\"" + ExePath() + L"\" --tray";
+        rc = RegSetValueExW(k, L"WVC", 0, REG_SZ, reinterpret_cast<const BYTE*>(cmd.c_str()),
+                            static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        rc = RegDeleteValueW(k, L"WVC");
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+    }
+    RegCloseKey(k);
+    return rc == ERROR_SUCCESS;
+}
+
+static void FillMediaList() {
+    Settings s = GetSettings();
+    HWND h = Ctl(IDC_MEDIA_LIST);
+    const int sel = static_cast<int>(SendMessageW(h, LB_GETCURSEL, 0, 0));
+    SendMessageW(h, LB_RESETCONTENT, 0, 0);
+    for (size_t i = 0; i < s.media.size(); ++i) {
+        std::wstring t = std::to_wstring(i + 1) + L". " + FileNameOf(s.media[i]);
+        SendMessageW(h, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(t.c_str()));
+    }
+    if (sel >= 0 && sel < static_cast<int>(s.media.size())) SendMessageW(h, LB_SETCURSEL, sel, 0);
+}
+
+// settings -> controls (after hotkeys, scenes, startup)
 static void SyncControls() {
     g_syncing = true;
     Settings s = GetSettings();
@@ -1923,11 +2626,16 @@ static void SyncControls() {
     ComboSet(IDC_FIT, s.fit);
     ComboSet(IDC_ROT, s.rotation);
     ComboSet(IDC_ZOOM, s.zoom);
+    ComboSet(IDC_FRAMESHAPE, s.frameShape);
+    ComboSet(IDC_SHAPECOLOR, s.shapeColor);
     CheckSet(IDC_MIRROR, s.mirror);
     CheckSet(IDC_CURSOR, s.cursor);
-    ComboSet(IDC_VIEW, s.view);
+    ComboSet(IDC_WINCAP, s.winCapture);
+    ComboSet(IDC_VIEW, s.mainSrc);
+    ComboSet(IDC_PIPSRC, s.pipSrc);
     ComboSet(IDC_PIPCORNER, s.pipCorner);
     ComboSet(IDC_PIPSIZE, s.pipSize);
+    ComboSet(IDC_PIPSHAPE, s.pipShape);
     CheckSet(IDC_CAMMIRROR, s.camMirror);
     SetTextIfChanged(Ctl(IDC_TEXT), s.text);
     CheckSet(IDC_TEXTON, s.textOn);
@@ -1937,17 +2645,27 @@ static void SyncControls() {
     ComboSet(IDC_LOGOSIZE, s.logoSize);
     SetTextIfChanged(Ctl(IDC_LOGO_NAME), s.logo.empty() ? L"Логотип не выбран" : L"Логотип: " + FileNameOf(s.logo));
     ComboSet(IDC_PAUSE, s.pauseMode);
+    ComboSet(IDC_IMGSEC, s.imageSec);
+    CheckSet(IDC_AUTOSTART, AutostartOn());
+    CheckSet(IDC_AUTOSTREAM, IniInt(kMainSec, L"AutoStream", 0) != 0);
     FillCamCombo();
+    FillMediaList();
     g_syncing = false;
+}
+
+static const wchar_t* SrcKindName(int mainKind) {
+    switch (mainKind) {
+    case 1: return L"веб-камера";
+    case 2: return L"медиафайлы";
+    default: return L"экран";
+    }
 }
 
 static void UpdateSourceLabel() {
     if (!g_main) return;
     Settings s = GetSettings();
     wchar_t buf[256];
-    if (s.view == 1) {
-        wcscpy(buf, L"веб-камера");
-    } else if (s.srcMode == 1) {
+    if (s.srcMode == 1) {
         swprintf(buf, 256, L"окно «%ls»", s.srcTitle.c_str());
     } else if (s.hasRegion) {
         swprintf(buf, 256, L"область %d × %d  (x %d, y %d)", static_cast<int>(s.region.right - s.region.left),
@@ -1957,8 +2675,13 @@ static void UpdateSourceLabel() {
         wcscpy(buf, L"не выбран");
     }
     SetTextIfChanged(Ctl(IDC_SRC_VALUE), buf);
+    std::wstring now;
+    {
+        std::lock_guard<std::mutex> lk(g_mediaNameMx);
+        now = g_mediaNow;
+    }
+    SetTextIfChanged(Ctl(IDC_MEDIA_NOW), g_media.status == 2 && !now.empty() ? L"Сейчас: " + now : L"");
 }
-
 static void UpdateStartButton() {
     SetWindowTextW(Ctl(IDC_START), g_streaming ? L"■  Стоп" : L"▶  Старт");
     const wchar_t* tip = g_streaming ? L"WVC — трансляция идёт" : L"WVC — пауза";
@@ -1988,15 +2711,23 @@ static void UpdateStatus() {
     std::wstring line2;
     if (!g_note.empty())
         line2 = g_note;
-    else if (g_streaming && s.view != 0 && s.camLink.empty())
-        line2 = L"Выберите веб-камеру на вкладке «Камера и наложения».";
-    else if (g_streaming && s.view != 0 && g_web.status == 3)
+    else if (g_streaming && CamNeeded(s) && s.camLink.empty())
+        line2 = L"Выберите веб-камеру на вкладке «Наложения».";
+    else if (g_streaming && CamNeeded(s) && g_web.status == 3)
         line2 = L"Веб-камера недоступна: занята другой программой или отключена. Пробую снова…";
-    else if (g_streaming && s.view != 1 && g_sourceLost)
+    else if (g_streaming && MediaNeeded(s) && s.media.empty())
+        line2 = L"Добавьте файлы на вкладке «Медиа».";
+    else if (g_streaming && g_sourceLost)
         line2 = L"Окно свёрнуто или закрыто: показываю последний кадр.";
-    else if (g_streaming)
-        line2 = L"Трансляция идёт.";
-    else
+    else if (g_streaming) {
+        line2 = L"Трансляция идёт: ";
+        line2 += SrcKindName(s.mainSrc);
+        if (s.pipSrc) {
+            line2 += L", в окошке — ";
+            line2 += s.pipSrc == 1 ? L"экран" : SrcKindName(s.pipSrc - 1);
+        }
+        line2 += L".";
+    } else
         line2 = L"Пауза.";
     SetTextIfChanged(Ctl(IDC_STATUS), line1 + L"\r\n" + line2);
 
@@ -2008,8 +2739,13 @@ static void UpdateStatus() {
 
 static bool HaveSource() {
     Settings s = GetSettings();
-    if (s.view == 1) return true;  // the card says what is missing
+    if (s.mainSrc != 0) return true;  // the card says what is missing
     return s.srcMode == 1 ? (s.srcWindow && IsWindow(s.srcWindow)) : s.hasRegion;
+}
+
+static void SyncSources() {
+    WebcamSync();
+    MediaSync();
 }
 
 static void ToggleStreaming() {
@@ -2025,12 +2761,55 @@ static void ToggleStreaming() {
     }
     g_streaming = !g_streaming;
     g_note.clear();
-    WebcamSync();
+    SyncSources();
     UpdateStartButton();
     UpdateFrame();
     UpdateStatus();
 }
+// --- "hide" the source window off screen so it keeps playing while WVC captures it directly
+static HWND g_hiddenWin = nullptr;
+static RECT g_hiddenRect{};
+static bool g_hiddenMax = false;
 
+static void RestoreHiddenWindow() {
+    if (!g_hiddenWin) return;
+    if (IsWindow(g_hiddenWin)) {
+        SetWindowPos(g_hiddenWin, nullptr, g_hiddenRect.left, g_hiddenRect.top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        if (g_hiddenMax) ShowWindow(g_hiddenWin, SW_MAXIMIZE);
+    }
+    g_hiddenWin = nullptr;
+    if (g_main) SetWindowTextW(Ctl(IDC_HIDEWIN), L"Спрятать окно за экран");
+}
+
+static void ToggleHideWindow() {
+    if (g_hiddenWin) {
+        RestoreHiddenWindow();
+        return;
+    }
+    Settings s = GetSettings();
+    if (s.srcMode != 1 || !s.srcWindow || !IsWindow(s.srcWindow)) {
+        MessageBoxW(g_main, L"Сначала выберите окно как источник (кнопка «Окно ▾»).", L"WVC", MB_ICONINFORMATION);
+        return;
+    }
+    HWND w = s.srcWindow;
+    if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+    g_hiddenMax = IsZoomed(w) != FALSE;
+    if (g_hiddenMax) ShowWindow(w, SW_RESTORE);
+    GetWindowRect(w, &g_hiddenRect);
+    RECT vs = VirtualScreen();
+    SetWindowPos(w, nullptr, vs.right + 200, g_hiddenRect.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    g_hiddenWin = w;
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.winCapture = 1;  // the screen no longer shows it
+    }
+    SaveSettings();
+    ComboSet(IDC_WINCAP, 1);
+    SetWindowTextW(Ctl(IDC_HIDEWIN), L"Вернуть окно на экран");
+    g_note = L"Окно спрятано за край экрана и продолжает работать. Вернуть — той же кнопкой.";
+    UpdateStatus();
+}
 static void RestartCameraForFormat() {
     StopCamera();
     if (!StartCamera()) MessageBoxW(g_main, L"Не удалось перезапустить камеру.", L"WVC", MB_ICONERROR);
@@ -2039,13 +2818,14 @@ static void RestartCameraForFormat() {
 }
 
 static void SetRegionSource(const RECT& r) {
+    RestoreHiddenWindow();
     {
         std::lock_guard<std::mutex> lk(g_setMx);
         g_set.srcMode = 0;
         g_set.srcWindow = nullptr;
         g_set.region = r;
         g_set.hasRegion = true;
-        if (g_set.view == 1) g_set.view = 0;  // picking a screen source means "show the screen"
+        if (g_set.mainSrc != 0 && g_set.pipSrc != 1) g_set.mainSrc = 0;  // picking a screen source = show it
     }
     SaveSettings();
     SyncControls();
@@ -2102,12 +2882,13 @@ static void ShowMonitorMenu() {
 }
 
 static void SetWindowSource(HWND hwnd, const std::wstring& title) {
+    if (hwnd != g_hiddenWin) RestoreHiddenWindow();
     {
         std::lock_guard<std::mutex> lk(g_setMx);
         g_set.srcMode = 1;
         g_set.srcWindow = hwnd;
         g_set.srcTitle = title;
-        if (g_set.view == 1) g_set.view = 0;
+        if (g_set.mainSrc != 0 && g_set.pipSrc != 1) g_set.mainSrc = 0;
     }
     SaveSettings();
     SyncControls();
@@ -2197,6 +2978,7 @@ static void SetCursorOption(bool on) {
 
 // --- profiles
 static void LoadProfile(const std::wstring& name) {
+    RestoreHiddenWindow();
     Settings s = GetSettings();
     ReadSettings(ProfileSection(name).c_str(), s, false);
     std::wstring note;
@@ -2212,10 +2994,14 @@ static void LoadProfile(const std::wstring& name) {
         g_set = s;
     }
     g_pauseDirty = true;
+    ++g_mediaGen;
+    g_mediaIndex = 0;
+    IniSetStr(kMainSec, L"LastScene", name);
     SaveSettings();
     SyncControls();
+    SyncSources();
     UpdateFrame();
-    g_note = note.empty() ? L"Профиль «" + name + L"» загружен." : note;
+    g_note = note.empty() ? L"Сцена «" + name + L"» загружена." : note;
     UpdateStatus();
 }
 
@@ -2246,13 +3032,14 @@ static void SaveProfile(std::wstring name) {
     WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, IniPath().c_str());  // drop old values
     WriteSettings(sec.c_str(), GetSettings(), false);
     FillProfileCombo(name);
-    g_note = L"Профиль «" + name + L"» сохранён.";
+    IniSetStr(kMainSec, L"LastScene", name);
+    g_note = L"Сцена «" + name + L"» сохранена.";
     UpdateStatus();
 }
 
 static void DeleteProfile(const std::wstring& name) {
     if (name.empty()) return;
-    std::wstring q = L"Удалить профиль «" + name + L"»?";
+    std::wstring q = L"Удалить сцену «" + name + L"»?";
     if (MessageBoxW(g_main, q.c_str(), L"WVC", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     auto names = ProfileNames();
     names.erase(std::remove(names.begin(), names.end(), name), names.end());
@@ -2448,33 +3235,433 @@ static void EditHotkeys() {
     if (!g_hotkeyNote.empty()) MessageBoxW(g_main, g_hotkeyNote.c_str(), L"WVC", MB_ICONWARNING);
 }
 
+// --- JSON export / import of everything in settings.ini (all sections: main, scenes, hotkeys)
+static std::string ToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring FromUtf8(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+    return w;
+}
+
+static std::wstring JsonStr(const std::wstring& v) {
+    std::wstring o = L"\"";
+    for (wchar_t c : v) {
+        switch (c) {
+        case L'"': o += L"\\\""; break;
+        case L'\\': o += L"\\\\"; break;
+        case L'\n': o += L"\\n"; break;
+        case L'\r': o += L"\\r"; break;
+        case L'\t': o += L"\\t"; break;
+        default:
+            if (c < 0x20) {
+                wchar_t b[8];
+                swprintf(b, 8, L"\\u%04x", static_cast<unsigned>(c));
+                o += b;
+            } else {
+                o += c;
+            }
+        }
+    }
+    return o + L"\"";
+}
+
+static std::vector<std::wstring> SplitZ(const std::vector<wchar_t>& buf, DWORD n) {
+    std::vector<std::wstring> v;
+    size_t i = 0;
+    while (i < n && buf[i]) {
+        std::wstring s(&buf[i]);
+        i += s.size() + 1;
+        v.push_back(s);
+    }
+    return v;
+}
+
+static bool ExportJson(const std::wstring& path) {
+    const std::wstring ini = IniPath();
+    std::vector<wchar_t> names(65536);
+    DWORD n = GetPrivateProfileSectionNamesW(names.data(), static_cast<DWORD>(names.size()), ini.c_str());
+    std::wstring j = L"{\n  \"app\": \"WVC\",\n  \"format\": 1,\n  \"sections\": {";
+    bool firstSec = true;
+    for (const auto& sec : SplitZ(names, n)) {
+        std::vector<wchar_t> body(262144);
+        DWORD m = GetPrivateProfileSectionW(sec.c_str(), body.data(), static_cast<DWORD>(body.size()), ini.c_str());
+        j += firstSec ? L"\n    " : L",\n    ";
+        firstSec = false;
+        j += JsonStr(sec) + L": {";
+        bool firstKey = true;
+        for (const auto& line : SplitZ(body, m)) {
+            size_t eq = line.find(L'=');
+            if (eq == std::wstring::npos) continue;
+            j += firstKey ? L"\n      " : L",\n      ";
+            firstKey = false;
+            j += JsonStr(line.substr(0, eq)) + L": " + JsonStr(line.substr(eq + 1));
+        }
+        j += L"\n    }";
+    }
+    j += L"\n  }\n}\n";
+    const std::string u = ToUtf8(j);
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD w = 0;
+    const BOOL ok = WriteFile(f, u.data(), static_cast<DWORD>(u.size()), &w, nullptr);
+    CloseHandle(f);
+    return ok && w == u.size();
+}
+
+// minimal JSON reader for {"sections": {"name": {"key": "value", ...}, ...}}
+struct JsonReader {
+    const std::wstring& t;
+    size_t i = 0;
+    bool bad = false;
+    explicit JsonReader(const std::wstring& text) : t(text) {}
+    void Ws() {
+        while (i < t.size() && (t[i] == L' ' || t[i] == L'\n' || t[i] == L'\r' || t[i] == L'\t' || t[i] == 0xFEFF)) ++i;
+    }
+    bool Eat(wchar_t c) {
+        Ws();
+        if (i < t.size() && t[i] == c) {
+            ++i;
+            return true;
+        }
+        return false;
+    }
+    std::wstring Str() {
+        Ws();
+        std::wstring o;
+        if (i >= t.size() || t[i] != L'"') {
+            bad = true;
+            return o;
+        }
+        ++i;
+        while (i < t.size() && t[i] != L'"') {
+            wchar_t c = t[i++];
+            if (c == L'\\' && i < t.size()) {
+                wchar_t e = t[i++];
+                switch (e) {
+                case L'n': o += L'\n'; break;
+                case L'r': o += L'\r'; break;
+                case L't': o += L'\t'; break;
+                case L'b': o += L'\b'; break;
+                case L'f': o += L'\f'; break;
+                case L'u':
+                    if (i + 4 <= t.size()) {
+                        o += static_cast<wchar_t>(wcstoul(t.substr(i, 4).c_str(), nullptr, 16));
+                        i += 4;
+                    }
+                    break;
+                default: o += e;
+                }
+            } else {
+                o += c;
+            }
+        }
+        if (i >= t.size()) bad = true;
+        ++i;
+        return o;
+    }
+    // a value: string, number, true/false/null -> text; objects/arrays skipped
+    std::wstring Scalar() {
+        Ws();
+        if (i < t.size() && t[i] == L'"') return Str();
+        if (i < t.size() && (t[i] == L'{' || t[i] == L'[')) {
+            Skip();
+            return L"";
+        }
+        size_t s0 = i;
+        while (i < t.size() && t[i] != L',' && t[i] != L'}' && t[i] != L']' && t[i] > L' ') ++i;
+        std::wstring v = t.substr(s0, i - s0);
+        if (v == L"true") return L"1";
+        if (v == L"false" || v == L"null") return L"0";
+        return v;
+    }
+    void Skip() {
+        Ws();
+        if (i >= t.size()) return;
+        if (t[i] == L'"') {
+            Str();
+            return;
+        }
+        if (t[i] == L'{' || t[i] == L'[') {
+            const wchar_t close = t[i] == L'{' ? L'}' : L']';
+            ++i;
+            Ws();
+            if (Eat(close)) return;
+            do {
+                if (close == L'}') {
+                    Str();
+                    if (!Eat(L':')) { bad = true; return; }
+                }
+                Skip();
+            } while (!bad && Eat(L','));
+            if (!Eat(close)) bad = true;
+            return;
+        }
+        Scalar();
+    }
+};
+
+typedef std::vector<std::pair<std::wstring, std::vector<std::pair<std::wstring, std::wstring>>>> IniDump;
+
+static bool ParseJsonSections(const std::wstring& text, IniDump& out, bool* isWvc) {
+    JsonReader r(text);
+    *isWvc = false;
+    if (!r.Eat(L'{')) return false;
+    if (r.Eat(L'}')) return true;
+    do {
+        std::wstring key = r.Str();
+        if (r.bad || !r.Eat(L':')) return false;
+        if (key == L"app") {
+            *isWvc = r.Scalar() == L"WVC";
+        } else if (key == L"sections") {
+            if (!r.Eat(L'{')) return false;
+            if (!r.Eat(L'}')) {
+                do {
+                    std::wstring sec = r.Str();
+                    if (r.bad || !r.Eat(L':') || !r.Eat(L'{')) return false;
+                    out.push_back({sec, {}});
+                    if (!r.Eat(L'}')) {
+                        do {
+                            std::wstring k = r.Str();
+                            if (r.bad || !r.Eat(L':')) return false;
+                            out.back().second.push_back({k, r.Scalar()});
+                        } while (!r.bad && r.Eat(L','));
+                        if (!r.Eat(L'}')) return false;
+                    }
+                } while (!r.bad && r.Eat(L','));
+                if (!r.Eat(L'}')) return false;
+            }
+        } else {
+            r.Skip();
+        }
+    } while (!r.bad && r.Eat(L','));
+    return !r.bad && r.Eat(L'}');
+}
+
+static bool ImportJsonFile(const std::wstring& path, std::wstring* err) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        *err = L"Не удалось открыть файл.";
+        return false;
+    }
+    std::string bytes;
+    char buf[65536];
+    DWORD got = 0;
+    while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got) bytes.append(buf, got);
+    CloseHandle(f);
+    if (bytes.size() >= 3 && static_cast<unsigned char>(bytes[0]) == 0xEF) bytes.erase(0, 3);
+    IniDump dump;
+    bool isWvc = false;
+    if (!ParseJsonSections(FromUtf8(bytes), dump, &isWvc) || dump.empty()) {
+        *err = L"Файл не похож на настройки WVC (ошибка в JSON).";
+        return false;
+    }
+    if (!isWvc) {
+        *err = L"В файле нет пометки \"app\": \"WVC\".";
+        return false;
+    }
+    // replace the whole ini
+    const std::wstring ini = IniPath();
+    HANDLE w = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (w != INVALID_HANDLE_VALUE) {
+        const unsigned char bom[2] = {0xFF, 0xFE};
+        DWORD wr = 0;
+        WriteFile(w, bom, 2, &wr, nullptr);
+        CloseHandle(w);
+    }
+    for (const auto& sec : dump)
+        for (const auto& kv : sec.second)
+            WritePrivateProfileStringW(sec.first.c_str(), kv.first.c_str(), kv.second.c_str(), ini.c_str());
+    return true;
+}
+
+static bool PickJsonFile(bool save, std::wstring* out) {
+    wchar_t file[MAX_PATH * 2] = L"WVC-настройки.json";
+    if (!save) file[0] = 0;
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter = L"Настройки WVC (*.json)\0*.json\0Все файлы\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH * 2;
+    ofn.lpstrDefExt = L"json";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    if (!(save ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn))) return false;
+    *out = file;
+    return true;
+}
+static void AfterLayersChanged() {
+    SaveSettings();
+    SyncControls();
+    SyncSources();
+    UpdateFrame();
+    UpdateStatus();
+}
+
+static void SwapLayers() {
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        if (g_set.pipSrc == 0) return;
+        const int big = g_set.mainSrc;
+        g_set.mainSrc = g_set.pipSrc - 1;
+        g_set.pipSrc = big + 1;
+    }
+    AfterLayersChanged();
+}
+
+static void OnPipDragged() {
+    SaveSettings();
+}
+
+static void MediaListChanged() {
+    ++g_mediaGen;
+    g_mediaIndex = 0;
+    SaveSettings();
+    FillMediaList();
+    MediaSync();
+}
+
+static void MediaAdd() {
+    std::vector<wchar_t> buf(32768, 0);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter =
+        L"Картинки и видео\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp;*.mp4;*.m4v;*.mov;*.avi;*.wmv;*.mkv;*.webm;*.mpg;*.mpeg;*.ts;*.3gp\0"
+        L"Все файлы\0*.*\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = static_cast<DWORD>(buf.size());
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+    if (!GetOpenFileNameW(&ofn)) return;
+    std::vector<std::wstring> files;
+    std::wstring first = buf.data();
+    const wchar_t* p = buf.data() + first.size() + 1;
+    if (!*p) {
+        files.push_back(first);  // one file: full path
+    } else {
+        while (*p) {  // directory, then names
+            std::wstring name = p;
+            files.push_back(first + L"\\" + name);
+            p += name.size() + 1;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        for (auto& f : files) g_set.media.push_back(f);
+        if (g_set.media.size() > 500) g_set.media.resize(500);
+    }
+    MediaListChanged();
+}
+
+static void MediaRemove() {
+    const int sel = static_cast<int>(SendMessageW(Ctl(IDC_MEDIA_LIST), LB_GETCURSEL, 0, 0));
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        if (sel < 0 || sel >= static_cast<int>(g_set.media.size())) return;
+        g_set.media.erase(g_set.media.begin() + sel);
+    }
+    MediaListChanged();
+}
+
+static void MediaMove(int dir) {
+    const int sel = static_cast<int>(SendMessageW(Ctl(IDC_MEDIA_LIST), LB_GETCURSEL, 0, 0));
+    int to = sel + dir;
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        if (sel < 0 || to < 0 || to >= static_cast<int>(g_set.media.size())) return;
+        std::swap(g_set.media[sel], g_set.media[to]);
+    }
+    MediaListChanged();
+    SendMessageW(Ctl(IDC_MEDIA_LIST), LB_SETCURSEL, to, 0);
+}
+
+static void ReloadAllSettings() {
+    Settings old = GetSettings();
+    Settings s;
+    ReadSettings(kMainSec, s, true);
+    if (s.srcMode == 1) {
+        s.srcWindow = FindWindowByTitle(s.srcTitle);
+        if (!s.srcWindow) s.srcMode = 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set = s;
+    }
+    LoadHotkeys();
+    RegisterHotkeys(g_main);
+    SetTextIfChanged(Ctl(IDC_HK_LIST), HotkeyListText());
+    FillProfileCombo(IniStr(kMainSec, L"LastScene"));
+    ++g_mediaGen;
+    g_mediaIndex = 0;
+    g_pauseDirty = true;
+    SyncControls();
+    if (old.quality != s.quality || old.aspect != s.aspect || old.fps != s.fps) RestartCameraForFormat();
+    SyncSources();
+    UpdateFrame();
+    UpdateStatus();
+}
+
+static void DoExportJson() {
+    std::wstring f;
+    if (!PickJsonFile(true, &f)) return;
+    SaveSettings();
+    SaveHotkeys();
+    if (ExportJson(f))
+        g_note = L"Настройки сохранены в " + FileNameOf(f) + L".";
+    else
+        MessageBoxW(g_main, L"Не удалось записать файл.", L"WVC", MB_ICONERROR);
+    UpdateStatus();
+}
+
+static void DoImportJson() {
+    std::wstring f;
+    if (!PickJsonFile(false, &f)) return;
+    if (MessageBoxW(g_main, L"Заменить все текущие настройки, сцены и горячие клавиши настройками из файла?", L"WVC",
+                    MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+    std::wstring err;
+    if (!ImportJsonFile(f, &err)) {
+        MessageBoxW(g_main, err.c_str(), L"WVC", MB_ICONERROR);
+        return;
+    }
+    ReloadAllSettings();
+    g_note = L"Настройки загружены из " + FileNameOf(f) + L".";
+    UpdateStatus();
+}
+
 static void OnHotkey(int action) {
     switch (action) {
     case HA_TOGGLE: ToggleStreaming(); return;
     case HA_SELECT: DoSelectRegion(); return;
     case HA_MONITOR: NextMonitor(); return;
     case HA_CURSOR: SetCursorOption(!GetSettings().cursor); return;
+    case HA_SWAP: SwapLayers(); return;
+    case HA_MEDIA_NEXT: MediaNext(); return;
+    case HA_HIDE_WINDOW: ToggleHideWindow(); return;
     case HA_SCREEN_CAM:
     case HA_PIP:
     case HA_TEXT: {
         {
             std::lock_guard<std::mutex> lk(g_setMx);
-            if (action == HA_SCREEN_CAM) g_set.view = g_set.view == 1 ? 0 : 1;
-            if (action == HA_PIP) g_set.view = g_set.view == 2 ? 0 : 2;
+            if (action == HA_SCREEN_CAM) g_set.mainSrc = g_set.mainSrc == 1 ? 0 : 1;
+            if (action == HA_PIP) g_set.pipSrc = g_set.pipSrc != 0 ? 0 : (g_set.mainSrc == 1 ? 1 : 2);
             if (action == HA_TEXT) g_set.textOn = !g_set.textOn;
         }
-        SaveSettings();
-        SyncControls();
-        WebcamSync();
-        UpdateFrame();
-        UpdateStatus();
+        AfterLayersChanged();
         return;
     }
     default:
         if (action >= HA_PROFILE1 && action <= HA_PROFILE4) LoadProfileByIndex(action - HA_PROFILE1);
     }
 }
-
 static void DoInstall(bool install) {
     if (!install &&
         MessageBoxW(g_main, L"Удалить камеру «WVC Camera» из системы?", L"WVC", MB_YESNO | MB_ICONQUESTION) != IDYES)
@@ -2525,16 +3712,17 @@ static void CreateControls(HWND hwnd) {
                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
     };
     HWND tab = mk(WC_TABCONTROLW, L"", WS_CLIPSIBLINGS | WS_TABSTOP, IDC_TAB);
-    const wchar_t* tabs[] = {L"Источник и картинка", L"Камера и наложения", L"Профили и клавиши"};
-    for (int i = 0; i < 3; ++i) {
+    const wchar_t* tabs[] = {L"Источник", L"Наложения", L"Медиа", L"Сцены и клавиши"};
+    for (int i = 0; i < 4; ++i) {
         TCITEMW ti{};
         ti.mask = TCIF_TEXT;
         ti.pszText = const_cast<wchar_t*>(tabs[i]);
         SendMessageW(tab, TCM_INSERTITEMW, i, reinterpret_cast<LPARAM>(&ti));
     }
+    auto shapes = {L"Прямоугольник", L"Скруглённый", L"Круг", L"Шестиугольник", L"Восьмиугольник"};
 
     // page 0
-    mk(L"STATIC", L"Источник:", 0, IDC_SRC_LABEL);
+    mk(L"STATIC", L"Экран:", 0, IDC_SRC_LABEL);
     mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_SRC_VALUE);
     mk(L"BUTTON", L"Область…", WS_TABSTOP | BS_PUSHBUTTON, IDC_SELECT);
     mk(L"BUTTON", L"Монитор ▾", WS_TABSTOP | BS_PUSHBUTTON, IDC_MONITOR);
@@ -2551,17 +3739,28 @@ static void CreateControls(HWND hwnd) {
     AddCombo(hwnd, IDC_ROT, {L"Без поворота", L"90° по часовой", L"180°", L"90° против часовой"});
     mk(L"STATIC", L"Увеличение (центр):", 0, IDC_ZOOM_LABEL);
     AddCombo(hwnd, IDC_ZOOM, {L"100%", L"125%", L"150%", L"200%", L"300%", L"400%"});
+    mk(L"STATIC", L"Форма кадра и фон:", 0, IDC_SHAPE_LABEL);
+    AddCombo(hwnd, IDC_FRAMESHAPE, shapes);
+    AddCombo(hwnd, IDC_SHAPECOLOR, {L"Чёрный", L"Белый", L"Зелёный", L"Серый"});
     mk(L"BUTTON", L"Зеркально", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_MIRROR);
     mk(L"BUTTON", L"Показывать курсор", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_CURSOR);
+    mk(L"STATIC", L"Окно захватывать:", 0, IDC_WCAP_LABEL);
+    AddCombo(hwnd, IDC_WINCAP, {L"С экрана (как видно)", L"Из самого окна"});
+    mk(L"BUTTON", L"Спрятать окно за экран", WS_TABSTOP | BS_PUSHBUTTON, IDC_HIDEWIN);
 
     // page 1
-    mk(L"STATIC", L"Показывать:", 0, IDC_VIEW_LABEL);
-    AddCombo(hwnd, IDC_VIEW, {L"Экран", L"Веб-камеру", L"Экран + камера в углу"});
+    mk(L"STATIC", L"Большая картинка:", 0, IDC_VIEW_LABEL);
+    AddCombo(hwnd, IDC_VIEW, {L"Экран", L"Веб-камера", L"Медиафайлы"});
+    mk(L"STATIC", L"Окошко поверх:", 0, IDC_PIPSRC_LABEL);
+    AddCombo(hwnd, IDC_PIPSRC, {L"Нет", L"Экран", L"Веб-камера", L"Медиафайлы"});
+    mk(L"BUTTON", L"⇄", WS_TABSTOP | BS_PUSHBUTTON, IDC_SWAP);
     mk(L"STATIC", L"Веб-камера:", 0, IDC_CAM_LABEL);
     AddCombo(hwnd, IDC_CAMDEV, {});
-    mk(L"STATIC", L"Окошко камеры:", 0, IDC_PIP_LABEL);
+    mk(L"STATIC", L"Окошко: в угол", 0, IDC_PIP_LABEL);
     AddCombo(hwnd, IDC_PIPCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
     AddCombo(hwnd, IDC_PIPSIZE, {L"20%", L"25%", L"33%"});
+    mk(L"STATIC", L"Форма окошка:", 0, IDC_PIPSHAPE_LABEL);
+    AddCombo(hwnd, IDC_PIPSHAPE, shapes);
     mk(L"BUTTON", L"Зеркалить веб-камеру (как в зеркале)", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_CAMMIRROR);
     mk(L"STATIC", L"Надпись:", 0, IDC_TEXT_LABEL);
     HWND ed = mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_TEXT, WS_EX_CLIENTEDGE);
@@ -2578,19 +3777,42 @@ static void CreateControls(HWND hwnd) {
     AddCombo(hwnd, IDC_LOGOCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
     AddCombo(hwnd, IDC_LOGOSIZE, {L"10%", L"15%", L"20%", L"30%"});
     mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_LOGO_NAME);
+    mk(L"STATIC",
+       L"Окошко можно перетаскивать мышью прямо в предпросмотре, а за правый нижний угол — менять размер. "
+       L"Кнопка ⇄ меняет местами большую картинку и окошко.",
+       0, IDC_PIP_HINT);
 
     // page 2
-    mk(L"STATIC", L"Профиль:", 0, IDC_PROF_LABEL);
+    mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, IDC_MEDIA_LIST, WS_EX_CLIENTEDGE);
+    mk(L"BUTTON", L"Добавить…", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_ADD);
+    mk(L"BUTTON", L"Убрать", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_DEL);
+    mk(L"BUTTON", L"▲", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_UP);
+    mk(L"BUTTON", L"▼", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_DOWN);
+    mk(L"STATIC", L"Картинку показывать:", 0, IDC_IMGSEC_LABEL);
+    AddCombo(hwnd, IDC_IMGSEC, {L"3 секунды", L"5 секунд", L"10 секунд", L"30 секунд", L"1 минуту"});
+    mk(L"BUTTON", L"⏭  Следующий файл", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_NEXT);
+    mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_MEDIA_NOW);
+    mk(L"STATIC",
+       L"Файлы идут по кругу. Картинки: PNG, JPG, BMP, GIF (анимация). Видео: MP4, MOV, AVI, WMV, MKV — если в Windows "
+       L"есть кодек. Звук в камеру не передаётся. Чтобы показать: «Большая картинка» или «Окошко» → «Медиафайлы».",
+       0, IDC_MEDIA_HINT);
+
+    // page 3
+    mk(L"STATIC", L"Сцена:", 0, IDC_PROF_LABEL);
     AddCombo(hwnd, IDC_PROFILE, {});
     mk(L"BUTTON", L"Загрузить", WS_TABSTOP | BS_PUSHBUTTON, IDC_PROF_LOAD);
     mk(L"BUTTON", L"Сохранить…", WS_TABSTOP | BS_PUSHBUTTON, IDC_PROF_SAVE);
     mk(L"BUTTON", L"Удалить", WS_TABSTOP | BS_PUSHBUTTON, IDC_PROF_DEL);
     mk(L"STATIC",
-       L"Профиль запоминает источник, поворот, масштаб, веб-камеру, надпись, логотип и паузу. Качество и частота "
-       L"кадров в профиль не входят: их смена требует переподключения камеры.",
+       L"Сцена запоминает рамку, окно программы, что где показано, окошко, формы, надпись, логотип, медиафайлы и паузу. "
+       L"Качество и частота в сцену не входят. При запуске WVC возвращает всё как было.",
        0, IDC_PROF_HINT);
+    mk(L"BUTTON", L"Запускать вместе с Windows (сразу в трей)", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_AUTOSTART);
+    mk(L"BUTTON", L"Сразу включать трансляцию при запуске", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_AUTOSTREAM);
+    mk(L"BUTTON", L"Сохранить всё в JSON…", WS_TABSTOP | BS_PUSHBUTTON, IDC_JSON_EXPORT);
+    mk(L"BUTTON", L"Загрузить из JSON…", WS_TABSTOP | BS_PUSHBUTTON, IDC_JSON_IMPORT);
     mk(L"BUTTON", L"Настроить горячие клавиши…", WS_TABSTOP | BS_PUSHBUTTON, IDC_HK_EDIT);
-    mk(L"STATIC", L"", 0, IDC_HK_LIST);
+    mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL, IDC_HK_LIST);
 
     // right column
     mk(L"STATIC", L"Предпросмотр (то, что видят другие):", 0, IDC_PREV_LABEL);
@@ -2605,7 +3827,6 @@ static void CreateControls(HWND hwnd) {
     mk(L"BUTTON", L"Установить камеру", WS_TABSTOP | BS_PUSHBUTTON, IDC_INSTALL);
     mk(L"BUTTON", L"Удалить камеру", WS_TABSTOP | BS_PUSHBUTTON, IDC_UNINSTALL);
 }
-
 static void ResizeForDpi(HWND hwnd) {
     RECT r{0, 0, S(kClientW), S(kClientH)};
     AdjustWindowRectExForDpi(&r, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)), FALSE,
@@ -2614,9 +3835,15 @@ static void ResizeForDpi(HWND hwnd) {
 }
 
 // one combo / checkbox / edit changed -> settings
+// one combo / checkbox / edit changed -> settings
 static void OnControlChanged(int id) {
     if (g_syncing) return;
-    bool format = false, pause = false, webcam = false;
+    bool format = false, pause = false, layers = false, media = false;
+    int W, H;
+    {
+        Settings cur = GetSettings();
+        OutSize(cur.quality, cur.aspect, &W, &H);
+    }
     {
         std::lock_guard<std::mutex> lk(g_setMx);
         Settings& s = g_set;
@@ -2633,9 +3860,13 @@ static void OnControlChanged(int id) {
         case IDC_FIT: s.fit = sel == 1 ? 1 : 0; break;
         case IDC_ROT: s.rotation = sel & 3; break;
         case IDC_ZOOM: s.zoom = (std::min)(sel, kZoomCount - 1); break;
+        case IDC_FRAMESHAPE: s.frameShape = (std::min)(sel, kShapeCount - 1); break;
+        case IDC_SHAPECOLOR: s.shapeColor = (std::min)(sel, 3); break;
         case IDC_MIRROR: s.mirror = CheckGet(id); break;
         case IDC_CURSOR: s.cursor = CheckGet(id); break;
-        case IDC_VIEW: s.view = (std::min)(sel, 2); webcam = true; break;
+        case IDC_WINCAP: s.winCapture = sel == 1 ? 1 : 0; break;
+        case IDC_VIEW: s.mainSrc = (std::min)(sel, 2); layers = true; break;
+        case IDC_PIPSRC: s.pipSrc = (std::min)(sel, 3); layers = true; break;
         case IDC_CAMDEV:
             if (sel >= 1 && sel <= static_cast<int>(g_camList.size())) {
                 s.camLink = g_camList[sel - 1].link;
@@ -2644,10 +3875,11 @@ static void OnControlChanged(int id) {
                 s.camLink.clear();
                 s.camName.clear();
             }
-            webcam = true;
+            layers = true;
             break;
-        case IDC_PIPCORNER: s.pipCorner = (std::min)(sel, 3); break;
-        case IDC_PIPSIZE: s.pipSize = (std::min)(sel, 2); break;
+        case IDC_PIPCORNER: s.pipCorner = (std::min)(sel, 3); PipPreset(s, W, H); break;
+        case IDC_PIPSIZE: s.pipSize = (std::min)(sel, 2); PipPreset(s, W, H); break;
+        case IDC_PIPSHAPE: s.pipShape = (std::min)(sel, kShapeCount - 1); break;
         case IDC_CAMMIRROR: s.camMirror = CheckGet(id); break;
         case IDC_TEXT: {
             wchar_t buf[256] = {};
@@ -2661,6 +3893,7 @@ static void OnControlChanged(int id) {
         case IDC_LOGOCORNER: s.logoCorner = (std::min)(sel, 3); break;
         case IDC_LOGOSIZE: s.logoSize = (std::min)(sel, 3); break;
         case IDC_PAUSE: s.pauseMode = (std::min)(sel, 3); pause = true; break;
+        case IDC_IMGSEC: s.imageSec = (std::min)(sel, 4); media = true; break;
         default: return;
         }
     }
@@ -2670,13 +3903,16 @@ static void OnControlChanged(int id) {
         g_pauseDirty = true;
         if (GetSettings().pauseMode == 3 && GetSettings().pauseImage.empty()) ChoosePauseImage();
     }
-    if (webcam) {
-        WebcamSync();
+    if (media) {
+        ++g_mediaGen;
+        MediaSync();
+    }
+    if (layers) {
+        SyncSources();
         UpdateFrame();
         UpdateStatus();
     }
 }
-
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -2688,7 +3924,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Layout();
         ResizeForDpi(hwnd);
         SyncControls();
-        FillProfileCombo(L"");
+        FillProfileCombo(IniStr(kMainSec, L"LastScene"));
         SetTextIfChanged(Ctl(IDC_HK_LIST), HotkeyListText());
         ShowPage(0);
         UpdateSourceLabel();
@@ -2745,7 +3981,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == kTimerPreview) {
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) InvalidateRect(g_preview, nullptr, FALSE);
         } else if (wp == kTimerFollow) {
-            WebcamSync();
+            SyncSources();
             if (g_streaming && GetSettings().srcMode == 1) UpdateFrame();
         }
         return 0;
@@ -2795,7 +4031,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_PROF_LOAD: {
             std::wstring n = SelectedProfile();
             if (n.empty())
-                MessageBoxW(hwnd, L"Профилей пока нет: настройте всё и нажмите «Сохранить…».", L"WVC",
+                MessageBoxW(hwnd, L"Сцен пока нет: настройте всё и нажмите «Сохранить…».", L"WVC",
                             MB_ICONINFORMATION);
             else
                 LoadProfile(n);
@@ -2803,13 +4039,40 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case IDC_PROF_SAVE: {
             std::wstring n = SelectedProfile();
-            if (n.empty()) n = L"Профиль " + std::to_wstring(ProfileNames().size() + 1);
-            if (InputBox(L"Сохранить профиль", L"Название профиля (то же название — перезаписать):", &n))
+            if (n.empty()) n = L"Сцена " + std::to_wstring(ProfileNames().size() + 1);
+            if (InputBox(L"Сохранить сцену", L"Название сцены (то же название — перезаписать):", &n))
                 SaveProfile(n);
             break;
         }
         case IDC_PROF_DEL: DeleteProfile(SelectedProfile()); break;
         case IDC_HK_EDIT: EditHotkeys(); break;
+        case IDC_SWAP: SwapLayers(); break;
+        case IDC_HIDEWIN: ToggleHideWindow(); break;
+        case IDC_MEDIA_ADD: MediaAdd(); break;
+        case IDC_MEDIA_DEL: MediaRemove(); break;
+        case IDC_MEDIA_UP: MediaMove(-1); break;
+        case IDC_MEDIA_DOWN: MediaMove(1); break;
+        case IDC_MEDIA_NEXT: MediaNext(); break;
+        case IDC_MEDIA_LIST:
+            if (code == LBN_DBLCLK) {
+                const int sel = static_cast<int>(SendMessageW(Ctl(IDC_MEDIA_LIST), LB_GETCURSEL, 0, 0));
+                if (sel >= 0) {
+                    g_mediaIndex = sel - 1;  // the player moves on to sel
+                    MediaNext();
+                }
+            }
+            break;
+        case IDC_JSON_EXPORT: DoExportJson(); break;
+        case IDC_JSON_IMPORT: DoImportJson(); break;
+        case IDC_AUTOSTART:
+            if (code == BN_CLICKED && !g_syncing && !SetAutostart(CheckGet(IDC_AUTOSTART))) {
+                MessageBoxW(hwnd, L"Не удалось изменить автозапуск.", L"WVC", MB_ICONERROR);
+                CheckSet(IDC_AUTOSTART, AutostartOn());
+            }
+            break;
+        case IDC_AUTOSTREAM:
+            if (code == BN_CLICKED && !g_syncing) IniSetInt(kMainSec, L"AutoStream", CheckGet(IDC_AUTOSTREAM) ? 1 : 0);
+            break;
         case IDC_INSTALL: DoInstall(true); break;
         case IDC_UNINSTALL: DoInstall(false); break;
         case IDC_CAMDEV:
@@ -2840,6 +4103,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        RestoreHiddenWindow();
         UnregisterHotkeys(hwnd);
         KillTimer(hwnd, kTimerStatus);
         KillTimer(hwnd, kTimerPreview);
@@ -2850,6 +4114,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
+
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -2953,9 +4218,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
                                 840, 520, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
-    ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
+    const bool tray = cmdLine && wcsstr(cmdLine, L"--tray");
+    if (!tray) {
+        ShowWindow(hwnd, nCmdShow);
+        UpdateWindow(hwnd);
+    }
     UpdateStatus();
+    if (IniInt(kMainSec, L"AutoStream", 0) && HaveSource() && g_cam) ToggleStreaming();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -2973,6 +4242,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
 
     g_streaming = false;
     WebcamStop();
+    MediaStop();
     StopCamera();
     if (g_frame) DestroyWindow(g_frame);
     if (g_font) DeleteObject(g_font);
