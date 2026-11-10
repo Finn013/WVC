@@ -1,11 +1,16 @@
 // WVC — лёгкая виртуальная камера, которая показывает выбранную область экрана.
-// Камера: DirectShow-фильтр на базе tshino/softcam (MIT), лежит в WVCCam.dll / WVCCam32.dll.
-// Это приложение: выбор области, захват экрана (GDI), отправка кадров в камеру.
+// Камера: DirectShow-фильтр на базе tshino/softcam (MIT) в WVCCam.dll / WVCCam32.dll.
+// Это приложение: источник (область / монитор / окно), захват GDI, поворот/зеркало/зум,
+// предпросмотр, картинка на паузе, горячие клавиши, автовосстановление.
 
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shlobj.h>
+#include <dwmapi.h>
+#include <objbase.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -42,26 +48,41 @@ static const wchar_t* kDll32 = L"WVCCam32.dll";
 // Settings
 // ---------------------------------------------------------------------------
 struct Settings {
-    int  res = 1;          // 0 = 1280x720, 1 = 1920x1080
+    int  quality = 1;      // 0 = 720p, 1 = 1080p
+    int  aspect = 0;       // 0 = 16:9, 1 = 4:3, 2 = 1:1, 3 = 9:16
     int  fps = 30;         // 30 or 60
-    bool cursor = false;   // draw mouse cursor
+    bool cursor = false;
     int  fit = 0;          // 0 = letterbox, 1 = crop
+    int  rotation = 0;     // 0, 1, 2, 3 = 0/90/180/270 degrees clockwise
+    bool mirror = false;
+    int  zoom = 0;         // index into kZoom
+    int  pauseMode = 2;    // 0 = freeze, 1 = black, 2 = text card, 3 = image
+    std::wstring pauseImage;
+    int  srcMode = 0;      // 0 = region, 1 = window
+    HWND srcWindow = nullptr;
+    std::wstring srcTitle;
     bool hasRegion = false;
     RECT region{};         // virtual-screen coordinates, physical pixels
 };
 
-static const int kResW[] = {1280, 1920};
-static const int kResH[] = {720, 1080};
+static const double kZoom[] = {1.0, 1.25, 1.5, 2.0, 3.0, 4.0};
+static const int kZoomCount = 6;
 
-static Settings    g_set;
-static std::mutex  g_setMx;
+static void OutSize(int quality, int aspect, int* w, int* h) {
+    static const int sz[2][4][2] = {
+        {{1280, 720}, {960, 720}, {720, 720}, {720, 1280}},
+        {{1920, 1080}, {1440, 1080}, {1080, 1080}, {1080, 1920}},
+    };
+    *w = sz[quality][aspect][0];
+    *h = sz[quality][aspect][1];
+}
 
-static std::wstring ExeDir() {
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring p(buf, n);
-    size_t pos = p.find_last_of(L"\\/");
-    return pos == std::wstring::npos ? L"." : p.substr(0, pos);
+static Settings   g_set;
+static std::mutex g_setMx;
+
+static Settings GetSettings() {
+    std::lock_guard<std::mutex> lk(g_setMx);
+    return g_set;
 }
 
 static std::wstring ExePath() {
@@ -70,19 +91,57 @@ static std::wstring ExePath() {
     return std::wstring(buf, n);
 }
 
+static std::wstring ExeDir() {
+    std::wstring p = ExePath();
+    size_t pos = p.find_last_of(L"\\/");
+    return pos == std::wstring::npos ? L"." : p.substr(0, pos);
+}
+
 static std::wstring IniPath() {
+    static std::wstring cached;
+    if (!cached.empty()) return cached;
     wchar_t buf[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, buf))) {
         std::wstring dir = std::wstring(buf) + L"\\WVC";
         CreateDirectoryW(dir.c_str(), nullptr);
-        return dir + L"\\settings.ini";
+        cached = dir + L"\\settings.ini";
+    } else {
+        cached = ExeDir() + L"\\settings.ini";
     }
-    return ExeDir() + L"\\settings.ini";
+    return cached;
+}
+
+// The *PrivateProfile*W functions keep Unicode only if the file is UTF-16LE with a BOM.
+static void EnsureUnicodeIni() {
+    const std::wstring path = IniPath();
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    std::string bytes;
+    if (f != INVALID_HANDLE_VALUE) {
+        char buf[4096];
+        DWORD got = 0;
+        while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got) bytes.append(buf, got);
+        CloseHandle(f);
+        if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0xFF &&
+            static_cast<unsigned char>(bytes[1]) == 0xFE)
+            return;  // already UTF-16
+    }
+    std::wstring text;
+    if (!bytes.empty()) {
+        int n = MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+        text.resize(n);
+        MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), &text[0], n);
+    }
+    f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    const unsigned char bom[2] = {0xFF, 0xFE};
+    WriteFile(f, bom, 2, &w, nullptr);
+    if (!text.empty()) WriteFile(f, text.data(), static_cast<DWORD>(text.size() * sizeof(wchar_t)), &w, nullptr);
+    CloseHandle(f);
 }
 
 static int IniInt(const wchar_t* key, int def) {
-    wchar_t buf[64];
-    wchar_t defs[32];
+    wchar_t buf[64], defs[32];
     swprintf(defs, 32, L"%d", def);
     GetPrivateProfileStringW(L"WVC", key, defs, buf, 64, IniPath().c_str());
     return _wtoi(buf);
@@ -94,12 +153,25 @@ static void IniSetInt(const wchar_t* key, int v) {
     WritePrivateProfileStringW(L"WVC", key, buf, IniPath().c_str());
 }
 
+static std::wstring IniStr(const wchar_t* key) {
+    wchar_t buf[MAX_PATH * 2] = {};
+    GetPrivateProfileStringW(L"WVC", key, L"", buf, MAX_PATH * 2, IniPath().c_str());
+    return buf;
+}
+
 static void LoadSettings() {
+    EnsureUnicodeIni();
     Settings s;
-    s.res = std::clamp(IniInt(L"Resolution", 1), 0, 1);
+    s.quality = std::clamp(IniInt(L"Resolution", 1), 0, 1);
+    s.aspect = std::clamp(IniInt(L"Aspect", 0), 0, 3);
     s.fps = IniInt(L"FPS", 30) == 60 ? 60 : 30;
     s.cursor = IniInt(L"Cursor", 0) != 0;
     s.fit = std::clamp(IniInt(L"Fit", 0), 0, 1);
+    s.rotation = std::clamp(IniInt(L"Rotation", 0), 0, 3);
+    s.mirror = IniInt(L"Mirror", 0) != 0;
+    s.zoom = std::clamp(IniInt(L"Zoom", 0), 0, kZoomCount - 1);
+    s.pauseMode = std::clamp(IniInt(L"PauseMode", 2), 0, 3);
+    s.pauseImage = IniStr(L"PauseImage");
     s.hasRegion = IniInt(L"HasRegion", 0) != 0;
     s.region.left = IniInt(L"Left", 0);
     s.region.top = IniInt(L"Top", 0);
@@ -111,15 +183,17 @@ static void LoadSettings() {
 }
 
 static void SaveSettings() {
-    Settings s;
-    {
-        std::lock_guard<std::mutex> lk(g_setMx);
-        s = g_set;
-    }
-    IniSetInt(L"Resolution", s.res);
+    Settings s = GetSettings();
+    IniSetInt(L"Resolution", s.quality);
+    IniSetInt(L"Aspect", s.aspect);
     IniSetInt(L"FPS", s.fps);
     IniSetInt(L"Cursor", s.cursor ? 1 : 0);
     IniSetInt(L"Fit", s.fit);
+    IniSetInt(L"Rotation", s.rotation);
+    IniSetInt(L"Mirror", s.mirror ? 1 : 0);
+    IniSetInt(L"Zoom", s.zoom);
+    IniSetInt(L"PauseMode", s.pauseMode);
+    WritePrivateProfileStringW(L"WVC", L"PauseImage", s.pauseImage.c_str(), IniPath().c_str());
     IniSetInt(L"HasRegion", s.hasRegion ? 1 : 0);
     IniSetInt(L"Left", s.region.left);
     IniSetInt(L"Top", s.region.top);
@@ -127,90 +201,247 @@ static void SaveSettings() {
     IniSetInt(L"Bottom", s.region.bottom);
 }
 
-static Settings GetSettings() {
-    std::lock_guard<std::mutex> lk(g_setMx);
-    return g_set;
+// ---------------------------------------------------------------------------
+// Monitors and windows
+// ---------------------------------------------------------------------------
+struct MonitorItem {
+    RECT rc;
+    bool primary;
+};
+
+static BOOL CALLBACK EnumMonProc(HMONITOR hm, HDC, LPRECT, LPARAM lp) {
+    auto* v = reinterpret_cast<std::vector<MonitorItem>*>(lp);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hm, &mi)) v->push_back({mi.rcMonitor, (mi.dwFlags & MONITORINFOF_PRIMARY) != 0});
+    return TRUE;
+}
+
+static std::vector<MonitorItem> Monitors() {
+    std::vector<MonitorItem> v;
+    EnumDisplayMonitors(nullptr, nullptr, EnumMonProc, reinterpret_cast<LPARAM>(&v));
+    std::sort(v.begin(), v.end(), [](const MonitorItem& a, const MonitorItem& b) {
+        return a.rc.left != b.rc.left ? a.rc.left < b.rc.left : a.rc.top < b.rc.top;
+    });
+    return v;
+}
+
+static RECT PrimaryMonitorRect() {
+    POINT zero{0, 0};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromPoint(zero, MONITOR_DEFAULTTOPRIMARY), &mi);
+    return mi.rcMonitor;
+}
+
+static RECT VirtualScreen() {
+    RECT r;
+    r.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    r.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    r.right = r.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    r.bottom = r.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    return r;
+}
+
+static bool WindowRectOf(HWND hwnd, RECT* r) {
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return false;
+    if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, r, sizeof(*r)))) {
+        if (!GetWindowRect(hwnd, r)) return false;
+    }
+    return r->right - r->left >= 16 && r->bottom - r->top >= 16;
+}
+
+struct WindowItem {
+    HWND hwnd;
+    std::wstring title;
+};
+
+static BOOL CALLBACK EnumWinProc(HWND hwnd, LPARAM lp) {
+    auto* v = reinterpret_cast<std::vector<WindowItem>*>(lp);
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
+    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) return TRUE;
+    BOOL cloaked = FALSE;
+    DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (cloaked) return TRUE;
+    wchar_t title[256] = {};
+    if (GetWindowTextW(hwnd, title, 256) <= 0) return TRUE;
+    RECT r;
+    if (!WindowRectOf(hwnd, &r)) return TRUE;
+    std::wstring t = title;
+    if (t.size() > 60) t = t.substr(0, 57) + L"…";
+    v->push_back({hwnd, t});
+    return v->size() < 40;
+}
+
+// Source rectangle for this frame. false = nothing to capture right now.
+static bool ResolveSource(const Settings& s, RECT* r) {
+    if (s.srcMode == 1) return WindowRectOf(s.srcWindow, r);
+    if (!s.hasRegion) return false;
+    *r = s.region;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// Screen capture (GDI)
+// Screen capture (GDI) + transform
 // ---------------------------------------------------------------------------
 class Capturer {
 public:
     Capturer(int w, int h) : W(w), H(h) {
         screenDC = GetDC(nullptr);
         memDC = CreateCompatibleDC(screenDC);
+    }
+    ~Capturer() {
+        FreeCanvas();
+        if (memDC) DeleteDC(memDC);
+        if (screenDC) ReleaseDC(nullptr, screenDC);
+    }
+
+    // out: W*H*3 bytes, BGR, top-down (what softcam expects)
+    bool Grab(const RECT& src, const Settings& s, uint8_t* out) {
+        double sx = src.left, sy = src.top;
+        double sw = src.right - src.left, sh = src.bottom - src.top;
+        if (sw < 1 || sh < 1 || !screenDC || !memDC) return false;
+
+        const double z = kZoom[std::clamp(s.zoom, 0, kZoomCount - 1)];
+        if (z > 1.0) {
+            const double nw = sw / z, nh = sh / z;
+            sx += (sw - nw) / 2.0;
+            sy += (sh - nh) / 2.0;
+            sw = nw;
+            sh = nh;
+        }
+
+        const bool swap = (s.rotation & 1) != 0;
+        const int cw = swap ? H : W, ch = swap ? W : H;
+        if (!EnsureCanvas(cw, ch)) return false;
+        std::memset(bits, 0, static_cast<size_t>(CW) * CH * 4);
+
+        double scale;
+        int dx = 0, dy = 0, dw = CW, dh = CH;
+        if (s.fit == 0) {  // letterbox
+            scale = (std::min)(CW / sw, CH / sh);
+            dw = (std::min)(CW, static_cast<int>(std::lround(sw * scale)));
+            dh = (std::min)(CH, static_cast<int>(std::lround(sh * scale)));
+            dx = (CW - dw) / 2;
+            dy = (CH - dh) / 2;
+        } else {  // crop
+            scale = (std::max)(CW / sw, CH / sh);
+            const double nw = CW / scale, nh = CH / scale;
+            sx += (sw - nw) / 2.0;
+            sy += (sh - nh) / 2.0;
+            sw = nw;
+            sh = nh;
+        }
+        const int isx = static_cast<int>(std::lround(sx));
+        const int isy = static_cast<int>(std::lround(sy));
+        const int isw = (std::max)(1, static_cast<int>(std::lround(sw)));
+        const int ish = (std::max)(1, static_cast<int>(std::lround(sh)));
+
+        BOOL ok;
+        if (dw == isw && dh == ish)
+            ok = BitBlt(memDC, dx, dy, dw, dh, screenDC, isx, isy, SRCCOPY);
+        else
+            ok = StretchBlt(memDC, dx, dy, dw, dh, screenDC, isx, isy, isw, ish, SRCCOPY);
+        if (!ok) return false;
+
+        if (s.cursor) DrawCursor(isx, isy, static_cast<double>(dw) / isw, dx, dy, dw, dh);
+        GdiFlush();
+        Convert(s.rotation, s.mirror, out);
+        return true;
+    }
+
+    // Picture shown while paused (modes 1..3)
+    void RenderPause(const Settings& s, uint8_t* out) {
+        if (!EnsureCanvas(W, H)) return;
+        std::memset(bits, 0, static_cast<size_t>(CW) * CH * 4);
+        bool drawn = false;
+        if (s.pauseMode == 3 && !s.pauseImage.empty()) drawn = DrawImageFile(s.pauseImage);
+        if (s.pauseMode == 2 || (s.pauseMode == 3 && !drawn)) {
+            RECT rc{0, 0, W, H};
+            HBRUSH bg = CreateSolidBrush(RGB(30, 32, 38));
+            FillRect(memDC, &rc, bg);
+            DeleteObject(bg);
+            const int px = (std::max)(24, (std::min)(W, H) / 9);
+            HFONT f = CreateFontW(-px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                  CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HGDIOBJ old = SelectObject(memDC, f);
+            SetBkMode(memDC, TRANSPARENT);
+            SetTextColor(memDC, RGB(240, 240, 240));
+            const wchar_t* txt = (s.pauseMode == 3) ? L"Не удалось открыть картинку" : L"Скоро вернусь";
+            DrawTextW(memDC, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(memDC, old);
+            DeleteObject(f);
+        }
+        GdiFlush();
+        Convert(0, false, out);
+    }
+
+private:
+    bool EnsureCanvas(int cw, int ch) {
+        if (dib && cw == CW && ch == CH) return true;
+        FreeCanvas();
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = W;
-        bi.bmiHeader.biHeight = -H;  // top-down
+        bi.bmiHeader.biWidth = cw;
+        bi.bmiHeader.biHeight = -ch;  // top-down
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
         dib = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, reinterpret_cast<void**>(&bits), nullptr, 0);
-        if (dib) oldBmp = SelectObject(memDC, dib);
+        if (!dib || !bits) {
+            dib = nullptr;
+            bits = nullptr;
+            return false;
+        }
+        oldBmp = SelectObject(memDC, dib);
         SetStretchBltMode(memDC, HALFTONE);
         SetBrushOrgEx(memDC, 0, 0, nullptr);
+        CW = cw;
+        CH = ch;
+        return true;
     }
-    ~Capturer() {
+
+    void FreeCanvas() {
         if (oldBmp) SelectObject(memDC, oldBmp);
         if (dib) DeleteObject(dib);
-        if (memDC) DeleteDC(memDC);
-        if (screenDC) ReleaseDC(nullptr, screenDC);
+        oldBmp = nullptr;
+        dib = nullptr;
+        bits = nullptr;
+        CW = CH = 0;
     }
-    bool ok() const { return dib && bits; }
 
-    // out: W*H*3 bytes, BGR, top-down (what softcam expects)
-    void Grab(const RECT& r, int fit, bool cursor, uint8_t* out) {
-        if (!ok()) return;
-        const int sw = r.right - r.left, sh = r.bottom - r.top;
-        if (sw <= 0 || sh <= 0) return;
-        std::memset(bits, 0, static_cast<size_t>(W) * H * 4);
-
-        double scale;
-        int dx = 0, dy = 0, dw = W, dh = H;
-        double ssx = r.left, ssy = r.top, ssw = sw, ssh = sh;
-        if (fit == 0) {  // letterbox
-            scale = (std::min)(static_cast<double>(W) / sw, static_cast<double>(H) / sh);
-            dw = static_cast<int>(std::lround(sw * scale));
-            dh = static_cast<int>(std::lround(sh * scale));
-            dw = (std::min)(dw, W);
-            dh = (std::min)(dh, H);
-            dx = (W - dw) / 2;
-            dy = (H - dh) / 2;
-        } else {  // crop
-            scale = (std::max)(static_cast<double>(W) / sw, static_cast<double>(H) / sh);
-            ssw = W / scale;
-            ssh = H / scale;
-            ssx = r.left + (sw - ssw) / 2.0;
-            ssy = r.top + (sh - ssh) / 2.0;
-        }
-        const int isx = static_cast<int>(std::lround(ssx));
-        const int isy = static_cast<int>(std::lround(ssy));
-        const int isw = (std::max)(1, static_cast<int>(std::lround(ssw)));
-        const int ish = (std::max)(1, static_cast<int>(std::lround(ssh)));
-
-        if (dw == isw && dh == ish)
-            BitBlt(memDC, dx, dy, dw, dh, screenDC, isx, isy, SRCCOPY);
-        else
-            StretchBlt(memDC, dx, dy, dw, dh, screenDC, isx, isy, isw, ish, SRCCOPY);
-
-        if (cursor) DrawCursor(isx, isy, scale, dx, dy, dw, dh);
-        GdiFlush();
-
-        const size_t n = static_cast<size_t>(W) * H;
-        const uint8_t* src = bits;
-        uint8_t* dst = out;
-        for (size_t i = 0; i < n; ++i) {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-            dst += 3;
-            src += 4;
+    // canvas (CW x CH, BGRA) -> out (W x H, BGR) with rotation (clockwise) and horizontal mirror
+    void Convert(int rot, bool mirror, uint8_t* out) {
+        for (int y = 0; y < H; ++y) {
+            int cx = 0, cy = 0, ddx = 0, ddy = 0;
+            switch (rot & 3) {
+            case 0: cx = 0; cy = y; ddx = 1; ddy = 0; break;
+            case 1: cx = y; cy = CH - 1; ddx = 0; ddy = -1; break;
+            case 2: cx = CW - 1; cy = CH - 1 - y; ddx = -1; ddy = 0; break;
+            case 3: cx = CW - 1 - y; cy = 0; ddx = 0; ddy = 1; break;
+            }
+            if (mirror) {
+                cx += (W - 1) * ddx;
+                cy += (W - 1) * ddy;
+                ddx = -ddx;
+                ddy = -ddy;
+            }
+            const ptrdiff_t step = static_cast<ptrdiff_t>(ddx) * 4 + static_cast<ptrdiff_t>(ddy) * CW * 4;
+            const uint8_t* p = bits + (static_cast<ptrdiff_t>(cy) * CW + cx) * 4;
+            uint8_t* o = out + static_cast<size_t>(y) * W * 3;
+            for (int x = 0; x < W; ++x) {
+                o[0] = p[0];
+                o[1] = p[1];
+                o[2] = p[2];
+                o += 3;
+                p += step;
+            }
         }
     }
 
-private:
     void DrawCursor(int isx, int isy, double scale, int dx, int dy, int dw, int dh) {
         CURSORINFO ci{};
         ci.cbSize = sizeof(ci);
@@ -238,7 +469,51 @@ private:
         if (ii.hbmMask) DeleteObject(ii.hbmMask);
     }
 
+    // Letterboxed image file into the canvas via WIC (needs COM on this thread)
+    bool DrawImageFile(const std::wstring& path) {
+        bool ok = false;
+        IWICImagingFactory* f = nullptr;
+        IWICBitmapDecoder* dec = nullptr;
+        IWICBitmapFrameDecode* fr = nullptr;
+        IWICFormatConverter* cv = nullptr;
+        IWICBitmapScaler* sc = nullptr;
+        do {
+            if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                        IID_PPV_ARGS(&f))))
+                break;
+            if (FAILED(f->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                    WICDecodeMetadataCacheOnLoad, &dec)))
+                break;
+            if (FAILED(dec->GetFrame(0, &fr))) break;
+            if (FAILED(f->CreateFormatConverter(&cv))) break;
+            if (FAILED(cv->Initialize(fr, GUID_WICPixelFormat32bppBGR, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                      WICBitmapPaletteTypeCustom)))
+                break;
+            UINT iw = 0, ih = 0;
+            cv->GetSize(&iw, &ih);
+            if (!iw || !ih) break;
+            const double scale = (std::min)(static_cast<double>(CW) / iw, static_cast<double>(CH) / ih);
+            const UINT dw = (std::max)(1u, (std::min)(static_cast<UINT>(CW), static_cast<UINT>(std::lround(iw * scale))));
+            const UINT dh = (std::max)(1u, (std::min)(static_cast<UINT>(CH), static_cast<UINT>(std::lround(ih * scale))));
+            if (FAILED(f->CreateBitmapScaler(&sc))) break;
+            if (FAILED(sc->Initialize(cv, dw, dh, WICBitmapInterpolationModeFant))) break;
+            const UINT dx = (CW - dw) / 2, dy = (CH - dh) / 2;
+            const UINT stride = static_cast<UINT>(CW) * 4;
+            BYTE* dst = bits + static_cast<size_t>(dy) * stride + static_cast<size_t>(dx) * 4;
+            const UINT size = stride * (dh - 1) + dw * 4;
+            if (FAILED(sc->CopyPixels(nullptr, stride, size, dst))) break;
+            ok = true;
+        } while (false);
+        if (sc) sc->Release();
+        if (cv) cv->Release();
+        if (fr) fr->Release();
+        if (dec) dec->Release();
+        if (f) f->Release();
+        return ok;
+    }
+
     int W, H;
+    int CW = 0, CH = 0;
     HDC screenDC = nullptr;
     HDC memDC = nullptr;
     HBITMAP dib = nullptr;
@@ -253,30 +528,81 @@ static scCamera          g_cam = nullptr;
 static std::thread       g_sender;
 static std::atomic<bool> g_quit{false};
 static std::atomic<bool> g_streaming{false};
+static std::atomic<bool> g_resetCapture{false};   // recreate GDI objects (display change, resume)
+static std::atomic<bool> g_pauseDirty{false};     // re-render pause picture
+static std::atomic<bool> g_sourceLost{false};     // window closed / minimised
+static std::atomic<int>  g_fpsX10{0};
+static std::atomic<int>  g_recoveries{0};
+
+static std::mutex           g_prevMx;
+static std::vector<uint8_t> g_prev;
+static int                  g_prevW = 0, g_prevH = 0;
 
 static void SenderLoop(int W, int H) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::vector<uint8_t> frame(static_cast<size_t>(W) * H * 3, 0);
-    Capturer cap(W, H);
-    bool dirty = false;
+    std::unique_ptr<Capturer> cap(new Capturer(W, H));
+    std::wstring pauseKey;
+    int fails = 0, frames = 0;
+    ULONGLONG fpsT0 = GetTickCount64(), prevT = 0;
+
     while (!g_quit) {
-        if (g_streaming) {
-            Settings s = GetSettings();
-            if (s.hasRegion) {
-                cap.Grab(s.region, s.fit, s.cursor, frame.data());
-                dirty = true;
-            }
-        } else if (dirty) {
-            std::fill(frame.begin(), frame.end(), static_cast<uint8_t>(0));
-            dirty = false;
+        if (g_resetCapture.exchange(false)) {
+            cap.reset(new Capturer(W, H));
+            pauseKey.clear();
+            fails = 0;
+            ++g_recoveries;
         }
+        Settings s = GetSettings();
+        if (g_streaming) {
+            pauseKey.clear();
+            RECT src;
+            if (ResolveSource(s, &src)) {
+                g_sourceLost = false;
+                if (cap->Grab(src, s, frame.data())) {
+                    fails = 0;
+                } else if (++fails >= 15) {  // ~0.5 s of failures: rebuild capture
+                    g_resetCapture = true;
+                }
+            } else {
+                g_sourceLost = true;  // keep the last frame
+            }
+        } else if (s.pauseMode != 0) {
+            std::wstring key = std::to_wstring(s.pauseMode) + L"|" + s.pauseImage;
+            if (key != pauseKey || g_pauseDirty.exchange(false)) {
+                if (s.pauseMode == 1)
+                    std::fill(frame.begin(), frame.end(), static_cast<uint8_t>(0));
+                else
+                    cap->RenderPause(s, frame.data());
+                pauseKey = key;
+            }
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (now - prevT >= 50) {
+            std::lock_guard<std::mutex> lk(g_prevMx);
+            g_prev = frame;
+            g_prevW = W;
+            g_prevH = H;
+            prevT = now;
+        }
+        ++frames;
+        if (now - fpsT0 >= 1000) {
+            g_fpsX10 = static_cast<int>(frames * 10000 / (now - fpsT0));
+            frames = 0;
+            fpsT0 = now;
+        }
+
         pSend(g_cam, frame.data());  // paces itself to the camera FPS
     }
+    CoUninitialize();
 }
 
 static bool StartCamera() {
     if (!pCreate || g_cam) return g_cam != nullptr;
     Settings s = GetSettings();
-    const int W = kResW[s.res], H = kResH[s.res];
+    int W, H;
+    OutSize(s.quality, s.aspect, &W, &H);
     g_cam = pCreate(W, H, static_cast<float>(s.fps));
     if (!g_cam) return false;
     g_quit = false;
@@ -335,7 +661,8 @@ static int DoRegister(bool reg) {
     if (GetFileAttributesW(dll32.c_str()) != INVALID_FILE_ATTRIBUTES) {
         wchar_t wow[MAX_PATH] = {};
         if (GetSystemWow64DirectoryW(wow, MAX_PATH)) {
-            std::wstring cmd = L"\"" + std::wstring(wow) + L"\\regsvr32.exe\" /s " + (reg ? L"" : L"/u ") + L"\"" + dll32 + L"\"";
+            std::wstring cmd = L"\"" + std::wstring(wow) + L"\\regsvr32.exe\" /s " + (reg ? L"" : L"/u ") + L"\"" +
+                               dll32 + L"\"";
             if (RunWait(cmd) != 0 && reg) result = 2;
         }
     }
@@ -351,9 +678,7 @@ static int RunElevated(const wchar_t* args) {
     sei.lpFile = exe.c_str();
     sei.lpParameters = args;
     sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei) || !sei.hProcess) {
-        return GetLastError() == ERROR_CANCELLED ? -2 : -1;
-    }
+    if (!ShellExecuteExW(&sei) || !sei.hProcess) return GetLastError() == ERROR_CANCELLED ? -2 : -1;
     WaitForSingleObject(sei.hProcess, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(sei.hProcess, &code);
@@ -463,19 +788,14 @@ static LRESULT CALLBACK SelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkMode(m, TRANSPARENT);
         SetTextColor(m, RGB(255, 255, 255));
 
-        // hint on the primary monitor
-        POINT zero{0, 0};
-        MONITORINFO mi{};
-        mi.cbSize = sizeof(mi);
-        GetMonitorInfoW(MonitorFromPoint(zero, MONITOR_DEFAULTTOPRIMARY), &mi);
-        RECT hint = mi.rcMonitor;
+        RECT hint = PrimaryMonitorRect();
         if (st) OffsetRect(&hint, -st->vx, -st->vy);
         hint.top += 40;
         hint.bottom = hint.top + 60;
         DrawTextW(m, L"Выделите мышью область, которую покажет камера.   Esc или правая кнопка — отмена", -1, &hint,
                   DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
-        if (st && (st->dragging)) {
+        if (st && st->dragging) {
             RECT s = NormRect(st->a, st->b);
             RECT frame = s;
             InflateRect(&frame, 2, 2);
@@ -516,16 +836,16 @@ static bool SelectRegion(HINSTANCE hInst, RECT* out) {
         registered = true;
     }
     SelState st;
-    st.vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    st.vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const RECT vs = VirtualScreen();
+    st.vx = vs.left;
+    st.vy = vs.top;
     st.font = CreateFontW(-28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     g_sel = &st;
 
-    HWND hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"WVCSelect", L"WVC",
-                                WS_POPUP, st.vx, st.vy, vw, vh, nullptr, nullptr, hInst, nullptr);
+    HWND hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"WVCSelect", L"WVC", WS_POPUP,
+                                vs.left, vs.top, vs.right - vs.left, vs.bottom - vs.top, nullptr, nullptr, hInst,
+                                nullptr);
     if (!hwnd) {
         g_sel = nullptr;
         DeleteObject(st.font);
@@ -549,19 +869,16 @@ static bool SelectRegion(HINSTANCE hInst, RECT* out) {
 }
 
 // ---------------------------------------------------------------------------
-// Red frame around the streamed region, with a drag tab.
-// The inside is colour-keyed (fully transparent and click-through); the red
-// border and the tab are grabbable and move the streamed region live.
+// Red frame around the streamed source, with a drag tab.
+// Inside is colour-keyed (transparent, click-through). Tab = move, edges = resize.
 // ---------------------------------------------------------------------------
-static HWND g_frame = nullptr;
-static int  g_fb = 4;           // border thickness, px (scaled by system DPI at start)
-static int  g_tabW = 150, g_tabH = 26;
-static bool g_tabBelow = false; // tab under the region when there is no room above
-static bool g_frameMoving = false;
+static HWND  g_frame = nullptr;
+static int   g_fb = 6;            // border thickness, px
+static int   g_tabW = 150, g_tabH = 26;
+static bool  g_tabBelow = false;  // tab under the region when there is no room above
+static bool  g_frameMoving = false;
 static HFONT g_frameFont = nullptr;
-
-static void UpdateRegionLabel();  // defined with the main window
-static void SaveSettings();
+static const UINT WM_FRAME_DONE = WM_APP + 7;
 
 static void FrameRects(int w, int h, RECT* border, RECT* hole, RECT* tab) {
     const int top = g_tabBelow ? 0 : g_tabH;
@@ -570,6 +887,17 @@ static void FrameRects(int w, int h, RECT* border, RECT* hole, RECT* tab) {
     *hole = RECT{g_fb, top + g_fb, w - g_fb, bottom - g_fb};
     const int tw = (std::min)(g_tabW, w);
     *tab = g_tabBelow ? RECT{0, h - g_tabH, tw, h} : RECT{0, 0, tw, g_tabH};
+}
+
+static void RegionFromFrame(HWND hwnd) {
+    RECT wr;
+    GetWindowRect(hwnd, &wr);
+    std::lock_guard<std::mutex> lk(g_setMx);
+    g_set.region.left = wr.left + g_fb;
+    g_set.region.right = wr.right - g_fb;
+    g_set.region.top = wr.top + g_fb + (g_tabBelow ? 0 : g_tabH);
+    g_set.region.bottom = wr.bottom - g_fb - (g_tabBelow ? g_tabH : 0);
+    g_set.hasRegion = true;
 }
 
 static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -597,39 +925,66 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_NCHITTEST: {
-        // colour-keyed pixels never reach us; everything else (border, tab) drags the window
-        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
-        return hit == HTCLIENT ? HTCAPTION : hit;
+        // colour-keyed pixels never reach us: only the border and the tab do
+        POINT pt{static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
+        ScreenToClient(hwnd, &pt);
+        RECT rc, border, hole, tab;
+        GetClientRect(hwnd, &rc);
+        FrameRects(rc.right, rc.bottom, &border, &hole, &tab);
+        if (PtInRect(&tab, pt)) return HTCAPTION;
+        const int cs = g_tabH;  // corner grab size
+        const bool L = pt.x < border.left + cs, R = pt.x >= border.right - cs;
+        const bool T = pt.y < border.top + cs, B = pt.y >= border.bottom - cs;
+        if (T && L) return HTTOPLEFT;
+        if (T && R) return HTTOPRIGHT;
+        if (B && L) return HTBOTTOMLEFT;
+        if (B && R) return HTBOTTOMRIGHT;
+        if (pt.x < hole.left) return HTLEFT;
+        if (pt.x >= hole.right) return HTRIGHT;
+        if (pt.y < hole.top) return HTTOP;
+        if (pt.y >= hole.bottom) return HTBOTTOM;
+        return HTCAPTION;
     }
     case WM_SETCURSOR:
-        SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
-        return TRUE;
-    case WM_ENTERSIZEMOVE:
-        g_frameMoving = true;
-        return 0;
-    case WM_MOVE: {
-        if (!g_frameMoving) return 0;
-        RECT wr;
-        GetWindowRect(hwnd, &wr);
-        std::lock_guard<std::mutex> lk(g_setMx);
-        const int w = g_set.region.right - g_set.region.left;
-        const int h = g_set.region.bottom - g_set.region.top;
-        g_set.region.left = wr.left + g_fb;
-        g_set.region.top = wr.top + g_fb + (g_tabBelow ? 0 : g_tabH);
-        g_set.region.right = g_set.region.left + w;
-        g_set.region.bottom = g_set.region.top + h;
+        if (LOWORD(lp) == HTCAPTION) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            return TRUE;
+        }
+        break;
+    case WM_GETMINMAXINFO: {
+        auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
+        mm->ptMinTrackSize.x = g_tabW + 2 * g_fb;
+        mm->ptMinTrackSize.y = g_tabH + 2 * g_fb + 48;
         return 0;
     }
+    case WM_ENTERSIZEMOVE: {
+        // dragging the frame always means "this exact area": a followed window becomes a fixed area
+        RECT cur;
+        Settings s = GetSettings();
+        if (s.srcMode == 1 && ResolveSource(s, &cur)) {
+            std::lock_guard<std::mutex> lk(g_setMx);
+            g_set.srcMode = 0;
+            g_set.region = cur;
+            g_set.hasRegion = true;
+        }
+        g_frameMoving = true;
+        return 0;
+    }
+    case WM_MOVE:
+    case WM_SIZE:
+        if (msg == WM_SIZE) InvalidateRect(hwnd, nullptr, FALSE);
+        if (g_frameMoving) RegionFromFrame(hwnd);
+        return 0;
     case WM_EXITSIZEMOVE:
         g_frameMoving = false;
-        SaveSettings();
-        UpdateRegionLabel();
-        PostMessageW(hwnd, WM_APP + 7, 0, 0);  // re-place the tab if needed
+        RegionFromFrame(hwnd);
+        PostMessageW(hwnd, WM_FRAME_DONE, 0, 0);
         return 0;
     case WM_DPICHANGED:
         return 0;  // keep the size: it must match the region in physical pixels
     case WM_NCRBUTTONUP:
-        return 0;  // no system menu on the frame
+    case WM_NCLBUTTONDBLCLK:
+        return 0;  // no system menu / maximise on the frame
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -637,56 +992,132 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static void UpdateFrame() {
     if (!g_frame || g_frameMoving) return;
     Settings s = GetSettings();
-    if (g_streaming && s.hasRegion) {
-        RECT r = s.region;
+    RECT r;
+    if (g_streaming && ResolveSource(s, &r)) {
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
         GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi);
         g_tabBelow = (r.top - g_fb - g_tabH) < mi.rcMonitor.top;
         RECT w{r.left - g_fb, r.top - g_fb, r.right + g_fb, r.bottom + g_fb};
-        if (g_tabBelow) w.bottom += g_tabH; else w.top -= g_tabH;
-        SetWindowPos(g_frame, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(g_frame, nullptr, TRUE);
+        if (g_tabBelow)
+            w.bottom += g_tabH;
+        else
+            w.top -= g_tabH;
+        RECT cur;
+        GetWindowRect(g_frame, &cur);
+        if (!IsWindowVisible(g_frame) || !EqualRect(&cur, &w)) {
+            SetWindowPos(g_frame, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top,
+                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            InvalidateRect(g_frame, nullptr, TRUE);
+        }
     } else {
         ShowWindow(g_frame, SW_HIDE);
     }
 }
 
 // ---------------------------------------------------------------------------
+// Preview control
+// ---------------------------------------------------------------------------
+static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HDC m = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ old = SelectObject(m, bmp);
+        HBRUSH bg = CreateSolidBrush(RGB(20, 20, 20));
+        FillRect(m, &rc, bg);
+        DeleteObject(bg);
+        {
+            std::lock_guard<std::mutex> lk(g_prevMx);
+            if (!g_prev.empty() && g_prevW > 0 && g_prevH > 0) {
+                const double sc = (std::min)(static_cast<double>(rc.right) / g_prevW,
+                                             static_cast<double>(rc.bottom) / g_prevH);
+                const int dw = static_cast<int>(g_prevW * sc), dh = static_cast<int>(g_prevH * sc);
+                const int dx = (rc.right - dw) / 2, dy = (rc.bottom - dh) / 2;
+                BITMAPINFO bi{};
+                bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bi.bmiHeader.biWidth = g_prevW;
+                bi.bmiHeader.biHeight = -g_prevH;
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 24;
+                bi.bmiHeader.biCompression = BI_RGB;
+                SetStretchBltMode(m, HALFTONE);
+                SetBrushOrgEx(m, 0, 0, nullptr);
+                StretchDIBits(m, dx, dy, dw, dh, 0, 0, g_prevW, g_prevH, g_prev.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+            }
+        }
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
+        SelectObject(m, old);
+        DeleteObject(bmp);
+        DeleteDC(m);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---------------------------------------------------------------------------
 // Main window
 // ---------------------------------------------------------------------------
 enum {
-    IDC_REGION_LABEL = 100,
-    IDC_REGION_VALUE,
+    IDC_SRC_LABEL = 100,
+    IDC_SRC_VALUE,
     IDC_SELECT,
-    IDC_FULL,
-    IDC_RES_LABEL,
-    IDC_RES,
+    IDC_MONITOR,
+    IDC_WINDOW,
+    IDC_Q_LABEL,
+    IDC_QUALITY,
+    IDC_A_LABEL,
+    IDC_ASPECT,
     IDC_FPS_LABEL,
     IDC_FPS,
     IDC_FIT_LABEL,
     IDC_FIT,
+    IDC_ROT_LABEL,
+    IDC_ROT,
+    IDC_ZOOM_LABEL,
+    IDC_ZOOM,
+    IDC_MIRROR,
     IDC_CURSOR,
     IDC_START,
     IDC_STATUS,
     IDC_INSTALL,
     IDC_UNINSTALL,
+    IDC_PREV_LABEL,
+    IDC_FPS_VALUE,
+    IDC_PREVIEW,
+    IDC_PAUSE_LABEL,
+    IDC_PAUSE,
+    IDC_PAUSE_IMG,
+    IDC_HOTKEYS,
 };
 enum { ID_TRAY_OPEN = 200, ID_TRAY_TOGGLE, ID_TRAY_EXIT };
+enum { HK_TOGGLE = 1, HK_SELECT, HK_MONITOR, HK_CURSOR };
 
 static const UINT WM_TRAY = WM_APP + 1;
-static const UINT_PTR kTimer = 1;
+static const UINT_PTR kTimerStatus = 1, kTimerPreview = 2, kTimerFollow = 3;
 
 static HINSTANCE g_hInst;
 static HWND g_main = nullptr;
+static HWND g_preview = nullptr;
 static HFONT g_font = nullptr;
 static UINT g_dpi = 96;
 static NOTIFYICONDATAW g_nid{};
 static std::wstring g_note;  // one-off note in the status line
+static std::wstring g_hotkeyNote;
 
 static int S(int v) { return MulDiv(v, static_cast<int>(g_dpi), 96); }
 static HWND Ctl(int id) { return GetDlgItem(g_main, id); }
+
+static void SetTextIfChanged(HWND h, const std::wstring& text) {
+    wchar_t cur[1024] = {};
+    GetWindowTextW(h, cur, 1024);
+    if (text != cur) SetWindowTextW(h, text.c_str());
+}
 
 static void MakeFont() {
     if (g_font) DeleteObject(g_font);
@@ -695,26 +1126,43 @@ static void MakeFont() {
                          L"Segoe UI");
 }
 
-static const int kClientW = 380, kClientH = 352;
+static const int kClientW = 760, kClientH = 448;
 
 static void Layout() {
     struct L { int id, x, y, w, h; };
     const L items[] = {
-        {IDC_REGION_LABEL, 12, 14, 150, 20},
-        {IDC_REGION_VALUE, 165, 14, 203, 20},
-        {IDC_SELECT, 12, 40, 175, 28},
-        {IDC_FULL, 193, 40, 175, 28},
-        {IDC_RES_LABEL, 12, 84, 150, 20},
-        {IDC_RES, 165, 80, 203, 200},
-        {IDC_FPS_LABEL, 12, 116, 150, 20},
-        {IDC_FPS, 165, 112, 203, 200},
-        {IDC_FIT_LABEL, 12, 148, 150, 20},
-        {IDC_FIT, 165, 144, 203, 200},
-        {IDC_CURSOR, 12, 178, 300, 22},
-        {IDC_START, 12, 210, 356, 40},
-        {IDC_STATUS, 12, 258, 356, 48},
-        {IDC_INSTALL, 12, 312, 175, 28},
-        {IDC_UNINSTALL, 193, 312, 175, 28},
+        // left column
+        {IDC_SRC_LABEL, 12, 14, 90, 20},
+        {IDC_SRC_VALUE, 102, 14, 266, 20},
+        {IDC_SELECT, 12, 40, 116, 28},
+        {IDC_MONITOR, 132, 40, 116, 28},
+        {IDC_WINDOW, 252, 40, 116, 28},
+        {IDC_Q_LABEL, 12, 84, 150, 20},
+        {IDC_QUALITY, 165, 80, 203, 200},
+        {IDC_A_LABEL, 12, 116, 150, 20},
+        {IDC_ASPECT, 165, 112, 203, 200},
+        {IDC_FPS_LABEL, 12, 148, 150, 20},
+        {IDC_FPS, 165, 144, 203, 200},
+        {IDC_FIT_LABEL, 12, 180, 150, 20},
+        {IDC_FIT, 165, 176, 203, 200},
+        {IDC_ROT_LABEL, 12, 212, 150, 20},
+        {IDC_ROT, 165, 208, 203, 200},
+        {IDC_ZOOM_LABEL, 12, 244, 150, 20},
+        {IDC_ZOOM, 165, 240, 203, 200},
+        {IDC_MIRROR, 12, 274, 170, 22},
+        {IDC_CURSOR, 190, 274, 178, 22},
+        {IDC_START, 12, 306, 356, 40},
+        {IDC_STATUS, 12, 354, 356, 50},
+        {IDC_INSTALL, 12, 408, 175, 28},
+        {IDC_UNINSTALL, 193, 408, 175, 28},
+        // right column
+        {IDC_PREV_LABEL, 388, 14, 200, 20},
+        {IDC_FPS_VALUE, 588, 14, 160, 20},
+        {IDC_PREVIEW, 388, 40, 360, 203},
+        {IDC_PAUSE_LABEL, 388, 256, 150, 20},
+        {IDC_PAUSE, 545, 252, 203, 200},
+        {IDC_PAUSE_IMG, 545, 284, 203, 28},
+        {IDC_HOTKEYS, 388, 324, 360, 112},
     };
     for (const auto& it : items) {
         HWND h = Ctl(it.id);
@@ -724,17 +1172,20 @@ static void Layout() {
     }
 }
 
-static void UpdateRegionLabel() {
+static void UpdateSourceLabel() {
     if (!g_main) return;
     Settings s = GetSettings();
-    wchar_t buf[128];
-    if (s.hasRegion)
-        swprintf(buf, 128, L"%d × %d  (x %d, y %d)", static_cast<int>(s.region.right - s.region.left),
+    wchar_t buf[256];
+    if (s.srcMode == 1) {
+        swprintf(buf, 256, L"окно «%ls»", s.srcTitle.c_str());
+    } else if (s.hasRegion) {
+        swprintf(buf, 256, L"область %d × %d  (x %d, y %d)", static_cast<int>(s.region.right - s.region.left),
                  static_cast<int>(s.region.bottom - s.region.top), static_cast<int>(s.region.left),
                  static_cast<int>(s.region.top));
-    else
-        wcscpy(buf, L"не выбрана");
-    SetWindowTextW(Ctl(IDC_REGION_VALUE), buf);
+    } else {
+        wcscpy(buf, L"не выбран");
+    }
+    SetTextIfChanged(Ctl(IDC_SRC_VALUE), buf);
 }
 
 static void UpdateStartButton() {
@@ -756,25 +1207,38 @@ static void UpdateStatus() {
         else if (st == 2)
             line1 = L"Камера установлена из другой папки: нажмите «Установить камеру» ещё раз.";
         else if (!g_cam)
-            line1 = L"Не удалось запустить камеру.";
+            line1 = L"Камера не запущена, пробую снова…";
         else if (pIsConnected && pIsConnected(g_cam))
             line1 = L"«WVC Camera» сейчас используется приложением.";
         else
             line1 = L"«WVC Camera» готова: выберите её в Zoom, Telegram, Discord или браузере.";
     }
-    std::wstring line2 = g_streaming ? L"Трансляция идёт." : L"Пауза: камера показывает чёрный экран.";
-    if (!g_note.empty()) line2 = g_note;
-    std::wstring text = line1 + L"\r\n" + line2;
-    wchar_t cur[512] = {};
-    GetWindowTextW(Ctl(IDC_STATUS), cur, 512);
-    if (text != cur) SetWindowTextW(Ctl(IDC_STATUS), text.c_str());
+    std::wstring line2;
+    if (!g_note.empty())
+        line2 = g_note;
+    else if (g_streaming && g_sourceLost)
+        line2 = L"Окно свёрнуто или закрыто: показываю последний кадр.";
+    else if (g_streaming)
+        line2 = L"Трансляция идёт.";
+    else
+        line2 = L"Пауза.";
+    SetTextIfChanged(Ctl(IDC_STATUS), line1 + L"\r\n" + line2);
+
+    wchar_t fps[64];
+    swprintf(fps, 64, L"%.1f кадров/с", g_fpsX10 / 10.0);
+    SetTextIfChanged(Ctl(IDC_FPS_VALUE), g_cam ? fps : L"");
+    UpdateSourceLabel();
+}
+
+static bool HaveSource() {
+    Settings s = GetSettings();
+    return s.srcMode == 1 ? (s.srcWindow && IsWindow(s.srcWindow)) : s.hasRegion;
 }
 
 static void ToggleStreaming() {
     if (!g_streaming) {
-        Settings s = GetSettings();
-        if (!s.hasRegion) {
-            MessageBoxW(g_main, L"Сначала выберите область экрана.", L"WVC", MB_ICONINFORMATION);
+        if (!HaveSource()) {
+            MessageBoxW(g_main, L"Сначала выберите источник: область, монитор или окно.", L"WVC", MB_ICONINFORMATION);
             return;
         }
         if (!g_cam && !StartCamera()) {
@@ -791,20 +1255,167 @@ static void ToggleStreaming() {
 
 static void RestartCameraForFormat() {
     StopCamera();
-    if (!StartCamera()) {
-        MessageBoxW(g_main, L"Не удалось перезапустить камеру.", L"WVC", MB_ICONERROR);
-    }
+    if (!StartCamera()) MessageBoxW(g_main, L"Не удалось перезапустить камеру.", L"WVC", MB_ICONERROR);
     g_note = L"Формат изменён: переподключите камеру в Zoom/Telegram (выключите и включите видео).";
     UpdateStatus();
 }
 
-static void DoInstall(bool install) {
-    if (!install) {
-        if (MessageBoxW(g_main, L"Удалить камеру «WVC Camera» из системы?", L"WVC", MB_YESNO | MB_ICONQUESTION) != IDYES)
-            return;
+static void SetRegionSource(const RECT& r) {
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.srcMode = 0;
+        g_set.srcWindow = nullptr;
+        g_set.region = r;
+        g_set.hasRegion = true;
     }
+    SaveSettings();
+    UpdateSourceLabel();
+    UpdateFrame();
+}
+
+static void DoSelectRegion() {
+    bool wasVisible = IsWindowVisible(g_main) != FALSE;
+    ShowWindow(g_main, SW_HIDE);
+    if (g_frame) ShowWindow(g_frame, SW_HIDE);
+    Sleep(150);  // let the windows disappear before the overlay appears
+    RECT r;
+    if (SelectRegion(g_hInst, &r)) SetRegionSource(r);
+    if (wasVisible) {
+        ShowWindow(g_main, SW_SHOW);
+        SetForegroundWindow(g_main);
+    }
+    UpdateFrame();
+}
+
+static void NextMonitor() {
+    auto mons = Monitors();
+    if (mons.empty()) return;
+    Settings s = GetSettings();
+    RECT cur;
+    int idx = -1;
+    if (ResolveSource(s, &cur)) {
+        POINT c{(cur.left + cur.right) / 2, (cur.top + cur.bottom) / 2};
+        for (size_t i = 0; i < mons.size(); ++i)
+            if (PtInRect(&mons[i].rc, c)) idx = static_cast<int>(i);
+    }
+    // already showing a whole monitor? go to the next one; otherwise take the monitor it is on
+    if (idx >= 0 && s.srcMode == 0 && EqualRect(&s.region, &mons[idx].rc)) idx = (idx + 1) % static_cast<int>(mons.size());
+    if (idx < 0) idx = 0;
+    SetRegionSource(mons[idx].rc);
+}
+
+static void ShowMonitorMenu() {
+    auto mons = Monitors();
+    HMENU m = CreatePopupMenu();
+    for (size_t i = 0; i < mons.size(); ++i) {
+        wchar_t buf[128];
+        swprintf(buf, 128, L"Монитор %d — %d × %d%ls", static_cast<int>(i + 1),
+                 static_cast<int>(mons[i].rc.right - mons[i].rc.left),
+                 static_cast<int>(mons[i].rc.bottom - mons[i].rc.top), mons[i].primary ? L" (основной)" : L"");
+        AppendMenuW(m, MF_STRING, 1000 + i, buf);
+    }
+    RECT br;
+    GetWindowRect(Ctl(IDC_MONITOR), &br);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, br.left, br.bottom, 0, g_main, nullptr);
+    DestroyMenu(m);
+    if (cmd >= 1000 && cmd < 1000 + static_cast<int>(mons.size())) SetRegionSource(mons[cmd - 1000].rc);
+}
+
+static void ShowWindowMenu() {
+    std::vector<WindowItem> wins;
+    EnumWindows(EnumWinProc, reinterpret_cast<LPARAM>(&wins));
+    HMENU m = CreatePopupMenu();
+    if (wins.empty()) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Нет подходящих окон");
+    for (size_t i = 0; i < wins.size(); ++i) AppendMenuW(m, MF_STRING, 2000 + i, wins[i].title.c_str());
+    RECT br;
+    GetWindowRect(Ctl(IDC_WINDOW), &br);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, br.left, br.bottom, 0, g_main, nullptr);
+    DestroyMenu(m);
+    if (cmd >= 2000 && cmd < 2000 + static_cast<int>(wins.size())) {
+        {
+            std::lock_guard<std::mutex> lk(g_setMx);
+            g_set.srcMode = 1;
+            g_set.srcWindow = wins[cmd - 2000].hwnd;
+            g_set.srcTitle = wins[cmd - 2000].title;
+        }
+        UpdateSourceLabel();
+        UpdateFrame();
+    }
+}
+
+static void ChoosePauseImage() {
+    wchar_t file[MAX_PATH * 2] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter = L"Картинки (PNG, JPG, BMP, GIF)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0Все файлы\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH * 2;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return;
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.pauseImage = file;
+        g_set.pauseMode = 3;
+    }
+    SendMessageW(Ctl(IDC_PAUSE), CB_SETCURSEL, 3, 0);
+    g_pauseDirty = true;
+    SaveSettings();
+}
+
+// Display change / resume from sleep: rebuild capture and bring the source back on screen
+static void RecoverDisplay() {
+    g_resetCapture = true;
+    Settings s = GetSettings();
+    if (s.srcMode == 0 && s.hasRegion) {
+        RECT vs = VirtualScreen(), inter;
+        if (!IntersectRect(&inter, &vs, &s.region)) {
+            RECT p = PrimaryMonitorRect();
+            const int w = (std::min)(s.region.right - s.region.left, static_cast<LONG>(p.right - p.left));
+            const int h = (std::min)(s.region.bottom - s.region.top, static_cast<LONG>(p.bottom - p.top));
+            RECT r{p.left, p.top, p.left + w, p.top + h};
+            SetRegionSource(r);
+            g_note = L"Область оказалась за пределами экрана и перенесена на основной монитор.";
+        }
+    }
+    UpdateFrame();
+    UpdateStatus();
+}
+
+static void RegisterHotkeys(HWND hwnd) {
+    struct HK { int id; UINT vk; const wchar_t* name; };
+    const HK keys[] = {
+        {HK_TOGGLE, VK_F5, L"Ctrl+Shift+F5"},
+        {HK_SELECT, VK_F6, L"Ctrl+Shift+F6"},
+        {HK_MONITOR, VK_F7, L"Ctrl+Shift+F7"},
+        {HK_CURSOR, VK_F8, L"Ctrl+Shift+F8"},
+    };
+    std::wstring busy;
+    for (const auto& k : keys) {
+        if (!RegisterHotKey(hwnd, k.id, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, k.vk)) {
+            if (!busy.empty()) busy += L", ";
+            busy += k.name;
+        }
+    }
+    if (!busy.empty()) g_hotkeyNote = L"\r\nЗаняты другой программой: " + busy;
+}
+
+static void SetCursorOption(bool on) {
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.cursor = on;
+    }
+    SendMessageW(Ctl(IDC_CURSOR), BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    SaveSettings();
+}
+
+static void DoInstall(bool install) {
+    if (!install &&
+        MessageBoxW(g_main, L"Удалить камеру «WVC Camera» из системы?", L"WVC", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
     int rc = RunElevated(install ? L"--register" : L"--unregister");
     if (rc == -2) return;  // UAC cancelled
+    wchar_t buf[256];
     if (install) {
         if (rc == 0)
             MessageBoxW(g_main,
@@ -815,16 +1426,14 @@ static void DoInstall(bool install) {
             MessageBoxW(g_main, L"Камера установлена для 64-битных программ, а 32-битную часть установить не удалось.",
                         L"WVC", MB_ICONWARNING);
         else {
-            wchar_t buf[128];
-            swprintf(buf, 128, L"Не удалось установить камеру (код %d).", rc);
+            swprintf(buf, 256, L"Не удалось установить камеру (код %d).", rc);
             MessageBoxW(g_main, buf, L"WVC", MB_ICONERROR);
         }
     } else {
         if (rc == 0)
             MessageBoxW(g_main, L"Камера удалена.", L"WVC", MB_ICONINFORMATION);
         else {
-            wchar_t buf[128];
-            swprintf(buf, 128, L"Не удалось удалить камеру (код %d).", rc);
+            swprintf(buf, 256, L"Не удалось удалить камеру (код %d).", rc);
             MessageBoxW(g_main, buf, L"WVC", MB_ICONERROR);
         }
     }
@@ -837,39 +1446,61 @@ static void ShowMain() {
     SetForegroundWindow(g_main);
 }
 
+static HWND AddCombo(HWND hwnd, int id, std::initializer_list<const wchar_t*> items, int sel) {
+    HWND h = CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                             0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
+    for (auto* s : items) SendMessageW(h, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+    SendMessageW(h, CB_SETCURSEL, sel, 0);
+    return h;
+}
+
 static void CreateControls(HWND hwnd) {
     auto mk = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
         return CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, hwnd,
                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
     };
-    mk(L"STATIC", L"Область экрана:", 0, IDC_REGION_LABEL);
-    mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_REGION_VALUE);
-    mk(L"BUTTON", L"Выбрать область…", WS_TABSTOP | BS_PUSHBUTTON, IDC_SELECT);
-    mk(L"BUTTON", L"Весь основной экран", WS_TABSTOP | BS_PUSHBUTTON, IDC_FULL);
-    mk(L"STATIC", L"Разрешение камеры:", 0, IDC_RES_LABEL);
-    HWND res = mk(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_RES);
+    Settings s = GetSettings();
+    mk(L"STATIC", L"Источник:", 0, IDC_SRC_LABEL);
+    mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_SRC_VALUE);
+    mk(L"BUTTON", L"Область…", WS_TABSTOP | BS_PUSHBUTTON, IDC_SELECT);
+    mk(L"BUTTON", L"Монитор ▾", WS_TABSTOP | BS_PUSHBUTTON, IDC_MONITOR);
+    mk(L"BUTTON", L"Окно ▾", WS_TABSTOP | BS_PUSHBUTTON, IDC_WINDOW);
+
+    mk(L"STATIC", L"Качество:", 0, IDC_Q_LABEL);
+    AddCombo(hwnd, IDC_QUALITY, {L"720p", L"1080p"}, s.quality);
+    mk(L"STATIC", L"Соотношение сторон:", 0, IDC_A_LABEL);
+    AddCombo(hwnd, IDC_ASPECT, {L"16:9 (обычное)", L"4:3", L"1:1 (квадрат)", L"9:16 (вертикальное)"}, s.aspect);
     mk(L"STATIC", L"Частота кадров:", 0, IDC_FPS_LABEL);
-    HWND fps = mk(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_FPS);
-    mk(L"STATIC", L"Другие пропорции:", 0, IDC_FIT_LABEL);
-    HWND fit = mk(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_FIT);
-    HWND cur = mk(L"BUTTON", L"Показывать курсор мыши", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_CURSOR);
+    AddCombo(hwnd, IDC_FPS, {L"30 кадров/с", L"60 кадров/с"}, s.fps == 60 ? 1 : 0);
+    mk(L"STATIC", L"Если пропорции другие:", 0, IDC_FIT_LABEL);
+    AddCombo(hwnd, IDC_FIT, {L"Вписать с полями", L"Обрезать по краям"}, s.fit);
+    mk(L"STATIC", L"Поворот:", 0, IDC_ROT_LABEL);
+    AddCombo(hwnd, IDC_ROT, {L"Без поворота", L"90° по часовой", L"180°", L"90° против часовой"}, s.rotation);
+    mk(L"STATIC", L"Увеличение (центр):", 0, IDC_ZOOM_LABEL);
+    AddCombo(hwnd, IDC_ZOOM, {L"100%", L"125%", L"150%", L"200%", L"300%", L"400%"}, s.zoom);
+    HWND mir = mk(L"BUTTON", L"Зеркально", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_MIRROR);
+    HWND cur = mk(L"BUTTON", L"Показывать курсор", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_CURSOR);
+    SendMessageW(mir, BM_SETCHECK, s.mirror ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(cur, BM_SETCHECK, s.cursor ? BST_CHECKED : BST_UNCHECKED, 0);
+
     mk(L"BUTTON", L"▶  Старт", WS_TABSTOP | BS_PUSHBUTTON, IDC_START);
     mk(L"STATIC", L"", 0, IDC_STATUS);
     mk(L"BUTTON", L"Установить камеру", WS_TABSTOP | BS_PUSHBUTTON, IDC_INSTALL);
     mk(L"BUTTON", L"Удалить камеру", WS_TABSTOP | BS_PUSHBUTTON, IDC_UNINSTALL);
 
-    SendMessageW(res, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1280 × 720"));
-    SendMessageW(res, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1920 × 1080"));
-    SendMessageW(fps, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"30 кадров/с"));
-    SendMessageW(fps, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"60 кадров/с"));
-    SendMessageW(fit, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Вписать с полями"));
-    SendMessageW(fit, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Обрезать по краям"));
-
-    Settings s = GetSettings();
-    SendMessageW(res, CB_SETCURSEL, s.res, 0);
-    SendMessageW(fps, CB_SETCURSEL, s.fps == 60 ? 1 : 0, 0);
-    SendMessageW(fit, CB_SETCURSEL, s.fit, 0);
-    SendMessageW(cur, BM_SETCHECK, s.cursor ? BST_CHECKED : BST_UNCHECKED, 0);
+    mk(L"STATIC", L"Предпросмотр (то, что видят другие):", 0, IDC_PREV_LABEL);
+    mk(L"STATIC", L"", SS_RIGHT, IDC_FPS_VALUE);
+    g_preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"WVCPreview", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd,
+                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PREVIEW)), g_hInst, nullptr);
+    mk(L"STATIC", L"На паузе показывать:", 0, IDC_PAUSE_LABEL);
+    AddCombo(hwnd, IDC_PAUSE, {L"Последний кадр", L"Чёрный экран", L"«Скоро вернусь»", L"Свою картинку"}, s.pauseMode);
+    mk(L"BUTTON", L"Выбрать картинку…", WS_TABSTOP | BS_PUSHBUTTON, IDC_PAUSE_IMG);
+    std::wstring hk = L"Горячие клавиши (работают везде):\r\n"
+                      L"Ctrl+Shift+F5 — Старт / Стоп\r\n"
+                      L"Ctrl+Shift+F6 — выбрать область\r\n"
+                      L"Ctrl+Shift+F7 — следующий монитор\r\n"
+                      L"Ctrl+Shift+F8 — курсор вкл/выкл";
+    mk(L"STATIC", (hk + g_hotkeyNote).c_str(), 0, IDC_HOTKEYS);
 }
 
 static void ResizeForDpi(HWND hwnd) {
@@ -879,16 +1510,19 @@ static void ResizeForDpi(HWND hwnd) {
     SetWindowPos(hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+static int ComboSel(int id) { return static_cast<int>(SendMessageW(Ctl(id), CB_GETCURSEL, 0, 0)); }
+
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_main = hwnd;
         g_dpi = GetDpiForWindow(hwnd);
+        RegisterHotkeys(hwnd);
         MakeFont();
         CreateControls(hwnd);
         Layout();
         ResizeForDpi(hwnd);
-        UpdateRegionLabel();
+        UpdateSourceLabel();
 
         g_nid.cbSize = sizeof(g_nid);
         g_nid.hWnd = hwnd;
@@ -899,7 +1533,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         wcscpy(g_nid.szTip, L"WVC — пауза");
         Shell_NotifyIconW(NIM_ADD, &g_nid);
 
-        SetTimer(hwnd, kTimer, 1000, nullptr);
+        SetTimer(hwnd, kTimerStatus, 1000, nullptr);
+        SetTimer(hwnd, kTimerPreview, 66, nullptr);
+        SetTimer(hwnd, kTimerFollow, 100, nullptr);
         return 0;
     }
     case WM_DPICHANGED: {
@@ -911,8 +1547,29 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Layout();
         return 0;
     }
+    case WM_DISPLAYCHANGE:
+        RecoverDisplay();
+        return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) RecoverDisplay();
+        return TRUE;
     case WM_TIMER:
-        if (wp == kTimer) UpdateStatus();
+        if (wp == kTimerStatus) {
+            if (g_camDll && !g_cam) StartCamera();  // auto-retry
+            UpdateStatus();
+        } else if (wp == kTimerPreview) {
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) InvalidateRect(g_preview, nullptr, FALSE);
+        } else if (wp == kTimerFollow) {
+            if (g_streaming && GetSettings().srcMode == 1) UpdateFrame();
+        }
+        return 0;
+    case WM_HOTKEY:
+        switch (wp) {
+        case HK_TOGGLE: ToggleStreaming(); break;
+        case HK_SELECT: DoSelectRegion(); break;
+        case HK_MONITOR: NextMonitor(); break;
+        case HK_CURSOR: SetCursorOption(!GetSettings().cursor); break;
+        }
         return 0;
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) ShowWindow(hwnd, SW_HIDE);  // live in the tray
@@ -936,62 +1593,30 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
         switch (id) {
-        case ID_TRAY_OPEN:
-            ShowMain();
-            break;
+        case ID_TRAY_OPEN: ShowMain(); break;
         case ID_TRAY_TOGGLE:
-        case IDC_START:
-            ToggleStreaming();
-            break;
-        case ID_TRAY_EXIT:
-            DestroyWindow(hwnd);
-            break;
-        case IDC_SELECT: {
-            bool wasVisible = IsWindowVisible(hwnd) != FALSE;
-            ShowWindow(hwnd, SW_HIDE);
-            if (g_frame) ShowWindow(g_frame, SW_HIDE);
-            Sleep(150);  // let the window disappear before the overlay appears
-            RECT r;
-            if (SelectRegion(g_hInst, &r)) {
-                {
-                    std::lock_guard<std::mutex> lk(g_setMx);
-                    g_set.region = r;
-                    g_set.hasRegion = true;
-                }
-                SaveSettings();
-                UpdateRegionLabel();
-            }
-            if (wasVisible) ShowMain();
-            UpdateFrame();
-            break;
-        }
-        case IDC_FULL: {
-            POINT zero{0, 0};
-            MONITORINFO mi{};
-            mi.cbSize = sizeof(mi);
-            GetMonitorInfoW(MonitorFromPoint(zero, MONITOR_DEFAULTTOPRIMARY), &mi);
-            {
-                std::lock_guard<std::mutex> lk(g_setMx);
-                g_set.region = mi.rcMonitor;
-                g_set.hasRegion = true;
-            }
-            SaveSettings();
-            UpdateRegionLabel();
-            UpdateFrame();
-            break;
-        }
-        case IDC_RES:
+        case IDC_START: ToggleStreaming(); break;
+        case ID_TRAY_EXIT: DestroyWindow(hwnd); break;
+        case IDC_SELECT: DoSelectRegion(); break;
+        case IDC_MONITOR: ShowMonitorMenu(); break;
+        case IDC_WINDOW: ShowWindowMenu(); break;
+        case IDC_QUALITY:
+        case IDC_ASPECT:
         case IDC_FPS:
             if (code == CBN_SELCHANGE) {
-                int sel = static_cast<int>(SendMessageW(Ctl(id), CB_GETCURSEL, 0, 0));
+                const int sel = ComboSel(id);
                 bool changed = false;
                 {
                     std::lock_guard<std::mutex> lk(g_setMx);
-                    if (id == IDC_RES && sel != g_set.res && sel >= 0) {
-                        g_set.res = sel;
+                    if (id == IDC_QUALITY && sel >= 0 && sel != g_set.quality) {
+                        g_set.quality = sel;
                         changed = true;
                     }
-                    int f = sel == 1 ? 60 : 30;
+                    if (id == IDC_ASPECT && sel >= 0 && sel != g_set.aspect) {
+                        g_set.aspect = sel;
+                        changed = true;
+                    }
+                    const int f = sel == 1 ? 60 : 30;
                     if (id == IDC_FPS && f != g_set.fps) {
                         g_set.fps = f;
                         changed = true;
@@ -1004,31 +1629,41 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case IDC_FIT:
+        case IDC_ROT:
+        case IDC_ZOOM:
+        case IDC_PAUSE:
             if (code == CBN_SELCHANGE) {
-                int sel = static_cast<int>(SendMessageW(Ctl(id), CB_GETCURSEL, 0, 0));
+                const int sel = (std::max)(0, ComboSel(id));
                 {
                     std::lock_guard<std::mutex> lk(g_setMx);
-                    g_set.fit = sel == 1 ? 1 : 0;
+                    if (id == IDC_FIT) g_set.fit = sel == 1 ? 1 : 0;
+                    if (id == IDC_ROT) g_set.rotation = sel & 3;
+                    if (id == IDC_ZOOM) g_set.zoom = (std::min)(sel, kZoomCount - 1);
+                    if (id == IDC_PAUSE) g_set.pauseMode = (std::min)(sel, 3);
+                }
+                if (id == IDC_PAUSE) {
+                    g_pauseDirty = true;
+                    if (sel == 3 && GetSettings().pauseImage.empty()) ChoosePauseImage();
+                }
+                SaveSettings();
+            }
+            break;
+        case IDC_PAUSE_IMG: ChoosePauseImage(); break;
+        case IDC_MIRROR:
+            if (code == BN_CLICKED) {
+                const bool on = SendMessageW(Ctl(IDC_MIRROR), BM_GETCHECK, 0, 0) == BST_CHECKED;
+                {
+                    std::lock_guard<std::mutex> lk(g_setMx);
+                    g_set.mirror = on;
                 }
                 SaveSettings();
             }
             break;
         case IDC_CURSOR:
-            if (code == BN_CLICKED) {
-                bool on = SendMessageW(Ctl(IDC_CURSOR), BM_GETCHECK, 0, 0) == BST_CHECKED;
-                {
-                    std::lock_guard<std::mutex> lk(g_setMx);
-                    g_set.cursor = on;
-                }
-                SaveSettings();
-            }
+            if (code == BN_CLICKED) SetCursorOption(SendMessageW(Ctl(IDC_CURSOR), BM_GETCHECK, 0, 0) == BST_CHECKED);
             break;
-        case IDC_INSTALL:
-            DoInstall(true);
-            break;
-        case IDC_UNINSTALL:
-            DoInstall(false);
-            break;
+        case IDC_INSTALL: DoInstall(true); break;
+        case IDC_UNINSTALL: DoInstall(false); break;
         }
         return 0;
     }
@@ -1036,7 +1671,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
-        KillTimer(hwnd, kTimer);
+        for (int i = HK_TOGGLE; i <= HK_CURSOR; ++i) UnregisterHotKey(hwnd, i);
+        KillTimer(hwnd, kTimerStatus);
+        KillTimer(hwnd, kTimerPreview);
+        KillTimer(hwnd, kTimerFollow);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -1063,6 +1701,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     }
 
     g_hInst = hInst;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // file dialog
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -1082,22 +1721,32 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     }
     if (g_camDll) StartCamera();  // the camera exists while WVC runs; Start/Stop only toggles the picture
 
-    WNDCLASSW fc{};
-    fc.lpfnWndProc = FrameProc;
-    fc.hInstance = hInst;
-    fc.lpszClassName = L"WVCFrame";
-    RegisterClassW(&fc);
+    // frame window
     {
         const int sdpi = static_cast<int>(GetDpiForSystem());
-        g_fb = MulDiv(4, sdpi, 96);
+        g_fb = MulDiv(6, sdpi, 96);
         g_tabW = MulDiv(150, sdpi, 96);
         g_tabH = MulDiv(26, sdpi, 96);
         g_frameFont = CreateFontW(-MulDiv(9, sdpi, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     }
-    g_frame = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                              L"WVCFrame", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
+    WNDCLASSW fc{};
+    fc.style = CS_HREDRAW | CS_VREDRAW;
+    fc.lpfnWndProc = FrameProc;
+    fc.hInstance = hInst;
+    fc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    fc.lpszClassName = L"WVCFrame";
+    RegisterClassW(&fc);
+    g_frame = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WVCFrame", L"",
+                              WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
     if (g_frame) SetLayeredWindowAttributes(g_frame, kKey, 255, LWA_COLORKEY);
+
+    WNDCLASSW pc{};
+    pc.lpfnWndProc = PreviewProc;
+    pc.hInstance = hInst;
+    pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pc.lpszClassName = L"WVCPreview";
+    RegisterClassW(&pc);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = MainProc;
@@ -1110,7 +1759,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
 
     HWND hwnd = CreateWindowExW(0, L"WVCMain", L"WVC — камера из области экрана",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
-                                400, 400, nullptr, nullptr, hInst, nullptr);
+                                800, 500, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
@@ -1118,7 +1767,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.hwnd == g_frame && msg.message == WM_APP + 7) {
+        if (msg.hwnd == g_frame && msg.message == WM_FRAME_DONE) {
+            SaveSettings();
+            UpdateSourceLabel();
             UpdateFrame();
             continue;
         }
@@ -1132,6 +1783,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     StopCamera();
     if (g_frame) DestroyWindow(g_frame);
     if (g_font) DeleteObject(g_font);
+    if (g_frameFont) DeleteObject(g_frameFont);
+    CoUninitialize();
     if (single) CloseHandle(single);
     return 0;
 }
