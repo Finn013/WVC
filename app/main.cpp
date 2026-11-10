@@ -549,38 +549,103 @@ static bool SelectRegion(HINSTANCE hInst, RECT* out) {
 }
 
 // ---------------------------------------------------------------------------
-// Red frame around the streamed region (click-through, outside the region)
+// Red frame around the streamed region, with a drag tab.
+// The inside is colour-keyed (fully transparent and click-through); the red
+// border and the tab are grabbable and move the streamed region live.
 // ---------------------------------------------------------------------------
 static HWND g_frame = nullptr;
-static const int kFrame = 3;
+static int  g_fb = 4;           // border thickness, px (scaled by system DPI at start)
+static int  g_tabW = 150, g_tabH = 26;
+static bool g_tabBelow = false; // tab under the region when there is no room above
+static bool g_frameMoving = false;
+static HFONT g_frameFont = nullptr;
+
+static void UpdateRegionLabel();  // defined with the main window
+static void SaveSettings();
+
+static void FrameRects(int w, int h, RECT* border, RECT* hole, RECT* tab) {
+    const int top = g_tabBelow ? 0 : g_tabH;
+    const int bottom = g_tabBelow ? h - g_tabH : h;
+    *border = RECT{0, top, w, bottom};
+    *hole = RECT{g_fb, top + g_fb, w - g_fb, bottom - g_fb};
+    const int tw = (std::min)(g_tabW, w);
+    *tab = g_tabBelow ? RECT{0, h - g_tabH, tw, h} : RECT{0, 0, tw, g_tabH};
+}
 
 static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_PAINT) {
+    switch (msg) {
+    case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        RECT rc;
+        RECT rc, border, hole, tab;
         GetClientRect(hwnd, &rc);
-        HBRUSH red = CreateSolidBrush(RGB(230, 40, 40));
-        FillRect(dc, &rc, red);
-        DeleteObject(red);
-        InflateRect(&rc, -kFrame, -kFrame);
+        FrameRects(rc.right, rc.bottom, &border, &hole, &tab);
         HBRUSH key = CreateSolidBrush(kKey);
+        HBRUSH red = CreateSolidBrush(RGB(230, 40, 40));
         FillRect(dc, &rc, key);
+        FillRect(dc, &border, red);
+        FillRect(dc, &hole, key);
+        FillRect(dc, &tab, red);
+        DeleteObject(red);
         DeleteObject(key);
+        HGDIOBJ old = g_frameFont ? SelectObject(dc, g_frameFont) : nullptr;
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, L"✥ перетащить", -1, &tab, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (old) SelectObject(dc, old);
         EndPaint(hwnd, &ps);
         return 0;
     }
-    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    case WM_NCHITTEST: {
+        // colour-keyed pixels never reach us; everything else (border, tab) drags the window
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+        return hit == HTCLIENT ? HTCAPTION : hit;
+    }
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+        return TRUE;
+    case WM_ENTERSIZEMOVE:
+        g_frameMoving = true;
+        return 0;
+    case WM_MOVE: {
+        if (!g_frameMoving) return 0;
+        RECT wr;
+        GetWindowRect(hwnd, &wr);
+        std::lock_guard<std::mutex> lk(g_setMx);
+        const int w = g_set.region.right - g_set.region.left;
+        const int h = g_set.region.bottom - g_set.region.top;
+        g_set.region.left = wr.left + g_fb;
+        g_set.region.top = wr.top + g_fb + (g_tabBelow ? 0 : g_tabH);
+        g_set.region.right = g_set.region.left + w;
+        g_set.region.bottom = g_set.region.top + h;
+        return 0;
+    }
+    case WM_EXITSIZEMOVE:
+        g_frameMoving = false;
+        SaveSettings();
+        UpdateRegionLabel();
+        PostMessageW(hwnd, WM_APP + 7, 0, 0);  // re-place the tab if needed
+        return 0;
+    case WM_DPICHANGED:
+        return 0;  // keep the size: it must match the region in physical pixels
+    case WM_NCRBUTTONUP:
+        return 0;  // no system menu on the frame
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static void UpdateFrame() {
-    if (!g_frame) return;
+    if (!g_frame || g_frameMoving) return;
     Settings s = GetSettings();
     if (g_streaming && s.hasRegion) {
         RECT r = s.region;
-        InflateRect(&r, kFrame, kFrame);
-        SetWindowPos(g_frame, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top,
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi);
+        g_tabBelow = (r.top - g_fb - g_tabH) < mi.rcMonitor.top;
+        RECT w{r.left - g_fb, r.top - g_fb, r.right + g_fb, r.bottom + g_fb};
+        if (g_tabBelow) w.bottom += g_tabH; else w.top -= g_tabH;
+        SetWindowPos(g_frame, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top,
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
         InvalidateRect(g_frame, nullptr, TRUE);
     } else {
@@ -614,7 +679,7 @@ static const UINT WM_TRAY = WM_APP + 1;
 static const UINT_PTR kTimer = 1;
 
 static HINSTANCE g_hInst;
-static HWND g_main;
+static HWND g_main = nullptr;
 static HFONT g_font = nullptr;
 static UINT g_dpi = 96;
 static NOTIFYICONDATAW g_nid{};
@@ -660,6 +725,7 @@ static void Layout() {
 }
 
 static void UpdateRegionLabel() {
+    if (!g_main) return;
     Settings s = GetSettings();
     wchar_t buf[128];
     if (s.hasRegion)
@@ -1021,7 +1087,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     fc.hInstance = hInst;
     fc.lpszClassName = L"WVCFrame";
     RegisterClassW(&fc);
-    g_frame = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+    {
+        const int sdpi = static_cast<int>(GetDpiForSystem());
+        g_fb = MulDiv(4, sdpi, 96);
+        g_tabW = MulDiv(150, sdpi, 96);
+        g_tabH = MulDiv(26, sdpi, 96);
+        g_frameFont = CreateFontW(-MulDiv(9, sdpi, 72), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    }
+    g_frame = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                               L"WVCFrame", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
     if (g_frame) SetLayeredWindowAttributes(g_frame, kKey, 255, LWA_COLORKEY);
 
@@ -1044,6 +1118,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.hwnd == g_frame && msg.message == WM_APP + 7) {
+            UpdateFrame();
+            continue;
+        }
         if (!IsDialogMessageW(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
