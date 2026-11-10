@@ -68,6 +68,7 @@ struct Settings {
     int  zoom = 0;         // index into kZoom
     int  pauseMode = 2;    // 0 = freeze, 1 = black, 2 = text card, 3 = image
     std::wstring pauseImage;
+    std::wstring pauseText = L"Скоро вернусь";  // text on the pause card
     // source
     int  srcMode = 0;      // 0 = region, 1 = window
     HWND srcWindow = nullptr;
@@ -75,9 +76,11 @@ struct Settings {
     bool hasRegion = false;
     RECT region{};         // virtual-screen coordinates, physical pixels
     int  winCapture = 0;   // window source: 0 = from the screen, 1 = straight from the window (PrintWindow)
+    RECT region2{};        // "Экран 2": a second fixed area (virtual-screen coordinates)
     // what is shown
-    int  mainSrc = 0;      // big picture: 0 = screen, 1 = webcam, 2 = media files
-    int  pipSrc = 0;       // small window: 0 = none, 1 = screen, 2 = webcam, 3 = media files
+    int  mainSrc = 0;      // big picture: 0 = screen 1, 1 = webcam, 2 = media files, 3 = screen 2
+    int  pipSrc = 2;       // second source: 1 = screen 1, 2 = webcam, 3 = media files, 4 = screen 2 (= kind + 1)
+    int  layout = 0;       // 0 = only the main source, 1 = small window on top, 2 = side by side
     std::wstring camLink, camName;
     bool camMirror = true;
     int  pipCorner = 0;    // last preset: 0 = bottom right, 1 = bottom left, 2 = top right, 3 = top left
@@ -101,6 +104,7 @@ struct Settings {
     int  transition = 1;   // 0 none, 1 dissolve, 2 through black, 3 wipe, 4 slide
     int  transDur = 1;     // index into kTransMs
     bool idleFrame = true; // green frame around the source while not streaming
+    bool keepCamOn = false; // keep the webcam open all the time (instant switching)
 };
 
 static const double kZoom[] = {1.0, 1.25, 1.5, 2.0, 3.0, 4.0};
@@ -114,9 +118,12 @@ static const int    kShapeCount = 5;
 static const COLORREF kShapeColors[] = {RGB(0, 0, 0), RGB(255, 255, 255), RGB(0, 177, 64), RGB(40, 42, 48)};
 static bool SquareShape(int shape) { return shape >= 2; }
 
-static int ScreenNeeded(const Settings& s) { return s.mainSrc == 0 || s.pipSrc == 1; }
-static bool CamNeeded(const Settings& s) { return s.mainSrc == 1 || s.pipSrc == 2; }
-static bool MediaNeeded(const Settings& s) { return s.mainSrc == 2 || s.pipSrc == 3; }
+// second source actually shown: 0 = none, else 1..4 (source kind + 1)
+static int SecondSrc(const Settings& s) { return s.layout == 0 ? 0 : std::clamp(s.pipSrc, 1, 4); }
+static bool ScreenNeeded(const Settings& s) { return s.mainSrc == 0 || SecondSrc(s) == 1; }
+static bool Screen2Needed(const Settings& s) { return s.mainSrc == 3 || SecondSrc(s) == 4; }
+static bool CamNeeded(const Settings& s) { return s.mainSrc == 1 || SecondSrc(s) == 2; }
+static bool MediaNeeded(const Settings& s) { return s.mainSrc == 2 || SecondSrc(s) == 3; }
 
 // Small window rectangle in output pixels (16:9, or square for circle/hexagon/octagon)
 static RECT PipRect(const Settings& s, int W, int H) {
@@ -134,9 +141,9 @@ static RECT PipRect(const Settings& s, int W, int H) {
     return RECT{x, y, x + pw, y + ph};
 }
 
-// Snap the small window to a corner preset
+// Snap the small window to a corner, keeping its current width (old settings without a width get the preset)
 static void PipPreset(Settings& s, int W, int H) {
-    s.pipW = static_cast<int>(10000 * kPipSize[std::clamp(s.pipSize, 0, 2)]);
+    if (s.pipW < 500 || s.pipW > 9000) s.pipW = static_cast<int>(10000 * kPipSize[std::clamp(s.pipSize, 0, 2)]);
     s.pipX = s.pipY = 0;
     RECT r = PipRect(s, W, H);
     const int pw = r.right - r.left, ph = r.bottom - r.top, m = (std::max)(8, H / 30);
@@ -239,6 +246,25 @@ static std::wstring IniStr(const wchar_t* sec, const wchar_t* key) {
     return buf.data();
 }
 
+// def when the key is missing (an empty value that is present stays empty)
+static std::wstring IniStrDef(const wchar_t* sec, const wchar_t* key, const std::wstring& def) {
+    std::vector<wchar_t> buf(4096, 0);
+    GetPrivateProfileStringW(sec, key, L"\x01", buf.data(), static_cast<DWORD>(buf.size()), IniPath().c_str());
+    if (buf[0] == 1 && buf[1] == 0) return def;
+    return buf.data();
+}
+
+static RECT PrimaryMonitorRect();
+// "Экран 2" when nothing is saved yet: half of the primary monitor, centred
+static RECT DefaultRegion2() {
+    RECT p = PrimaryMonitorRect();
+    const int w = (std::max)(64, static_cast<int>(p.right - p.left) / 2);
+    const int h = (std::max)(64, static_cast<int>(p.bottom - p.top) / 2);
+    const int x = p.left + (static_cast<int>(p.right - p.left) - w) / 2;
+    const int y = p.top + (static_cast<int>(p.bottom - p.top) - h) / 2;
+    return RECT{x, y, x + w, y + h};
+}
+
 static void IniSetStr(const wchar_t* sec, const wchar_t* key, const std::wstring& v) {
     // GetPrivateProfileString strips surrounding quotes, so quote values that need protecting
     std::wstring q = L"\"" + v + L"\"";
@@ -254,6 +280,7 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
         s.transition = std::clamp(IniInt(sec, L"Transition", s.transition), 0, 4);
         s.transDur = std::clamp(IniInt(sec, L"TransitionTime", s.transDur), 0, 2);
         s.idleFrame = IniInt(sec, L"IdleFrame", s.idleFrame) != 0;
+        s.keepCamOn = IniInt(sec, L"KeepCamOn", s.keepCamOn) != 0;
     }
     s.cursor = IniInt(sec, L"Cursor", s.cursor) != 0;
     s.fit = std::clamp(IniInt(sec, L"Fit", s.fit), 0, 1);
@@ -262,6 +289,7 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
     s.zoom = std::clamp(IniInt(sec, L"Zoom", s.zoom), 0, kZoomCount - 1);
     s.pauseMode = std::clamp(IniInt(sec, L"PauseMode", s.pauseMode), 0, 3);
     s.pauseImage = IniStr(sec, L"PauseImage");
+    s.pauseText = IniStrDef(sec, L"PauseText", s.pauseText);
     s.srcMode = std::clamp(IniInt(sec, L"SourceMode", 0), 0, 1);
     s.srcTitle = IniStr(sec, L"WindowTitle");
     s.srcWindow = nullptr;
@@ -272,15 +300,27 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
     s.region.bottom = IniInt(sec, L"Bottom", s.region.bottom);
     if (s.region.right - s.region.left < 16 || s.region.bottom - s.region.top < 16) s.hasRegion = false;
     s.winCapture = std::clamp(IniInt(sec, L"WindowCapture", s.winCapture), 0, 1);
+    {  // v0.7: Region2X/Y/W/H; missing (old settings / old scenes) -> keep what we have or the default
+        const int w2 = IniInt(sec, L"Region2W", -1), h2 = IniInt(sec, L"Region2H", -1);
+        if (w2 >= 16 && h2 >= 16) {
+            const int x2 = IniInt(sec, L"Region2X", 0), y2 = IniInt(sec, L"Region2Y", 0);
+            s.region2 = RECT{x2, y2, x2 + w2, y2 + h2};
+        }
+        if (s.region2.right - s.region2.left < 16 || s.region2.bottom - s.region2.top < 16) s.region2 = DefaultRegion2();
+    }
     const int oldView = IniInt(sec, L"View", -1);  // v0.3
     s.mainSrc = IniInt(sec, L"MainSrc", -1);
-    s.pipSrc = IniInt(sec, L"PipSrc", -1);
-    if (s.mainSrc < 0 || s.pipSrc < 0) {
+    int rawPip = IniInt(sec, L"PipSrc", -1);       // v0.4-0.6: 0 = no small window
+    if (s.mainSrc < 0 || rawPip < 0) {
         s.mainSrc = oldView == 1 ? 1 : 0;
-        s.pipSrc = oldView == 2 ? 2 : 0;
+        rawPip = oldView == 2 ? 2 : 0;
     }
-    s.mainSrc = std::clamp(s.mainSrc, 0, 2);
-    s.pipSrc = std::clamp(s.pipSrc, 0, 3);
+    s.mainSrc = std::clamp(s.mainSrc, 0, 3);
+    rawPip = std::clamp(rawPip, 0, 4);
+    const int lay = IniInt(sec, L"Layout", -1);     // v0.7
+    const int second = IniInt(sec, L"SecondSrc", -1);
+    s.layout = lay < 0 ? (rawPip ? 1 : 0) : std::clamp(lay, 0, 2);
+    s.pipSrc = second >= 1 ? std::clamp(second, 1, 4) : rawPip >= 1 ? rawPip : (s.mainSrc == 1 ? 1 : 2);
     s.camLink = IniStr(sec, L"CamLink");
     s.camName = IniStr(sec, L"CamName");
     s.camMirror = IniInt(sec, L"CamMirror", s.camMirror) != 0;
@@ -326,6 +366,7 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
         IniSetInt(sec, L"Transition", s.transition);
         IniSetInt(sec, L"TransitionTime", s.transDur);
         IniSetInt(sec, L"IdleFrame", s.idleFrame ? 1 : 0);
+        IniSetInt(sec, L"KeepCamOn", s.keepCamOn ? 1 : 0);
     }
     IniSetInt(sec, L"Cursor", s.cursor ? 1 : 0);
     IniSetInt(sec, L"Fit", s.fit);
@@ -334,6 +375,7 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
     IniSetInt(sec, L"Zoom", s.zoom);
     IniSetInt(sec, L"PauseMode", s.pauseMode);
     IniSetStr(sec, L"PauseImage", s.pauseImage);
+    IniSetStr(sec, L"PauseText", s.pauseText);
     IniSetInt(sec, L"SourceMode", s.srcMode);
     IniSetStr(sec, L"WindowTitle", s.srcTitle);
     IniSetInt(sec, L"HasRegion", s.hasRegion ? 1 : 0);
@@ -342,8 +384,14 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
     IniSetInt(sec, L"Right", s.region.right);
     IniSetInt(sec, L"Bottom", s.region.bottom);
     IniSetInt(sec, L"WindowCapture", s.winCapture);
+    IniSetInt(sec, L"Region2X", s.region2.left);
+    IniSetInt(sec, L"Region2Y", s.region2.top);
+    IniSetInt(sec, L"Region2W", s.region2.right - s.region2.left);
+    IniSetInt(sec, L"Region2H", s.region2.bottom - s.region2.top);
     IniSetInt(sec, L"MainSrc", s.mainSrc);
-    IniSetInt(sec, L"PipSrc", s.pipSrc);
+    IniSetInt(sec, L"PipSrc", SecondSrc(s));  // what v0.6 understood: 0 = none
+    IniSetInt(sec, L"SecondSrc", std::clamp(s.pipSrc, 1, 4));
+    IniSetInt(sec, L"Layout", s.layout);
     WritePrivateProfileStringW(sec, L"View", nullptr, IniPath().c_str());
     IniSetStr(sec, L"CamLink", s.camLink);
     IniSetStr(sec, L"CamName", s.camName);
@@ -479,6 +527,13 @@ static bool ResolveSource(const Settings& s, RECT* r) {
     if (s.srcMode == 1) return WindowRectOf(s.srcWindow, r);
     if (!s.hasRegion) return false;
     *r = s.region;
+    return true;
+}
+
+// "Экран 2": always a fixed area
+static bool ResolveSource2(const Settings& s, RECT* r) {
+    if (s.region2.right - s.region2.left < 16 || s.region2.bottom - s.region2.top < 16) return false;
+    *r = s.region2;
     return true;
 }
 
@@ -713,13 +768,13 @@ static void WebcamStop() {
     g_web.link.clear();
 }
 
-// Called on a timer from the UI thread: opens the webcam only while it is shown.
+// Called on a timer from the UI thread: opens the webcam only while it is shown (or always with KeepCamOn).
 static std::atomic<bool> g_streaming{false};
 static std::atomic<bool> g_paused{false};   // streaming, but the camera shows the pause picture
 static std::atomic<int>  g_transGen{0};     // bumped by the UI: source / scene changed -> transition
 static void WebcamSync() {
     Settings s = GetSettings();
-    const bool want = g_streaming && CamNeeded(s) && !s.camLink.empty();
+    const bool want = ((g_streaming && CamNeeded(s)) || s.keepCamOn) && !s.camLink.empty();
     if (g_web.th.joinable()) {
         const bool dead = g_web.status == 3;
         if (!want || g_web.link != s.camLink || dead) {
@@ -1280,6 +1335,7 @@ public:
 
     struct Inputs {
         const RECT* screen;      // screen/window rectangle, nullptr = not available now
+        const RECT* screen2;     // "Экран 2" rectangle or nullptr
         const CamImage* cam;     // webcam frame or nullptr
         const CamImage* media;   // media frame or nullptr
         const wchar_t* camMsg;
@@ -1290,14 +1346,19 @@ public:
     bool Frame(const Settings& s, const Inputs& in, uint8_t* outBGR) {
         if (!screenDC) return false;
         const bool swap = (s.rotation & 1) != 0;
-        const int cw = swap ? H : W, ch = swap ? W : H;
+        const bool side = s.layout == 2;          // side by side: main source in the left half
+        const int TW = side ? W / 2 : W;
+        const int cw = swap ? H : TW, ch = swap ? TW : H;
         if (!canvas.Ensure(screenDC, cw, ch) || !out.Ensure(screenDC, W, H)) return false;
         canvas.Clear();
         const double zoom = kZoom[std::clamp(s.zoom, 0, kZoomCount - 1)];
         if (!DrawSource(s.mainSrc, s, in, canvas.dc, cw, ch, zoom, s.fit, s.cursor)) return false;
         GdiFlush();
-        Convert(s.rotation, s.mirror);
-        if (s.pipSrc != 0) DrawPip(s, in);
+        Convert(s.rotation, s.mirror, TW);
+        if (side)
+            DrawSide(s, in, TW);
+        else if (s.layout == 1)
+            DrawPip(s, in);
         if (s.frameShape != 0) ApplyFrameShape(s);
         if (!s.logo.empty()) DrawLogo(s);
         if (s.textOn && !s.text.empty()) DrawTextOverlay(s);
@@ -1323,7 +1384,7 @@ public:
             }
         }
         if (s.pauseMode == 2 || (s.pauseMode == 3 && !drawn))
-            DrawCard(out.dc, W, H, s.pauseMode == 3 ? L"Не удалось открыть картинку" : L"Скоро вернусь");
+            DrawCard(out.dc, W, H, s.pauseMode == 3 ? L"Не удалось открыть картинку" : s.pauseText.c_str());
         GdiFlush();
         Pack(outBGR);
     }
@@ -1341,7 +1402,7 @@ private:
         return true;
     }
 
-    // kind: 0 screen, 1 webcam, 2 media. Draws into dst (dw x dh) with zoom and fit.
+    // kind: 0 screen 1, 1 webcam, 2 media, 3 screen 2. Draws into dst (dw x dh) with zoom and fit.
     bool DrawSource(int kind, const Settings& s, const Inputs& in, HDC dst, int dw, int dh, double zoom, int fit,
                     bool cursor) {
         if (kind == 1 || kind == 2) {
@@ -1356,11 +1417,12 @@ private:
             }
             return true;
         }
-        if (!in.screen) return false;
-        const RECT& r = *in.screen;
+        const RECT* rp = kind == 3 ? in.screen2 : in.screen;
+        if (!rp) return false;
+        const RECT& r = *rp;
         HDC srcDC = screenDC;
         int ox = 0, oy = 0;  // source DC origin in screen coordinates
-        if (s.srcMode == 1 && s.winCapture == 1) {
+        if (kind == 0 && s.srcMode == 1 && s.winCapture == 1) {
             if (!GrabWindow(s.srcWindow)) return false;
             srcDC = winSurf.dc;
             ox = winRect.left;
@@ -1388,8 +1450,8 @@ private:
         return PrintWindow(hwnd, winSurf.dc, 2 /* PW_RENDERFULLCONTENT */) != FALSE;
     }
 
-    // canvas (BGRA) -> out (BGRA, W x H) with clockwise rotation and horizontal mirror
-    void Convert(int rot, bool mirror) {
+    // canvas (BGRA) -> out (BGRA, columns 0..TW-1 of W x H) with clockwise rotation and horizontal mirror
+    void Convert(int rot, bool mirror, int TW) {
         const int CW = canvas.w, CH = canvas.h;
         for (int y = 0; y < H; ++y) {
             int cx = 0, cy = 0, ddx = 0, ddy = 0;
@@ -1400,8 +1462,8 @@ private:
             case 3: cx = CW - 1 - y; cy = 0; ddx = 0; ddy = 1; break;
             }
             if (mirror) {
-                cx += (W - 1) * ddx;
-                cy += (W - 1) * ddy;
+                cx += (TW - 1) * ddx;
+                cy += (TW - 1) * ddy;
                 ddx = -ddx;
                 ddy = -ddy;
             }
@@ -1409,9 +1471,9 @@ private:
             const uint32_t* p = reinterpret_cast<const uint32_t*>(canvas.bits) + static_cast<ptrdiff_t>(cy) * CW + cx;
             uint32_t* o = reinterpret_cast<uint32_t*>(out.bits) + static_cast<size_t>(y) * W;
             if (step == 1) {
-                std::memcpy(o, p, static_cast<size_t>(W) * 4);
+                std::memcpy(o, p, static_cast<size_t>(TW) * 4);
             } else {
-                for (int x = 0; x < W; ++x, p += step) o[x] = *p;
+                for (int x = 0; x < TW; ++x, p += step) o[x] = *p;
             }
         }
     }
@@ -1460,13 +1522,34 @@ private:
         BlendMasked(solid.data(), w, h, m, x0, y0);
     }
 
+    // "Рядом": the second source fills the right half (webcam cropped to fill, others follow "fit")
+    void DrawSide(const Settings& s, const Inputs& in, int TW) {
+        const int pw = W - TW, ph = H;
+        if (pw < 8 || !pipSurf.Ensure(screenDC, pw, ph)) return;
+        pipSurf.Clear();
+        const int kind = std::clamp(s.pipSrc, 1, 4) - 1;
+        const int fit = kind == 1 ? 1 : s.fit;
+        if (!DrawSource(kind, s, in, pipSurf.dc, pw, ph, 1.0, fit, false)) DrawCard(pipSurf.dc, pw, ph, L"Нет картинки");
+        GdiFlush();
+        for (int y = 0; y < ph; ++y)
+            std::memcpy(out.bits + (static_cast<size_t>(y) * W + TW) * 4, pipSurf.bits + static_cast<size_t>(y) * pw * 4,
+                        static_cast<size_t>(pw) * 4);
+        // thin divider
+        const int dv = (std::max)(1, H / 540);
+        for (int y = 0; y < H; ++y)
+            for (int x = (std::max)(0, TW - dv); x < (std::min)(W, TW + dv); ++x) {
+                uint8_t* d = out.bits + (static_cast<size_t>(y) * W + x) * 4;
+                d[0] = d[1] = d[2] = 40;
+            }
+    }
+
     void DrawPip(const Settings& s, const Inputs& in) {
         RECT r = PipRect(s, W, H);
         const int pw = r.right - r.left, ph = r.bottom - r.top;
         if (!pipSurf.Ensure(screenDC, pw, ph)) return;
         pipSurf.Clear();
-        // pip kinds 1 screen, 2 webcam, 3 media -> source kinds 0, 1, 2
-        if (!DrawSource(s.pipSrc - 1, s, in, pipSurf.dc, pw, ph, 1.0, 1, false))
+        // pip kinds 1 screen 1, 2 webcam, 3 media, 4 screen 2 -> source kinds 0..3
+        if (!DrawSource(std::clamp(s.pipSrc, 1, 4) - 1, s, in, pipSurf.dc, pw, ph, 1.0, 1, false))
             DrawCard(pipSurf.dc, pw, ph, L"Нет картинки");
         GdiFlush();
         const int b = (std::max)(2, H / 360);
@@ -1635,10 +1718,10 @@ static const wchar_t* MediaMessage(const Settings& s) {
 
 // What changes visibly: a change here starts a transition
 static std::wstring TransitionKey(const Settings& s, bool live) {
-    wchar_t buf[160];
-    swprintf(buf, 160, L"%d|%d|%d|%d|%d|%d|%d|%d|%p|%d", live ? 1 : 0, s.mainSrc, s.pipSrc, s.textOn ? 1 : 0,
+    wchar_t buf[200];
+    swprintf(buf, 200, L"%d|%d|%d|%d|%d|%d|%d|%d|%p|%d|%d", live ? 1 : 0, s.mainSrc, SecondSrc(s), s.textOn ? 1 : 0,
              s.logo.empty() ? 0 : 1, s.frameShape, s.pipShape, s.srcMode, static_cast<void*>(s.srcWindow),
-             g_transGen.load());
+             g_transGen.load(), s.layout);
     return buf + s.camLink;
 }
 
@@ -1739,10 +1822,12 @@ static void SenderLoop(int W, int H) {
             in.media = fetch(g_media, MediaNeeded(s), mediaBuf, mediaW, mediaH, mediaSeq, false, mi);
             in.camMsg = WebcamMessage(s);
             in.mediaMsg = MediaMessage(s);
-            RECT src;
+            RECT src, src2;
             const bool haveScreen = ScreenNeeded(s) && ResolveSource(s, &src);
+            const bool haveScreen2 = Screen2Needed(s) && ResolveSource2(s, &src2);
             in.screen = haveScreen ? &src : nullptr;
-            if (s.mainSrc == 0 && !haveScreen) {
+            in.screen2 = haveScreen2 ? &src2 : nullptr;
+            if ((s.mainSrc == 0 && !haveScreen) || (s.mainSrc == 3 && !haveScreen2)) {
                 g_sourceLost = true;  // keep the last frame
             } else {
                 g_sourceLost = ScreenNeeded(s) && !haveScreen;
@@ -1752,7 +1837,7 @@ static void SenderLoop(int W, int H) {
                     g_resetCapture = true;
             }
         } else if (s.pauseMode != 0) {
-            std::wstring key = std::to_wstring(s.pauseMode) + L"|" + s.pauseImage;
+            std::wstring key = std::to_wstring(s.pauseMode) + L"|" + s.pauseImage + L"|" + s.pauseText;
             if (key != pauseKey || g_pauseDirty.exchange(false)) {
                 if (s.pauseMode == 1)
                     std::fill(frame.begin(), frame.end(), static_cast<uint8_t>(0));
@@ -2068,21 +2153,26 @@ static bool SelectRegion(HINSTANCE hInst, RECT* out) {
 // Red frame around the streamed source, with a drag tab.
 // Inside is colour-keyed (transparent, click-through). Tab = move, edges = resize.
 // ---------------------------------------------------------------------------
-static HWND  g_frame = nullptr;
+// Two frames: [0] = "Экран 1" (region / window), [1] = "Экран 2" (dashed, labelled)
+static HWND  g_frame[2] = {nullptr, nullptr};
 static int   g_fb = 6;            // border thickness, px
 static int   g_tabW = 150, g_tabH = 26;
-static bool  g_tabBelow = false;  // tab under the region when there is no room above
+static bool  g_tabBelow[2] = {false, false};  // tab under the region when there is no room above
 static bool  g_frameMoving = false;
+static int   g_movingIdx = -1;
 static HFONT g_frameFont = nullptr;
 static const UINT WM_FRAME_DONE = WM_APP + 7;
 
-static void FrameRects(int w, int h, RECT* border, RECT* hole, RECT* tab) {
-    const int top = g_tabBelow ? 0 : g_tabH;
-    const int bottom = g_tabBelow ? h - g_tabH : h;
+static int FrameIdx(HWND hwnd) { return hwnd && hwnd == g_frame[1] ? 1 : 0; }
+
+static void FrameRects(int idx, int w, int h, RECT* border, RECT* hole, RECT* tab) {
+    const bool below = g_tabBelow[idx & 1];
+    const int top = below ? 0 : g_tabH;
+    const int bottom = below ? h - g_tabH : h;
     *border = RECT{0, top, w, bottom};
     *hole = RECT{g_fb, top + g_fb, w - g_fb, bottom - g_fb};
     const int tw = (std::min)(g_tabW, w);
-    *tab = g_tabBelow ? RECT{0, h - g_tabH, tw, h} : RECT{0, 0, tw, g_tabH};
+    *tab = below ? RECT{0, h - g_tabH, tw, h} : RECT{0, 0, tw, g_tabH};
 }
 
 // Frame colour: red = live, yellow = paused, green = not streaming
@@ -2093,13 +2183,15 @@ static COLORREF FrameColor() {
 
 // The chosen shape (frame or small window) traced on the screen around the captured area.
 // Points are pushed outward so the line lies in the part the shape cuts away: it never shows in the camera.
-static bool ScreenShapeOutline(const Settings& s, const RECT& src, std::vector<POINT>* pts) {
+static bool ScreenShapeOutline(const Settings& s, const RECT& src, std::vector<POINT>* pts, int idx) {
     int W, H;
     OutSize(s.quality, s.aspect, &W, &H);
     int shape, areaW, areaH, rot = 0, fit = 1;
     bool mirror = false;
     double zoom = 1.0;
-    if (s.mainSrc == 0) {
+    const int mainKind = idx == 1 ? 3 : 0;
+    if (s.layout == 2) return false;  // side by side: plain rectangle
+    if (s.mainSrc == mainKind) {
         shape = s.frameShape;
         areaW = W;
         areaH = H;
@@ -2107,7 +2199,7 @@ static bool ScreenShapeOutline(const Settings& s, const RECT& src, std::vector<P
         mirror = s.mirror;
         zoom = kZoom[std::clamp(s.zoom, 0, kZoomCount - 1)];
         fit = s.fit;
-    } else if (s.pipSrc == 1) {
+    } else if (SecondSrc(s) == mainKind + 1) {
         shape = s.pipShape;
         RECT r = PipRect(s, W, H);
         areaW = r.right - r.left;
@@ -2165,14 +2257,18 @@ static bool ScreenShapeOutline(const Settings& s, const RECT& src, std::vector<P
 }
 
 static void RegionFromFrame(HWND hwnd) {
+    const int idx = FrameIdx(hwnd);
     RECT wr;
     GetWindowRect(hwnd, &wr);
+    RECT r{wr.left + g_fb, wr.top + g_fb + (g_tabBelow[idx] ? 0 : g_tabH), wr.right - g_fb,
+           wr.bottom - g_fb - (g_tabBelow[idx] ? g_tabH : 0)};
     std::lock_guard<std::mutex> lk(g_setMx);
-    g_set.region.left = wr.left + g_fb;
-    g_set.region.right = wr.right - g_fb;
-    g_set.region.top = wr.top + g_fb + (g_tabBelow ? 0 : g_tabH);
-    g_set.region.bottom = wr.bottom - g_fb - (g_tabBelow ? g_tabH : 0);
-    g_set.hasRegion = true;
+    if (idx == 1) {
+        g_set.region2 = r;
+    } else {
+        g_set.region = r;
+        g_set.hasRegion = true;
+    }
 }
 
 static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2180,10 +2276,12 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
+        const int idx = FrameIdx(hwnd);
         RECT rc, border, hole, tab;
         GetClientRect(hwnd, &rc);
-        FrameRects(rc.right, rc.bottom, &border, &hole, &tab);
+        FrameRects(idx, rc.right, rc.bottom, &border, &hole, &tab);
         const COLORREF col = FrameColor();
+        const Settings fs = GetSettings();
         HBRUSH key = CreateSolidBrush(kKey);
         HBRUSH red = CreateSolidBrush(col);
         FillRect(dc, &rc, key);
@@ -2191,7 +2289,7 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetWindowRect(hwnd, &wr);
         const RECT holeScr{wr.left + hole.left, wr.top + hole.top, wr.left + hole.right, wr.top + hole.bottom};
         std::vector<POINT> pts;
-        if (ScreenShapeOutline(GetSettings(), holeScr, &pts) && pts.size() >= 3) {
+        if (ScreenShapeOutline(fs, holeScr, &pts, idx) && pts.size() >= 3) {
             // corner marks (grab them to resize) + the shape's outline
             const int L = (std::min)(g_tabH * 3 / 2, (std::min)(static_cast<int>(border.right - border.left),
                                                                 static_cast<int>(border.bottom - border.top)) / 3);
@@ -2224,6 +2322,23 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             FillRect(dc, &border, red);
             FillRect(dc, &hole, key);
+            if (idx == 1) {  // "Экран 2": dashed (colour / white) so the two frames never look alike
+                HBRUSH wb = CreateSolidBrush(RGB(255, 255, 255));
+                const int seg = (std::max)(8, g_tabH / 2);
+                for (int x = border.left + seg; x < border.right - seg; x += 2 * seg) {
+                    const int x2 = (std::min)(x + seg, static_cast<int>(border.right) - seg);
+                    RECT a{x, border.top, x2, border.top + g_fb}, b{x, border.bottom - g_fb, x2, border.bottom};
+                    FillRect(dc, &a, wb);
+                    FillRect(dc, &b, wb);
+                }
+                for (int y = border.top + seg; y < border.bottom - seg; y += 2 * seg) {
+                    const int y2 = (std::min)(y + seg, static_cast<int>(border.bottom) - seg);
+                    RECT a{border.left, y, border.left + g_fb, y2}, b{border.right - g_fb, y, border.right, y2};
+                    FillRect(dc, &a, wb);
+                    FillRect(dc, &b, wb);
+                }
+                DeleteObject(wb);
+            }
         }
         FillRect(dc, &tab, red);
         DeleteObject(red);
@@ -2231,7 +2346,9 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HGDIOBJ old = g_frameFont ? SelectObject(dc, g_frameFont) : nullptr;
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        DrawTextW(dc, L"✥ перетащить", -1, &tab, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        const bool both = ScreenNeeded(fs) && Screen2Needed(fs);
+        DrawTextW(dc, idx == 1 ? L"✥ Экран 2" : both ? L"✥ Экран 1" : L"✥ перетащить", -1, &tab,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (old) SelectObject(dc, old);
         EndPaint(hwnd, &ps);
         return 0;
@@ -2242,7 +2359,7 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ScreenToClient(hwnd, &pt);
         RECT rc, border, hole, tab;
         GetClientRect(hwnd, &rc);
-        FrameRects(rc.right, rc.bottom, &border, &hole, &tab);
+        FrameRects(FrameIdx(hwnd), rc.right, rc.bottom, &border, &hole, &tab);
         if (PtInRect(&tab, pt)) return HTCAPTION;
         const int cs = g_tabH;  // corner grab size
         const bool L = pt.x < border.left + cs, R = pt.x >= border.right - cs;
@@ -2273,22 +2390,24 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // dragging the frame always means "this exact area": a followed window becomes a fixed area
         RECT cur;
         Settings s = GetSettings();
-        if (s.srcMode == 1 && ResolveSource(s, &cur)) {
+        if (FrameIdx(hwnd) == 0 && s.srcMode == 1 && ResolveSource(s, &cur)) {
             std::lock_guard<std::mutex> lk(g_setMx);
             g_set.srcMode = 0;
             g_set.region = cur;
             g_set.hasRegion = true;
         }
         g_frameMoving = true;
+        g_movingIdx = FrameIdx(hwnd);
         return 0;
     }
     case WM_MOVE:
     case WM_SIZE:
         if (msg == WM_SIZE) InvalidateRect(hwnd, nullptr, FALSE);
-        if (g_frameMoving) RegionFromFrame(hwnd);
+        if (g_frameMoving && g_movingIdx == FrameIdx(hwnd)) RegionFromFrame(hwnd);
         return 0;
     case WM_EXITSIZEMOVE:
         g_frameMoving = false;
+        g_movingIdx = -1;
         RegionFromFrame(hwnd);
         PostMessageW(hwnd, WM_FRAME_DONE, 0, 0);
         return 0;
@@ -2301,39 +2420,52 @@ static LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void UpdateFrame() {
-    if (!g_frame || g_frameMoving) return;
-    Settings s = GetSettings();
+static void UpdateOneFrame(int idx, const Settings& s) {
+    HWND f = g_frame[idx];
+    if (!f) return;
     RECT r;
-    if ((g_streaming || s.idleFrame) && ScreenNeeded(s) && ResolveSource(s, &r)) {
+    const bool need = idx == 0 ? (ScreenNeeded(s) && ResolveSource(s, &r)) : (Screen2Needed(s) && ResolveSource2(s, &r));
+    if ((g_streaming || s.idleFrame) && need) {
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
         GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi);
-        g_tabBelow = (r.top - g_fb - g_tabH) < mi.rcMonitor.top;
+        g_tabBelow[idx] = (r.top - g_fb - g_tabH) < mi.rcMonitor.top;
         RECT w{r.left - g_fb, r.top - g_fb, r.right + g_fb, r.bottom + g_fb};
-        if (g_tabBelow)
+        if (g_tabBelow[idx])
             w.bottom += g_tabH;
         else
             w.top -= g_tabH;
         RECT cur;
-        GetWindowRect(g_frame, &cur);
+        GetWindowRect(f, &cur);
         // repaint when the colour or anything that shapes the outline changes
-        static std::wstring lastLook;
-        wchar_t look[200];
-        swprintf(look, 200, L"%u|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d", static_cast<unsigned>(FrameColor()),
-                 s.mainSrc, s.pipSrc, s.frameShape, s.pipShape, s.fit, s.zoom, s.rotation, s.mirror ? 1 : 0,
-                 s.quality, s.aspect, s.pipX, s.pipY, s.pipW);
-        if (!IsWindowVisible(g_frame) || !EqualRect(&cur, &w)) {
-            SetWindowPos(g_frame, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top,
+        static std::wstring lastLook[2];
+        wchar_t look[240];
+        swprintf(look, 240, L"%u|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d", static_cast<unsigned>(FrameColor()),
+                 s.mainSrc, SecondSrc(s), s.frameShape, s.pipShape, s.fit, s.zoom, s.rotation, s.mirror ? 1 : 0,
+                 s.quality, s.aspect, s.pipX, s.pipY, s.pipW, s.layout, (ScreenNeeded(s) && Screen2Needed(s)) ? 1 : 0);
+        if (!IsWindowVisible(f) || !EqualRect(&cur, &w)) {
+            SetWindowPos(f, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top,
                          SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            InvalidateRect(g_frame, nullptr, TRUE);
-        } else if (lastLook != look) {
-            InvalidateRect(g_frame, nullptr, TRUE);
+            InvalidateRect(f, nullptr, TRUE);
+        } else if (lastLook[idx] != look) {
+            InvalidateRect(f, nullptr, TRUE);
         }
-        lastLook = look;
+        lastLook[idx] = look;
     } else {
-        ShowWindow(g_frame, SW_HIDE);
+        ShowWindow(f, SW_HIDE);
     }
+}
+
+static void UpdateFrame() {
+    if (g_frameMoving) return;
+    Settings s = GetSettings();
+    UpdateOneFrame(0, s);
+    UpdateOneFrame(1, s);
+}
+
+static void HideFrames() {
+    for (HWND f : g_frame)
+        if (f) ShowWindow(f, SW_HIDE);
 }
 
 // ---------------------------------------------------------------------------
@@ -2349,7 +2481,7 @@ static void OnPipDragged();  // main window: save + refresh
 
 static int PipHit(int mx, int my) {
     Settings s = GetSettings();
-    if (s.pipSrc == 0 || g_pvScale <= 0) return 0;
+    if (s.layout != 1 || g_pvScale <= 0) return 0;
     RECT r = PipRect(s, g_pvW, g_pvH);
     const int l = g_pvX + static_cast<int>(r.left * g_pvScale), t = g_pvY + static_cast<int>(r.top * g_pvScale);
     const int rr = g_pvX + static_cast<int>(r.right * g_pvScale), b = g_pvY + static_cast<int>(r.bottom * g_pvScale);
@@ -2366,7 +2498,7 @@ static int PipHit(int mx, int my) {
 // small window rectangle in preview pixels (for the corner handles)
 static bool PipPreviewRect(RECT* out) {
     Settings s = GetSettings();
-    if (s.pipSrc == 0 || g_pvScale <= 0) return false;
+    if (s.layout != 1 || g_pvScale <= 0) return false;
     RECT r = PipRect(s, g_pvW, g_pvH);
     *out = RECT{g_pvX + static_cast<int>(r.left * g_pvScale), g_pvY + static_cast<int>(r.top * g_pvScale),
                 g_pvX + static_cast<int>(r.right * g_pvScale), g_pvY + static_cast<int>(r.bottom * g_pvScale)};
@@ -2515,6 +2647,7 @@ enum HotkeyAction {
     HA_MEDIA_NEXT,
     HA_HIDE_WINDOW,
     HA_PAUSE,
+    HA_SCREEN12,  // v0.7: main source Экран 1 <-> Экран 2
     HA_COUNT
 };
 
@@ -2529,17 +2662,18 @@ static const HotkeyDef kHotkeys[HA_COUNT] = {
     {L"Выбрать область", MOD_CONTROL | MOD_SHIFT, VK_F6},
     {L"Следующий монитор", MOD_CONTROL | MOD_SHIFT, VK_F7},
     {L"Курсор вкл/выкл", MOD_CONTROL | MOD_SHIFT, VK_F8},
-    {L"Большая картинка: экран ↔ камера", MOD_CONTROL | MOD_SHIFT, VK_F9},
-    {L"Камера в углу вкл/выкл", MOD_CONTROL | MOD_SHIFT, VK_F10},
+    {L"Главный источник: экран ↔ веб-камера", MOD_CONTROL | MOD_SHIFT, VK_F9},
+    {L"Второй источник (окошко) вкл/выкл", MOD_CONTROL | MOD_SHIFT, VK_F10},
     {L"Надпись вкл/выкл", MOD_CONTROL | MOD_SHIFT, VK_F11},
     {L"Сцена 1", MOD_CONTROL | MOD_SHIFT, '1'},
     {L"Сцена 2", MOD_CONTROL | MOD_SHIFT, '2'},
     {L"Сцена 3", MOD_CONTROL | MOD_SHIFT, '3'},
     {L"Сцена 4", MOD_CONTROL | MOD_SHIFT, '4'},
-    {L"Поменять большое и малое", MOD_CONTROL | MOD_SHIFT, VK_F12},
+    {L"Поменять главный и второй источник", MOD_CONTROL | MOD_SHIFT, VK_F12},
     {L"Следующий медиафайл", MOD_CONTROL | MOD_SHIFT, '5'},
     {L"Спрятать / вернуть окно", 0, 0},
     {L"Пауза / продолжить", MOD_CONTROL | MOD_SHIFT, '6'},
+    {L"Главный источник: Экран 1 ⇄ Экран 2", MOD_CONTROL | MOD_SHIFT, '7'},
 };
 
 static UINT g_hk[HA_COUNT];  // (MOD_* << 8) | vk, 0 = none
@@ -2628,29 +2762,37 @@ static std::wstring HotkeyListText() {
 // ---------------------------------------------------------------------------
 enum {
     IDC_TAB = 100,
-    // page 0: source and picture
-    IDC_SRC_LABEL, IDC_SRC_VALUE, IDC_SELECT, IDC_MONITOR, IDC_WINDOW,
-    IDC_Q_LABEL, IDC_QUALITY, IDC_A_LABEL, IDC_ASPECT, IDC_FPS_LABEL, IDC_FPS,
-    IDC_FIT_LABEL, IDC_FIT, IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM,
-    IDC_MIRROR, IDC_CURSOR, IDC_SHAPE_LABEL, IDC_FRAMESHAPE, IDC_SHAPECOLOR,
-    IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN, IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR, IDC_IDLEFRAME,
-    // page 1: layers
-    IDC_VIEW_LABEL, IDC_VIEW, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP,
-    IDC_CAM_LABEL, IDC_CAMDEV, IDC_PIP_LABEL, IDC_PIPCORNER, IDC_PIPSIZE, IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE,
-    IDC_CAMMIRROR,
-    IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE,
-    IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE, IDC_LOGO_NAME,
-    IDC_PIP_HINT, IDC_PIPSIZE_UD,
-    // page 2: media files
-    IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN, IDC_IMGSEC_LABEL, IDC_IMGSEC,
-    IDC_MEDIA_NEXT, IDC_MEDIA_NOW, IDC_MEDIA_HINT,
-    // page 3: scenes and keys
-    IDC_PROF_LABEL, IDC_PROFILE, IDC_PROF_LOAD, IDC_PROF_SAVE, IDC_PROF_DEL, IDC_PROF_HINT,
-    IDC_HK_EDIT, IDC_AUTOSTART, IDC_AUTOSTREAM, IDC_JSON_EXPORT, IDC_JSON_IMPORT, IDC_HK_LIST,
-    // right column
+    // tab "Источники"
+    IDC_SRC_HDR, IDC_SRC_VALUE, IDC_SELECT, IDC_MONITOR, IDC_WINDOW,
+    IDC_SEC_WIN, IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN,
+    IDC_SRC2_HDR, IDC_SRC2_VALUE, IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE,
+    IDC_SHOW_HDR, IDC_VIEW_LABEL, IDC_VIEW, IDC_LAYOUT_LABEL, IDC_LAYOUT, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP,
+    IDC_CAM_HDR, IDC_CAM_LABEL, IDC_CAMDEV, IDC_CAMMIRROR,
+    IDC_MEDIA_HDR, IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN, IDC_IMGSEC_LABEL,
+    IDC_IMGSEC, IDC_MEDIA_NEXT, IDC_MEDIA_NOW,
+    // tab "Кадр"
+    IDC_PIP_HDR, IDC_PIP_LABEL, IDC_PIPCORNER, IDC_PIPSIZE, IDC_PIPSIZE_UD, IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE,
+    IDC_FRAME_HDR, IDC_FIT_LABEL, IDC_FIT, IDC_SHAPE_LABEL, IDC_FRAMESHAPE,
+    IDC_SEC_FRAME, IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM, IDC_MIRROR, IDC_CURSOR, IDC_SHAPECOLOR_LABEL,
+    IDC_SHAPECOLOR,
+    IDC_TEXT_HDR, IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE,
+    IDC_LOGO_HDR, IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE,
+    IDC_LOGO_NAME,
+    IDC_TRANS_HDR, IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR,
+    // tab "Настройки"
+    IDC_FMT_HDR, IDC_Q_LABEL, IDC_QUALITY, IDC_A_LABEL, IDC_ASPECT, IDC_FPS_LABEL, IDC_FPS,
+    IDC_PAUSE_HDR, IDC_PAUSE_LABEL, IDC_PAUSE, IDC_PAUSETEXT_LABEL, IDC_PAUSETEXT, IDC_PAUSE_IMG,
+    IDC_BEH_HDR, IDC_KEEPCAM, IDC_IDLEFRAME, IDC_AUTOSTART, IDC_AUTOSTREAM,
+    IDC_HK_HDR, IDC_HK_EDIT, IDC_SEC_KEYS, IDC_HK_LIST,
+    IDC_FILE_HDR, IDC_JSON_EXPORT, IDC_JSON_IMPORT,
+    IDC_CAMSYS_HDR, IDC_INSTALL, IDC_UNINSTALL,
+    // left column (always visible)
     IDC_PREV_LABEL, IDC_FPS_VALUE, IDC_PREVIEW, IDC_START, IDC_PAUSEBTN, IDC_STATUS,
-    IDC_PAUSE_LABEL, IDC_PAUSE, IDC_PAUSE_IMG, IDC_INSTALL, IDC_UNINSTALL,
+    IDC_SCENE_HDR, IDC_SCENE1, IDC_SCENE2, IDC_SCENE3, IDC_SCENE4,
+    IDC_PROF_LABEL, IDC_PROFILE, IDC_PROF_LOAD, IDC_PROF_SAVE, IDC_PROF_DEL, IDC_PROF_HINT,
+    IDC_LAST_ID
 };
+static_assert(IDC_LAST_ID < 300, "control ids must stay below the tray ids");
 enum { ID_TRAY_OPEN = 300, ID_TRAY_TOGGLE, ID_TRAY_PAUSE, ID_TRAY_EXIT };
 
 static const UINT WM_TRAY = WM_APP + 1;
@@ -2660,6 +2802,7 @@ static HINSTANCE g_hInst;
 static HWND g_main = nullptr;
 static HWND g_preview = nullptr;
 static HFONT g_font = nullptr;
+static HFONT g_fontBold = nullptr;
 static UINT g_dpi = 96;
 static NOTIFYICONDATAW g_nid{};
 static std::wstring g_note;  // one-off note in the status line
@@ -2667,28 +2810,40 @@ static bool g_syncing = false;
 static int g_page = 0;
 static std::vector<CamDevice> g_camList;
 
-static const int kPage0[] = {IDC_SRC_LABEL, IDC_SRC_VALUE, IDC_SELECT, IDC_MONITOR, IDC_WINDOW, IDC_Q_LABEL,
-                             IDC_QUALITY, IDC_A_LABEL, IDC_ASPECT, IDC_FPS_LABEL, IDC_FPS, IDC_FIT_LABEL, IDC_FIT,
-                             IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM, IDC_MIRROR, IDC_CURSOR,
-                             IDC_SHAPE_LABEL, IDC_FRAMESHAPE, IDC_SHAPECOLOR, IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN,
-                             IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR, IDC_IDLEFRAME};
-static const int kPage1[] = {IDC_VIEW_LABEL, IDC_VIEW, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP, IDC_CAM_LABEL,
-                             IDC_CAMDEV, IDC_PIP_LABEL, IDC_PIPCORNER, IDC_PIPSIZE, IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE,
-                             IDC_CAMMIRROR, IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL, IDC_TEXTPOS,
-                             IDC_TEXTSIZE, IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL,
-                             IDC_LOGOCORNER, IDC_LOGOSIZE, IDC_LOGO_NAME, IDC_PIP_HINT, IDC_PIPSIZE_UD};
-static const int kPage2[] = {IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN,
-                             IDC_IMGSEC_LABEL, IDC_IMGSEC, IDC_MEDIA_NEXT, IDC_MEDIA_NOW, IDC_MEDIA_HINT};
-static const int kPage3[] = {IDC_PROF_LABEL, IDC_PROFILE, IDC_PROF_LOAD, IDC_PROF_SAVE, IDC_PROF_DEL,
-                             IDC_PROF_HINT, IDC_HK_EDIT, IDC_AUTOSTART, IDC_AUTOSTREAM, IDC_JSON_EXPORT,
-                             IDC_JSON_IMPORT, IDC_HK_LIST};
+// light theme
+static const COLORREF kBgMain = RGB(243, 243, 243), kBgPage = RGB(255, 255, 255);
+static const COLORREF kHdrText = RGB(0, 84, 160), kHintText = RGB(96, 96, 96);
+static HBRUSH g_brMain = nullptr, g_brPage = nullptr;
 
-static bool OnTabPage(int id) { return id >= IDC_SRC_LABEL && id <= IDC_HK_LIST; }
+// tab pages: scrollable child windows holding their controls
+static const int kPages = 3;
+static HWND g_pageWnd[kPages] = {};
+static int g_scroll[kPages] = {};  // vertical scroll offset, px
+static HWND g_ctl[IDC_LAST_ID + 1] = {};
+
+// collapsible sections (bit per section, saved as UiExpanded)
+enum { SEC_WIN = 1, SEC_FRAME = 2, SEC_KEYS = 4 };
+static int g_expanded = 0;
+
+static bool IsHeaderId(int id) {
+    switch (id) {
+    case IDC_SRC_HDR: case IDC_SRC2_HDR: case IDC_SHOW_HDR: case IDC_CAM_HDR: case IDC_MEDIA_HDR:
+    case IDC_PIP_HDR: case IDC_FRAME_HDR: case IDC_TEXT_HDR: case IDC_LOGO_HDR: case IDC_TRANS_HDR:
+    case IDC_FMT_HDR: case IDC_PAUSE_HDR: case IDC_BEH_HDR: case IDC_HK_HDR: case IDC_FILE_HDR:
+    case IDC_CAMSYS_HDR: case IDC_SCENE_HDR:
+        return true;
+    }
+    return false;
+}
 
 static int S(int v) { return MulDiv(v, static_cast<int>(g_dpi), 96); }
-static HWND Ctl(int id) { return GetDlgItem(g_main, id); }
+static HWND Ctl(int id) {
+    if (id > 0 && id <= IDC_LAST_ID && g_ctl[id]) return g_ctl[id];
+    return GetDlgItem(g_main, id);
+}
 
 static void SetTextIfChanged(HWND h, const std::wstring& text) {
+    if (!h) return;
     wchar_t cur[4096] = {};
     GetWindowTextW(h, cur, 4096);
     if (text != cur) SetWindowTextW(h, text.c_str());
@@ -2696,99 +2851,317 @@ static void SetTextIfChanged(HWND h, const std::wstring& text) {
 
 static void MakeFont() {
     if (g_font) DeleteObject(g_font);
+    if (g_fontBold) DeleteObject(g_fontBold);
     g_font = CreateFontW(-MulDiv(9, static_cast<int>(g_dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
                          L"Segoe UI");
+    g_fontBold = CreateFontW(-MulDiv(9, static_cast<int>(g_dpi), 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                             L"Segoe UI");
 }
 
-static const int kClientW = 800, kClientH = 500;
+static const int kClientW = 900, kClientH = 600;
+static const int kLeftX = 12, kLeftW = 400, kRightX = 424;
+
+static void SetSectionText(int id, bool open, const wchar_t* title) {
+    std::wstring t = (open ? L"▾  " : L"▸  ") + std::wstring(title);
+    SetTextIfChanged(Ctl(id), t);
+}
+
+// One tab page laid out top to bottom; collapsed sections hide their controls and the rest moves up.
+static void LayoutPage(int p) {
+    HWND page = g_pageWnd[p];
+    if (!page) return;
+    RECT pc;
+    GetClientRect(page, &pc);
+    const int W = MulDiv(pc.right, 96, static_cast<int>(g_dpi));  // page width in 96-dpi units
+    struct Pl { int id, x, y, w, h; bool vis; };
+    std::vector<Pl> pl;
+    const int pad = 14, lw = 148, cx = pad + lw + 6;
+    const int fw = (std::max)(120, W - 2 * pad), cw = (std::max)(80, W - cx - pad);
+    int y = 8;
+    auto P = [&](int id, int x, int yy, int w, int h, bool vis = true) { pl.push_back({id, x, yy, w, h, vis}); };
+    auto hdr = [&](int id) { y += 6; P(id, pad, y, fw, 20); y += 26; };
+    auto row1 = [&](int lab, int ctl, int h = 200) { P(lab, pad, y + 4, lw, 20); P(ctl, cx, y, cw, h); y += 32; };
+    auto row2 = [&](int lab, int a, int b, int bw = 76) {
+        P(lab, pad, y + 4, lw, 20);
+        P(a, cx, y, cw - bw - 6, 200);
+        P(b, cx + cw - bw, y, bw, 200);
+        y += 32;
+    };
+    auto chk = [&](int id) { P(id, pad, y, fw, 22); y += 26; };
+    auto btns = [&](std::initializer_list<int> ids) {
+        const int n = static_cast<int>(ids.size());
+        const int bw = (fw - (n - 1) * 6) / n;
+        int i = 0;
+        for (int id : ids) {
+            const int x = pad + i * (bw + 6);
+            const int w = (i == n - 1) ? fw - (n - 1) * (bw + 6) : bw;
+            P(id, x, y, w, 28);
+            ++i;
+        }
+        y += 34;
+    };
+    auto full = [&](int id, int h) { P(id, pad, y, fw, h); y += h + 6; };
+    auto hide = [&](std::initializer_list<int> ids) {
+        for (int id : ids) P(id, 0, 0, 10, 10, false);
+    };
+    auto sec = [&](int id, int bit, const wchar_t* title) {
+        const bool open = (g_expanded & bit) != 0;
+        SetSectionText(id, open, title);
+        P(id, pad, y, fw, 26);
+        y += 32;
+        return open;
+    };
+
+    if (p == 0) {  // Источники
+        hdr(IDC_SRC_HDR);
+        full(IDC_SRC_VALUE, 20);
+        btns({IDC_SELECT, IDC_MONITOR, IDC_WINDOW});
+        if (sec(IDC_SEC_WIN, SEC_WIN, L"Дополнительно: захват окна")) {
+            row1(IDC_WCAP_LABEL, IDC_WINCAP);
+            P(IDC_HIDEWIN, cx, y, cw, 28);
+            y += 34;
+        } else {
+            hide({IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN});
+        }
+        hdr(IDC_SRC2_HDR);
+        full(IDC_SRC2_VALUE, 20);
+        btns({IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE});
+        hdr(IDC_SHOW_HDR);
+        row1(IDC_VIEW_LABEL, IDC_VIEW);
+        row1(IDC_LAYOUT_LABEL, IDC_LAYOUT);
+        P(IDC_PIPSRC_LABEL, pad, y + 4, lw, 20);
+        P(IDC_PIPSRC, cx, y, cw - 46, 200);
+        P(IDC_SWAP, cx + cw - 40, y - 1, 40, 26);
+        y += 32;
+        hdr(IDC_CAM_HDR);
+        row1(IDC_CAM_LABEL, IDC_CAMDEV, 240);
+        chk(IDC_CAMMIRROR);
+        hdr(IDC_MEDIA_HDR);
+        full(IDC_MEDIA_LIST, 104);
+        {
+            const int bw = (fw - 3 * 6 - 2 * 44) / 2;
+            P(IDC_MEDIA_ADD, pad, y, bw, 28);
+            P(IDC_MEDIA_DEL, pad + bw + 6, y, bw, 28);
+            P(IDC_MEDIA_UP, pad + 2 * (bw + 6), y, 44, 28);
+            P(IDC_MEDIA_DOWN, pad + fw - 44, y, 44, 28);
+            y += 34;
+        }
+        row1(IDC_IMGSEC_LABEL, IDC_IMGSEC);
+        P(IDC_MEDIA_NEXT, pad, y, 180, 28);
+        P(IDC_MEDIA_NOW, pad + 188, y + 5, fw - 188, 20);
+        y += 34;
+    } else if (p == 1) {  // Кадр
+        hdr(IDC_PIP_HDR);
+        P(IDC_PIP_LABEL, pad, y + 4, lw, 20);
+        P(IDC_PIPCORNER, cx, y, cw - 84, 200);
+        P(IDC_PIPSIZE, cx + cw - 78, y, 56, 24);
+        P(IDC_PIPSIZE_UD, cx + cw - 22, y, 22, 24);
+        y += 32;
+        row1(IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE);
+        hdr(IDC_FRAME_HDR);
+        row1(IDC_FIT_LABEL, IDC_FIT);
+        row1(IDC_SHAPE_LABEL, IDC_FRAMESHAPE);
+        if (sec(IDC_SEC_FRAME, SEC_FRAME, L"Дополнительно: поворот, зум, зеркало, курсор, фон")) {
+            row1(IDC_ROT_LABEL, IDC_ROT);
+            row1(IDC_ZOOM_LABEL, IDC_ZOOM);
+            row1(IDC_SHAPECOLOR_LABEL, IDC_SHAPECOLOR);
+            chk(IDC_MIRROR);
+            chk(IDC_CURSOR);
+        } else {
+            hide({IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM, IDC_SHAPECOLOR_LABEL, IDC_SHAPECOLOR, IDC_MIRROR,
+                  IDC_CURSOR});
+        }
+        hdr(IDC_TEXT_HDR);
+        P(IDC_TEXT_LABEL, pad, y + 4, lw, 20);
+        P(IDC_TEXT, cx, y, cw, 24);
+        y += 32;
+        chk(IDC_TEXTON);
+        row2(IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE, 96);
+        hdr(IDC_LOGO_HDR);
+        P(IDC_LOGO_LABEL, pad, y + 5, lw, 20);
+        P(IDC_LOGO_PICK, cx, y, cw - 96 - 6, 28);
+        P(IDC_LOGO_CLEAR, cx + cw - 96, y, 96, 28);
+        y += 34;
+        row2(IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE, 96);
+        full(IDC_LOGO_NAME, 20);
+        hdr(IDC_TRANS_HDR);
+        row2(IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR, 96);
+    } else {  // Настройки
+        hdr(IDC_FMT_HDR);
+        row1(IDC_Q_LABEL, IDC_QUALITY);
+        row1(IDC_A_LABEL, IDC_ASPECT);
+        row1(IDC_FPS_LABEL, IDC_FPS);
+        hdr(IDC_PAUSE_HDR);
+        row1(IDC_PAUSE_LABEL, IDC_PAUSE);
+        P(IDC_PAUSETEXT_LABEL, pad, y + 4, lw, 20);
+        P(IDC_PAUSETEXT, cx, y, cw, 24);
+        y += 32;
+        P(IDC_PAUSE_IMG, cx, y, cw, 28);
+        y += 34;
+        hdr(IDC_BEH_HDR);
+        chk(IDC_KEEPCAM);
+        chk(IDC_IDLEFRAME);
+        chk(IDC_AUTOSTART);
+        chk(IDC_AUTOSTREAM);
+        hdr(IDC_HK_HDR);
+        P(IDC_HK_EDIT, pad, y, 240, 28);
+        y += 34;
+        if (sec(IDC_SEC_KEYS, SEC_KEYS, L"Список горячих клавиш")) {
+            full(IDC_HK_LIST, 190);
+        } else {
+            hide({IDC_HK_LIST});
+        }
+        hdr(IDC_FILE_HDR);
+        btns({IDC_JSON_EXPORT, IDC_JSON_IMPORT});
+        hdr(IDC_CAMSYS_HDR);
+        btns({IDC_INSTALL, IDC_UNINSTALL});
+    }
+    y += 8;
+
+    // scroll range, then place everything shifted by the scroll offset
+    const int content = S(y), view = pc.bottom;
+    g_scroll[p] = std::clamp(g_scroll[p], 0, (std::max)(0, content - view));
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+    si.nMin = 0;
+    si.nMax = (std::max)(0, content - 1);
+    si.nPage = static_cast<UINT>((std::max)(1, view));
+    si.nPos = g_scroll[p];
+    SetScrollInfo(page, SB_VERT, &si, TRUE);
+    HDWP dw = BeginDeferWindowPos(static_cast<int>(pl.size()));
+    for (const Pl& it : pl) {
+        HWND h = Ctl(it.id);
+        if (!h) continue;
+        const UINT fl = SWP_NOZORDER | SWP_NOACTIVATE | (it.vis ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+        if (dw)
+            dw = DeferWindowPos(dw, h, nullptr, S(it.x), S(it.y) - g_scroll[p], S(it.w), S(it.h), fl);
+        else
+            SetWindowPos(h, nullptr, S(it.x), S(it.y) - g_scroll[p], S(it.w), S(it.h), fl);
+    }
+    if (dw) EndDeferWindowPos(dw);
+    InvalidateRect(page, nullptr, TRUE);
+}
+
+static void LayoutPages() {
+    for (int p = 0; p < kPages; ++p) LayoutPage(p);
+}
 
 static void Layout() {
+    // fonts for every control (headers bold)
+    for (int id = IDC_TAB; id < IDC_LAST_ID; ++id) {
+        HWND h = Ctl(id);
+        if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(IsHeaderId(id) ? g_fontBold : g_font), FALSE);
+    }
+    // left column: preview, start / pause, status, scenes
     struct L { int id, x, y, w, h; };
-    const int lx = 24, cx = 172, cw = 210;  // label x, control x, control width on the tab pages
+    const int lx = kLeftX, lw = kLeftW;
+    const int sb = (lw - 3 * 6) / 4;
+    const int pb = (lw - 2 * 6) / 3;
     const L items[] = {
-        {IDC_TAB, 10, 8, 384, 484},
-        // page 0
-        {IDC_SRC_LABEL, lx, 46, 70, 20},
-        {IDC_SRC_VALUE, lx + 72, 46, 286, 20},
-        {IDC_SELECT, lx, 70, 116, 28},
-        {IDC_MONITOR, lx + 121, 70, 116, 28},
-        {IDC_WINDOW, lx + 242, 70, 116, 28},
-        {IDC_Q_LABEL, lx, 114, 145, 20}, {IDC_QUALITY, cx, 110, cw, 200},
-        {IDC_A_LABEL, lx, 144, 145, 20}, {IDC_ASPECT, cx, 140, cw, 200},
-        {IDC_FPS_LABEL, lx, 174, 145, 20}, {IDC_FPS, cx, 170, cw, 200},
-        {IDC_FIT_LABEL, lx, 204, 145, 20}, {IDC_FIT, cx, 200, cw, 200},
-        {IDC_ROT_LABEL, lx, 234, 145, 20}, {IDC_ROT, cx, 230, cw, 200},
-        {IDC_ZOOM_LABEL, lx, 264, 145, 20}, {IDC_ZOOM, cx, 260, cw, 200},
-        {IDC_SHAPE_LABEL, lx, 294, 145, 20}, {IDC_FRAMESHAPE, cx, 290, 128, 200}, {IDC_SHAPECOLOR, cx + 134, 290, 76, 200},
-        {IDC_MIRROR, lx, 324, 150, 22}, {IDC_CURSOR, cx, 324, cw, 22},
-        {IDC_WCAP_LABEL, lx, 362, 145, 20}, {IDC_WINCAP, cx, 358, cw, 200},
-        {IDC_HIDEWIN, cx, 390, cw, 28},
-        {IDC_TRANS_LABEL, lx, 432, 145, 20}, {IDC_TRANS, cx, 428, 128, 200}, {IDC_TRANSDUR, cx + 134, 428, 76, 200},
-        {IDC_IDLEFRAME, lx, 460, 358, 22},
-        // page 1
-        {IDC_VIEW_LABEL, lx, 50, 145, 20}, {IDC_VIEW, cx, 46, cw, 200},
-        {IDC_PIPSRC_LABEL, lx, 82, 145, 20}, {IDC_PIPSRC, cx, 78, 128, 200}, {IDC_SWAP, cx + 134, 77, 76, 26},
-        {IDC_CAM_LABEL, lx, 114, 145, 20}, {IDC_CAMDEV, cx, 110, cw, 240},
-        {IDC_PIP_LABEL, lx, 146, 145, 20}, {IDC_PIPCORNER, cx, 142, 128, 200}, {IDC_PIPSIZE, cx + 134, 142, 54, 24},
-        {IDC_PIPSIZE_UD, cx + 188, 142, 22, 24},
-        {IDC_PIPSHAPE_LABEL, lx, 178, 145, 20}, {IDC_PIPSHAPE, cx, 174, cw, 200},
-        {IDC_CAMMIRROR, lx, 206, 340, 22},
-        {IDC_TEXT_LABEL, lx, 242, 145, 20}, {IDC_TEXT, cx, 238, cw, 24},
-        {IDC_TEXTON, lx, 268, 340, 22},
-        {IDC_TPOS_LABEL, lx, 300, 145, 20}, {IDC_TEXTPOS, cx, 296, 128, 200}, {IDC_TEXTSIZE, cx + 134, 296, 76, 200},
-        {IDC_LOGO_LABEL, lx, 338, 145, 20}, {IDC_LOGO_PICK, cx, 334, 128, 28}, {IDC_LOGO_CLEAR, cx + 134, 334, 76, 28},
-        {IDC_LPOS_LABEL, lx, 374, 145, 20}, {IDC_LOGOCORNER, cx, 370, 128, 200}, {IDC_LOGOSIZE, cx + 134, 370, 76, 200},
-        {IDC_LOGO_NAME, lx, 404, 358, 20},
-        {IDC_PIP_HINT, lx, 430, 358, 54},
-        // page 2
-        {IDC_MEDIA_LIST, lx, 46, 358, 236},
-        {IDC_MEDIA_ADD, lx, 290, 116, 28}, {IDC_MEDIA_DEL, lx + 121, 290, 116, 28},
-        {IDC_MEDIA_UP, lx + 242, 290, 56, 28}, {IDC_MEDIA_DOWN, lx + 302, 290, 56, 28},
-        {IDC_IMGSEC_LABEL, lx, 334, 145, 20}, {IDC_IMGSEC, cx, 330, cw, 200},
-        {IDC_MEDIA_NEXT, lx, 366, 200, 28},
-        {IDC_MEDIA_NOW, lx, 402, 358, 20},
-        {IDC_MEDIA_HINT, lx, 426, 358, 60},
-        // page 3
-        {IDC_PROF_LABEL, lx, 50, 90, 20}, {IDC_PROFILE, lx + 92, 46, 266, 240},
-        {IDC_PROF_LOAD, lx, 80, 116, 28}, {IDC_PROF_SAVE, lx + 121, 80, 116, 28}, {IDC_PROF_DEL, lx + 242, 80, 116, 28},
-        {IDC_PROF_HINT, lx, 116, 358, 58},
-        {IDC_AUTOSTART, lx, 180, 358, 22},
-        {IDC_AUTOSTREAM, lx, 204, 358, 22},
-        {IDC_JSON_EXPORT, lx, 234, 176, 28}, {IDC_JSON_IMPORT, lx + 182, 234, 176, 28},
-        {IDC_HK_EDIT, lx, 270, 240, 28},
-        {IDC_HK_LIST, lx, 304, 358, 178},
-        // right column
-        {IDC_PREV_LABEL, 406, 14, 220, 20},
-        {IDC_FPS_VALUE, 630, 14, 160, 20},
-        {IDC_PREVIEW, 406, 40, 384, 216},
-        {IDC_START, 406, 266, 246, 40},
-        {IDC_PAUSEBTN, 658, 266, 132, 40},
-        {IDC_STATUS, 406, 314, 384, 70},
-        {IDC_PAUSE_LABEL, 406, 398, 150, 20},
-        {IDC_PAUSE, 560, 394, 230, 200},
-        {IDC_PAUSE_IMG, 560, 426, 230, 28},
-        {IDC_INSTALL, 406, 464, 189, 28},
-        {IDC_UNINSTALL, 601, 464, 189, 28},
+        {IDC_PREV_LABEL, lx, 10, 260, 20},
+        {IDC_FPS_VALUE, lx + 262, 10, lw - 262, 20},
+        {IDC_PREVIEW, lx, 34, lw, 225},
+        {IDC_START, lx, 269, lw - 138, 40},
+        {IDC_PAUSEBTN, lx + lw - 132, 269, 132, 40},
+        {IDC_STATUS, lx, 317, lw, 54},
+        {IDC_SCENE_HDR, lx, 379, lw, 20},
+        {IDC_SCENE1, lx, 403, sb, 30},
+        {IDC_SCENE2, lx + (sb + 6), 403, sb, 30},
+        {IDC_SCENE3, lx + 2 * (sb + 6), 403, sb, 30},
+        {IDC_SCENE4, lx + 3 * (sb + 6), 403, lw - 3 * (sb + 6), 30},
+        {IDC_PROF_LABEL, lx, 447, 56, 20},
+        {IDC_PROFILE, lx + 58, 443, lw - 58, 240},
+        {IDC_PROF_LOAD, lx, 475, pb, 28},
+        {IDC_PROF_SAVE, lx + pb + 6, 475, pb, 28},
+        {IDC_PROF_DEL, lx + 2 * (pb + 6), 475, lw - 2 * (pb + 6), 28},
+        {IDC_PROF_HINT, lx, 511, lw, 80},
+        {IDC_TAB, kRightX, 8, kClientW - kRightX - 12, kClientH - 16},
     };
     for (const auto& it : items) {
         HWND h = Ctl(it.id);
-        if (!h) continue;
-        SetWindowPos(h, nullptr, S(it.x), S(it.y), S(it.w), S(it.h), SWP_NOZORDER | SWP_NOACTIVATE);
-        SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        if (h) SetWindowPos(h, nullptr, S(it.x), S(it.y), S(it.w), S(it.h), SWP_NOZORDER | SWP_NOACTIVATE);
     }
+    // pages fill the tab's display area
+    RECT tr{S(kRightX), S(8), S(kClientW - 12), S(kClientH - 8)};
+    SendMessageW(Ctl(IDC_TAB), TCM_ADJUSTRECT, FALSE, reinterpret_cast<LPARAM>(&tr));
+    for (int p = 0; p < kPages; ++p)
+        if (g_pageWnd[p])
+            SetWindowPos(g_pageWnd[p], HWND_TOP, tr.left, tr.top, tr.right - tr.left, tr.bottom - tr.top,
+                         SWP_NOACTIVATE);
     SetWindowPos(Ctl(IDC_TAB), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    LayoutPages();
+    InvalidateRect(g_main, nullptr, TRUE);
 }
 
 static void ShowPage(int page) {
-    g_page = page;
-    auto show = [](const int* ids, size_t n, bool on) {
-        for (size_t i = 0; i < n; ++i) ShowWindow(Ctl(ids[i]), on ? SW_SHOW : SW_HIDE);
-    };
-    show(kPage0, ARRAYSIZE(kPage0), page == 0);
-    show(kPage1, ARRAYSIZE(kPage1), page == 1);
-    show(kPage2, ARRAYSIZE(kPage2), page == 2);
-    show(kPage3, ARRAYSIZE(kPage3), page == 3);
+    g_page = std::clamp(page, 0, kPages - 1);
+    for (int p = 0; p < kPages; ++p)
+        if (g_pageWnd[p]) ShowWindow(g_pageWnd[p], p == g_page ? SW_SHOW : SW_HIDE);
+}
+
+static void ToggleSection(int bit) {
+    g_expanded ^= bit;
+    IniSetInt(kMainSec, L"UiExpanded", g_expanded);
+    LayoutPage(g_page);
+}
+
+static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    int p = 0;
+    for (int i = 0; i < kPages; ++i)
+        if (g_pageWnd[i] == hwnd) p = i;
+    switch (msg) {
+    case WM_COMMAND:
+    case WM_NOTIFY:
+        return g_main ? SendMessageW(g_main, msg, wp, lp) : 0;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lp));
+        SetBkColor(dc, kBgPage);
+        if (msg == WM_CTLCOLORSTATIC) {
+            if (IsHeaderId(id))
+                SetTextColor(dc, kHdrText);
+            else if (id == IDC_MEDIA_NOW || id == IDC_LOGO_NAME || id == IDC_SRC_VALUE || id == IDC_SRC2_VALUE)
+                SetTextColor(dc, kHintText);
+        }
+        return reinterpret_cast<LRESULT>(g_brPage);
+    }
+    case WM_VSCROLL: {
+        if (lp) return 0;  // from a child (the % up-down): not the page scroll bar
+        SCROLLINFO si{};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int pos = si.nPos;
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: pos -= S(30); break;
+        case SB_LINEDOWN: pos += S(30); break;
+        case SB_PAGEUP: pos -= static_cast<int>(si.nPage); break;
+        case SB_PAGEDOWN: pos += static_cast<int>(si.nPage); break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: pos = si.nTrackPos; break;
+        case SB_TOP: pos = 0; break;
+        case SB_BOTTOM: pos = si.nMax; break;
+        default: return 0;
+        }
+        if (pos != g_scroll[p]) {
+            g_scroll[p] = pos;
+            LayoutPage(p);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        const int old = g_scroll[p];
+        g_scroll[p] -= GET_WHEEL_DELTA_WPARAM(wp) * S(60) / WHEEL_DELTA;
+        LayoutPage(p);
+        (void)old;
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 static int ComboSel(int id) { return static_cast<int>(SendMessageW(Ctl(id), CB_GETCURSEL, 0, 0)); }
 static void ComboSet(int id, int sel) { SendMessageW(Ctl(id), CB_SETCURSEL, sel, 0); }
@@ -2831,6 +3204,13 @@ static void FillProfileCombo(const std::wstring& select) {
         if (names[i] == select) sel = static_cast<int>(i);
     }
     SendMessageW(h, CB_SETCURSEL, sel, 0);
+    // quick buttons 1-4 = the first four scenes in the list
+    for (int i = 0; i < 4; ++i) {
+        const bool have = i < static_cast<int>(names.size());
+        std::wstring t = std::to_wstring(i + 1) + L"  " + (have ? names[i] : std::wstring(L"—"));
+        SetTextIfChanged(Ctl(IDC_SCENE1 + i), t);
+        EnableWindow(Ctl(IDC_SCENE1 + i), have);
+    }
 }
 
 // settings -> controls (after hotkeys, profiles, startup)
@@ -2892,7 +3272,10 @@ static void SyncControls() {
     CheckSet(IDC_CURSOR, s.cursor);
     ComboSet(IDC_WINCAP, s.winCapture);
     ComboSet(IDC_VIEW, s.mainSrc);
-    ComboSet(IDC_PIPSRC, s.pipSrc);
+    ComboSet(IDC_LAYOUT, s.layout);
+    ComboSet(IDC_PIPSRC, std::clamp(s.pipSrc, 1, 4) - 1);
+    CheckSet(IDC_KEEPCAM, s.keepCamOn);
+    SetTextIfChanged(Ctl(IDC_PAUSETEXT), s.pauseText);
     ComboSet(IDC_PIPCORNER, s.pipCorner);
     SendMessageW(Ctl(IDC_PIPSIZE_UD), UDM_SETPOS32, 0, std::clamp((s.pipW + 50) / 100, 5, 90));
     ComboSet(IDC_TRANS, s.transition);
@@ -2920,7 +3303,8 @@ static const wchar_t* SrcKindName(int mainKind) {
     switch (mainKind) {
     case 1: return L"веб-камера";
     case 2: return L"медиафайлы";
-    default: return L"экран";
+    case 3: return L"Экран 2";
+    default: return L"Экран 1";
     }
 }
 
@@ -2938,6 +3322,10 @@ static void UpdateSourceLabel() {
         wcscpy(buf, L"не выбран");
     }
     SetTextIfChanged(Ctl(IDC_SRC_VALUE), buf);
+    swprintf(buf, 256, L"область %d × %d  (x %d, y %d)%ls", static_cast<int>(s.region2.right - s.region2.left),
+             static_cast<int>(s.region2.bottom - s.region2.top), static_cast<int>(s.region2.left),
+             static_cast<int>(s.region2.top), s.mainSrc == 3 ? L" — сейчас главный" : SecondSrc(s) == 4 ? L" — второй" : L"");
+    SetTextIfChanged(Ctl(IDC_SRC2_VALUE), buf);
     std::wstring now;
     {
         std::lock_guard<std::mutex> lk(g_mediaNameMx);
@@ -2976,11 +3364,11 @@ static void UpdateStatus() {
     if (!g_note.empty())
         line2 = g_note;
     else if (g_streaming && CamNeeded(s) && s.camLink.empty())
-        line2 = L"Выберите веб-камеру на вкладке «Наложения».";
+        line2 = L"Выберите веб-камеру на вкладке «Источники».";
     else if (g_streaming && CamNeeded(s) && g_web.status == 3)
         line2 = L"Веб-камера недоступна: занята другой программой или отключена. Пробую снова…";
     else if (g_streaming && MediaNeeded(s) && s.media.empty())
-        line2 = L"Добавьте файлы на вкладке «Медиа».";
+        line2 = L"Добавьте медиафайлы на вкладке «Источники».";
     else if (g_streaming && g_paused)
         line2 = L"Пауза: в камере картинка паузы. «Продолжить» — вернуть трансляцию.";
     else if (g_streaming && g_sourceLost)
@@ -2988,12 +3376,16 @@ static void UpdateStatus() {
     else if (g_streaming) {
         line2 = L"Трансляция идёт: ";
         line2 += SrcKindName(s.mainSrc);
-        if (s.pipSrc) {
-            line2 += L", в окошке — ";
-            line2 += s.pipSrc == 1 ? L"экран" : SrcKindName(s.pipSrc - 1);
+        if (SecondSrc(s)) {
+            line2 += s.layout == 2 ? L", рядом — " : L", в окошке — ";
+            line2 += SrcKindName(SecondSrc(s) - 1);
         }
         line2 += L".";
-    } else
+    } else if (s.keepCamOn && !s.camLink.empty() && g_web.status == 3)
+        line2 = L"Веб-камера не включилась (занята или отключена). Пробую снова…";
+    else if (s.keepCamOn && !s.camLink.empty() && g_web.status == 2)
+        line2 = L"Остановлено. Веб-камера держится включённой.";
+    else
         line2 = L"Остановлено: в камере картинка паузы.";
     SetTextIfChanged(Ctl(IDC_STATUS), line1 + L"\r\n" + line2);
 
@@ -3107,7 +3499,7 @@ static void SetRegionSource(const RECT& r) {
         g_set.srcWindow = nullptr;
         g_set.region = r;
         g_set.hasRegion = true;
-        if (g_set.mainSrc != 0 && g_set.pipSrc != 1) g_set.mainSrc = 0;  // picking a screen source = show it
+        if (g_set.mainSrc != 0 && SecondSrc(g_set) != 1) g_set.mainSrc = 0;  // picking a screen source = show it
     }
     SaveSettings();
     SyncControls();
@@ -3115,19 +3507,44 @@ static void SetRegionSource(const RECT& r) {
     UpdateFrame();
 }
 
-static void DoSelectRegion() {
+// "Экран 2": a fixed area. Picking it does not switch the camera to it: «Экран 1 ⇄ 2» does.
+static void SetRegion2Source(const RECT& r) {
+    bool shown;
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.region2 = r;
+        shown = Screen2Needed(g_set);
+    }
+    if (shown) ++g_transGen;
+    SaveSettings();
+    UpdateSourceLabel();
+    UpdateFrame();
+    if (!shown) {
+        g_note = L"Область 2 сохранена. Показать её: «Экран 1 ⇄ 2»" +
+                 (g_hk[HA_SCREEN12] ? L" или " + HotkeyName(g_hk[HA_SCREEN12]) : std::wstring()) + L".";
+        UpdateStatus();
+    }
+}
+
+static void DoSelectRegionN(int which) {
     bool wasVisible = IsWindowVisible(g_main) != FALSE;
     ShowWindow(g_main, SW_HIDE);
-    if (g_frame) ShowWindow(g_frame, SW_HIDE);
+    HideFrames();
     Sleep(150);  // let the windows disappear before the overlay appears
     RECT r;
-    if (SelectRegion(g_hInst, &r)) SetRegionSource(r);
+    if (SelectRegion(g_hInst, &r)) {
+        if (which == 1)
+            SetRegion2Source(r);
+        else
+            SetRegionSource(r);
+    }
     if (wasVisible) {
         ShowWindow(g_main, SW_SHOW);
         SetForegroundWindow(g_main);
     }
     UpdateFrame();
 }
+static void DoSelectRegion() { DoSelectRegionN(0); }
 
 static void NextMonitor() {
     auto mons = Monitors();
@@ -3146,7 +3563,7 @@ static void NextMonitor() {
     SetRegionSource(mons[idx].rc);
 }
 
-static void ShowMonitorMenu() {
+static void ShowMonitorMenu(int which) {
     auto mons = Monitors();
     HMENU m = CreatePopupMenu();
     for (size_t i = 0; i < mons.size(); ++i) {
@@ -3157,10 +3574,15 @@ static void ShowMonitorMenu() {
         AppendMenuW(m, MF_STRING, 1000 + i, buf);
     }
     RECT br;
-    GetWindowRect(Ctl(IDC_MONITOR), &br);
+    GetWindowRect(Ctl(which == 1 ? IDC_MONITOR2 : IDC_MONITOR), &br);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, br.left, br.bottom, 0, g_main, nullptr);
     DestroyMenu(m);
-    if (cmd >= 1000 && cmd < 1000 + static_cast<int>(mons.size())) SetRegionSource(mons[cmd - 1000].rc);
+    if (cmd >= 1000 && cmd < 1000 + static_cast<int>(mons.size())) {
+        if (which == 1)
+            SetRegion2Source(mons[cmd - 1000].rc);
+        else
+            SetRegionSource(mons[cmd - 1000].rc);
+    }
 }
 
 static void SetWindowSource(HWND hwnd, const std::wstring& title) {
@@ -3171,7 +3593,7 @@ static void SetWindowSource(HWND hwnd, const std::wstring& title) {
         g_set.srcMode = 1;
         g_set.srcWindow = hwnd;
         g_set.srcTitle = title;
-        if (g_set.mainSrc != 0 && g_set.pipSrc != 1) g_set.mainSrc = 0;
+        if (g_set.mainSrc != 0 && SecondSrc(g_set) != 1) g_set.mainSrc = 0;
     }
     SaveSettings();
     SyncControls();
@@ -3244,6 +3666,13 @@ static void RecoverDisplay() {
             RECT r{p.left, p.top, p.left + w, p.top + h};
             SetRegionSource(r);
             g_note = L"Область оказалась за пределами экрана и перенесена на основной монитор.";
+        }
+    }
+    {
+        RECT vs = VirtualScreen(), inter;
+        if (!IntersectRect(&inter, &vs, &s.region2)) {
+            SetRegion2Source(DefaultRegion2());
+            g_note = L"Область 2 оказалась за пределами экрана и перенесена на основной монитор.";
         }
     }
     UpdateFrame();
@@ -3794,10 +4223,22 @@ static void AfterLayersChanged() {
 static void SwapLayers() {
     {
         std::lock_guard<std::mutex> lk(g_setMx);
-        if (g_set.pipSrc == 0) return;
+        if (g_set.layout == 0) return;
         const int big = g_set.mainSrc;
-        g_set.mainSrc = g_set.pipSrc - 1;
+        g_set.mainSrc = std::clamp(g_set.pipSrc, 1, 4) - 1;
         g_set.pipSrc = big + 1;
+    }
+    AfterLayersChanged();
+}
+
+// Main source Экран 1 <-> Экран 2. No frame moves. If the second source shows the target, they trade places.
+static void ToggleScreens() {
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        const int old = g_set.mainSrc;
+        const int now = old == 0 ? 3 : 0;
+        if (g_set.layout != 0 && std::clamp(g_set.pipSrc, 1, 4) == now + 1) g_set.pipSrc = old + 1;
+        g_set.mainSrc = now;
     }
     AfterLayersChanged();
 }
@@ -3936,13 +4377,21 @@ static void OnHotkey(int action) {
     case HA_MEDIA_NEXT: MediaNext(); return;
     case HA_HIDE_WINDOW: ToggleHideWindow(); return;
     case HA_PAUSE: TogglePause(); return;
+    case HA_SCREEN12: ToggleScreens(); return;
     case HA_SCREEN_CAM:
     case HA_PIP:
     case HA_TEXT: {
         {
             std::lock_guard<std::mutex> lk(g_setMx);
             if (action == HA_SCREEN_CAM) g_set.mainSrc = g_set.mainSrc == 1 ? 0 : 1;
-            if (action == HA_PIP) g_set.pipSrc = g_set.pipSrc != 0 ? 0 : (g_set.mainSrc == 1 ? 1 : 2);
+            if (action == HA_PIP) {
+                if (g_set.layout != 0) {
+                    g_set.layout = 0;
+                } else {
+                    g_set.layout = 1;
+                    if (std::clamp(g_set.pipSrc, 1, 4) == g_set.mainSrc + 1) g_set.pipSrc = g_set.mainSrc == 1 ? 1 : 2;
+                }
+            }
             if (action == HA_TEXT) g_set.textOn = !g_set.textOn;
         }
         AfterLayersChanged();
@@ -3989,178 +4438,261 @@ static void ShowMain() {
     SetForegroundWindow(g_main);
 }
 
-static HWND AddCombo(HWND hwnd, int id, std::initializer_list<const wchar_t*> items) {
-    HWND h = CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                             0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
+static HWND g_mkParent = nullptr;  // parent for the controls being created
+
+static HWND Mk(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD ex = 0) {
+    HWND h = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, g_mkParent,
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
+    if (h && id > 0 && id <= IDC_LAST_ID) g_ctl[id] = h;
+    if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(IsHeaderId(id) ? g_fontBold : g_font), FALSE);
+    return h;
+}
+
+static HWND AddCombo(int id, std::initializer_list<const wchar_t*> items) {
+    HWND h = Mk(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, id);
     for (auto* s : items) SendMessageW(h, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
     return h;
 }
 
 static void CreateControls(HWND hwnd) {
-    auto mk = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD ex = 0) {
-        return CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, hwnd,
-                               reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
-    };
-    HWND tab = mk(WC_TABCONTROLW, L"", WS_CLIPSIBLINGS | WS_TABSTOP, IDC_TAB);
-    const wchar_t* tabs[] = {L"Источник", L"Наложения", L"Медиа", L"Сцены и клавиши"};
-    for (int i = 0; i < 4; ++i) {
+    const DWORD btn = WS_TABSTOP | BS_PUSHBUTTON, chk = WS_TABSTOP | BS_AUTOCHECKBOX;
+    g_mkParent = hwnd;
+    HWND tab = Mk(WC_TABCONTROLW, L"", WS_CLIPSIBLINGS | WS_TABSTOP, IDC_TAB);
+    const wchar_t* tabs[] = {L"Источники", L"Кадр", L"Настройки"};
+    for (int i = 0; i < kPages; ++i) {
         TCITEMW ti{};
         ti.mask = TCIF_TEXT;
         ti.pszText = const_cast<wchar_t*>(tabs[i]);
         SendMessageW(tab, TCM_INSERTITEMW, i, reinterpret_cast<LPARAM>(&ti));
     }
+    for (int p = 0; p < kPages; ++p)
+        g_pageWnd[p] = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCPage", L"",
+                                       WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN, 0, 0, 10, 10, hwnd,
+                                       nullptr, g_hInst, nullptr);
     auto shapes = {L"Прямоугольник", L"Скруглённый", L"Круг", L"Шестиугольник", L"Восьмиугольник"};
+    auto kinds = {L"Экран 1", L"Веб-камера", L"Медиафайлы", L"Экран 2"};
 
-    // page 0
-    mk(L"STATIC", L"Экран:", 0, IDC_SRC_LABEL);
-    mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_SRC_VALUE);
-    mk(L"BUTTON", L"Область…", WS_TABSTOP | BS_PUSHBUTTON, IDC_SELECT);
-    mk(L"BUTTON", L"Монитор ▾", WS_TABSTOP | BS_PUSHBUTTON, IDC_MONITOR);
-    mk(L"BUTTON", L"Окно ▾", WS_TABSTOP | BS_PUSHBUTTON, IDC_WINDOW);
-    mk(L"STATIC", L"Качество:", 0, IDC_Q_LABEL);
-    AddCombo(hwnd, IDC_QUALITY, {L"720p", L"1080p"});
-    mk(L"STATIC", L"Соотношение сторон:", 0, IDC_A_LABEL);
-    AddCombo(hwnd, IDC_ASPECT, {L"16:9 (обычное)", L"4:3", L"1:1 (квадрат)", L"9:16 (вертикальное)"});
-    mk(L"STATIC", L"Частота кадров:", 0, IDC_FPS_LABEL);
-    AddCombo(hwnd, IDC_FPS, {L"30 кадров/с", L"60 кадров/с"});
-    mk(L"STATIC", L"Если пропорции другие:", 0, IDC_FIT_LABEL);
-    AddCombo(hwnd, IDC_FIT, {L"Вписать с полями", L"Обрезать по краям"});
-    mk(L"STATIC", L"Поворот:", 0, IDC_ROT_LABEL);
-    AddCombo(hwnd, IDC_ROT, {L"Без поворота", L"90° по часовой", L"180°", L"90° против часовой"});
-    mk(L"STATIC", L"Увеличение (центр):", 0, IDC_ZOOM_LABEL);
-    AddCombo(hwnd, IDC_ZOOM, {L"100%", L"125%", L"150%", L"200%", L"300%", L"400%"});
-    mk(L"STATIC", L"Форма кадра и фон:", 0, IDC_SHAPE_LABEL);
-    AddCombo(hwnd, IDC_FRAMESHAPE, shapes);
-    AddCombo(hwnd, IDC_SHAPECOLOR, {L"Чёрный", L"Белый", L"Зелёный", L"Серый"});
-    mk(L"BUTTON", L"Зеркально", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_MIRROR);
-    mk(L"BUTTON", L"Показывать курсор", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_CURSOR);
-    mk(L"STATIC", L"Окно захватывать:", 0, IDC_WCAP_LABEL);
-    AddCombo(hwnd, IDC_WINCAP, {L"С экрана (как видно)", L"Из самого окна"});
-    mk(L"BUTTON", L"Спрятать окно за экран", WS_TABSTOP | BS_PUSHBUTTON, IDC_HIDEWIN);
-    mk(L"STATIC", L"Плавный переход:", 0, IDC_TRANS_LABEL);
-    AddCombo(hwnd, IDC_TRANS, {L"Без перехода", L"Растворение", L"Через чёрный", L"Шторка", L"Сдвиг"});
-    AddCombo(hwnd, IDC_TRANSDUR, {L"0,3 с", L"0,5 с", L"1 с"});
-    mk(L"BUTTON", L"Зелёная рамка вокруг области, когда трансляция выключена", WS_TABSTOP | BS_AUTOCHECKBOX,
-       IDC_IDLEFRAME);
+    // ---- tab "Источники"
+    g_mkParent = g_pageWnd[0];
+    Mk(L"STATIC", L"Экран 1", 0, IDC_SRC_HDR);
+    Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_SRC_VALUE);
+    Mk(L"BUTTON", L"Область…", btn, IDC_SELECT);
+    Mk(L"BUTTON", L"Монитор ▾", btn, IDC_MONITOR);
+    Mk(L"BUTTON", L"Окно ▾", btn, IDC_WINDOW);
+    Mk(L"BUTTON", L"▸  Дополнительно", btn | BS_LEFT, IDC_SEC_WIN);
+    Mk(L"STATIC", L"Окно захватывать:", 0, IDC_WCAP_LABEL);
+    AddCombo(IDC_WINCAP, {L"С экрана (как видно)", L"Из самого окна"});
+    Mk(L"BUTTON", L"Спрятать окно за экран", btn, IDC_HIDEWIN);
+    Mk(L"STATIC", L"Экран 2", 0, IDC_SRC2_HDR);
+    Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_SRC2_VALUE);
+    Mk(L"BUTTON", L"Выбрать область 2", btn, IDC_SELECT2);
+    Mk(L"BUTTON", L"Монитор ▾", btn, IDC_MONITOR2);
+    Mk(L"BUTTON", L"Экран 1 ⇄ 2", btn, IDC_SCR_TOGGLE);
+    Mk(L"STATIC", L"Что показывать", 0, IDC_SHOW_HDR);
+    Mk(L"STATIC", L"Главный источник:", 0, IDC_VIEW_LABEL);
+    AddCombo(IDC_VIEW, kinds);
+    Mk(L"STATIC", L"Раскладка:", 0, IDC_LAYOUT_LABEL);
+    AddCombo(IDC_LAYOUT, {L"Только главный", L"Окошко поверх", L"Рядом (пополам)"});
+    Mk(L"STATIC", L"Второй источник:", 0, IDC_PIPSRC_LABEL);
+    AddCombo(IDC_PIPSRC, kinds);
+    Mk(L"BUTTON", L"⇄", btn, IDC_SWAP);
+    Mk(L"STATIC", L"Веб-камера", 0, IDC_CAM_HDR);
+    Mk(L"STATIC", L"Устройство:", 0, IDC_CAM_LABEL);
+    AddCombo(IDC_CAMDEV, {});
+    Mk(L"BUTTON", L"Зеркалить веб-камеру (как в зеркале)", chk, IDC_CAMMIRROR);
+    Mk(L"STATIC", L"Медиафайлы", 0, IDC_MEDIA_HDR);
+    Mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, IDC_MEDIA_LIST, WS_EX_CLIENTEDGE);
+    Mk(L"BUTTON", L"Добавить…", btn, IDC_MEDIA_ADD);
+    Mk(L"BUTTON", L"Убрать", btn, IDC_MEDIA_DEL);
+    Mk(L"BUTTON", L"▲", btn, IDC_MEDIA_UP);
+    Mk(L"BUTTON", L"▼", btn, IDC_MEDIA_DOWN);
+    Mk(L"STATIC", L"Картинку показывать:", 0, IDC_IMGSEC_LABEL);
+    AddCombo(IDC_IMGSEC, {L"3 секунды", L"5 секунд", L"10 секунд", L"30 секунд", L"1 минуту"});
+    Mk(L"BUTTON", L"⏭  Следующий файл", btn, IDC_MEDIA_NEXT);
+    Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_MEDIA_NOW);
 
-    // page 1
-    mk(L"STATIC", L"Большая картинка:", 0, IDC_VIEW_LABEL);
-    AddCombo(hwnd, IDC_VIEW, {L"Экран", L"Веб-камера", L"Медиафайлы"});
-    mk(L"STATIC", L"Окошко поверх:", 0, IDC_PIPSRC_LABEL);
-    AddCombo(hwnd, IDC_PIPSRC, {L"Нет", L"Экран", L"Веб-камера", L"Медиафайлы"});
-    mk(L"BUTTON", L"⇄", WS_TABSTOP | BS_PUSHBUTTON, IDC_SWAP);
-    mk(L"STATIC", L"Веб-камера:", 0, IDC_CAM_LABEL);
-    AddCombo(hwnd, IDC_CAMDEV, {});
-    mk(L"STATIC", L"Окошко: угол и размер %", 0, IDC_PIP_LABEL);
-    AddCombo(hwnd, IDC_PIPCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
-    mk(L"EDIT", L"25", WS_TABSTOP | ES_NUMBER | ES_CENTER, IDC_PIPSIZE, WS_EX_CLIENTEDGE);
+    // ---- tab "Кадр"
+    g_mkParent = g_pageWnd[1];
+    Mk(L"STATIC", L"Окошко (второй источник поверх)", 0, IDC_PIP_HDR);
+    Mk(L"STATIC", L"Угол и ширина, %:", 0, IDC_PIP_LABEL);
+    AddCombo(IDC_PIPCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
+    Mk(L"EDIT", L"25", WS_TABSTOP | ES_NUMBER | ES_CENTER, IDC_PIPSIZE, WS_EX_CLIENTEDGE);
     {
-        HWND ud = mk(UPDOWN_CLASSW, L"", UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS | UDS_HOTTRACK,
+        HWND ud = Mk(UPDOWN_CLASSW, L"", UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS | UDS_HOTTRACK,
                      IDC_PIPSIZE_UD);
         SendMessageW(ud, UDM_SETBUDDY, reinterpret_cast<WPARAM>(Ctl(IDC_PIPSIZE)), 0);
         SendMessageW(ud, UDM_SETRANGE32, 5, 90);
     }
-    mk(L"STATIC", L"Форма окошка:", 0, IDC_PIPSHAPE_LABEL);
-    AddCombo(hwnd, IDC_PIPSHAPE, shapes);
-    mk(L"BUTTON", L"Зеркалить веб-камеру (как в зеркале)", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_CAMMIRROR);
-    mk(L"STATIC", L"Надпись:", 0, IDC_TEXT_LABEL);
-    HWND ed = mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_TEXT, WS_EX_CLIENTEDGE);
+    Mk(L"STATIC", L"Форма окошка:", 0, IDC_PIPSHAPE_LABEL);
+    AddCombo(IDC_PIPSHAPE, shapes);
+    Mk(L"STATIC", L"Кадр", 0, IDC_FRAME_HDR);
+    Mk(L"STATIC", L"Если пропорции другие:", 0, IDC_FIT_LABEL);
+    AddCombo(IDC_FIT, {L"Вписать с полями", L"Обрезать по краям"});
+    Mk(L"STATIC", L"Форма кадра:", 0, IDC_SHAPE_LABEL);
+    AddCombo(IDC_FRAMESHAPE, shapes);
+    Mk(L"BUTTON", L"▸  Дополнительно", btn | BS_LEFT, IDC_SEC_FRAME);
+    Mk(L"STATIC", L"Поворот:", 0, IDC_ROT_LABEL);
+    AddCombo(IDC_ROT, {L"Без поворота", L"90° по часовой", L"180°", L"90° против часовой"});
+    Mk(L"STATIC", L"Увеличение (центр):", 0, IDC_ZOOM_LABEL);
+    AddCombo(IDC_ZOOM, {L"100%", L"125%", L"150%", L"200%", L"300%", L"400%"});
+    Mk(L"BUTTON", L"Зеркально (весь главный источник)", chk, IDC_MIRROR);
+    Mk(L"BUTTON", L"Показывать курсор", chk, IDC_CURSOR);
+    Mk(L"STATIC", L"Фон вне формы:", 0, IDC_SHAPECOLOR_LABEL);
+    AddCombo(IDC_SHAPECOLOR, {L"Чёрный", L"Белый", L"Зелёный", L"Серый"});
+    Mk(L"STATIC", L"Надпись", 0, IDC_TEXT_HDR);
+    Mk(L"STATIC", L"Текст:", 0, IDC_TEXT_LABEL);
+    HWND ed = Mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_TEXT, WS_EX_CLIENTEDGE);
     SendMessageW(ed, EM_LIMITTEXT, 120, 0);
-    mk(L"BUTTON", L"Показывать надпись", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_TEXTON);
-    mk(L"STATIC", L"Где и какого размера:", 0, IDC_TPOS_LABEL);
-    AddCombo(hwnd, IDC_TEXTPOS, {L"Слева вверху", L"По центру вверху", L"Справа вверху", L"Слева внизу",
-                                 L"По центру внизу", L"Справа внизу"});
-    AddCombo(hwnd, IDC_TEXTSIZE, {L"Мелкий", L"Средний", L"Крупный"});
-    mk(L"STATIC", L"Логотип (PNG):", 0, IDC_LOGO_LABEL);
-    mk(L"BUTTON", L"Выбрать…", WS_TABSTOP | BS_PUSHBUTTON, IDC_LOGO_PICK);
-    mk(L"BUTTON", L"Убрать", WS_TABSTOP | BS_PUSHBUTTON, IDC_LOGO_CLEAR);
-    mk(L"STATIC", L"Угол и размер логотипа:", 0, IDC_LPOS_LABEL);
-    AddCombo(hwnd, IDC_LOGOCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
-    AddCombo(hwnd, IDC_LOGOSIZE, {L"10%", L"15%", L"20%", L"30%"});
-    mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_LOGO_NAME);
-    mk(L"STATIC",
-       L"Окошко можно перетаскивать мышью прямо в предпросмотре, а за любой угол (белые квадратики) — менять "
-       L"размер. Размер в % — стрелками ▲▼. Кнопка ⇄ меняет местами большую картинку и окошко.",
-       0, IDC_PIP_HINT);
+    Mk(L"BUTTON", L"Показывать надпись", chk, IDC_TEXTON);
+    Mk(L"STATIC", L"Где и какого размера:", 0, IDC_TPOS_LABEL);
+    AddCombo(IDC_TEXTPOS, {L"Слева вверху", L"По центру вверху", L"Справа вверху", L"Слева внизу", L"По центру внизу",
+                           L"Справа внизу"});
+    AddCombo(IDC_TEXTSIZE, {L"Мелкий", L"Средний", L"Крупный"});
+    Mk(L"STATIC", L"Логотип", 0, IDC_LOGO_HDR);
+    Mk(L"STATIC", L"Картинка (PNG):", 0, IDC_LOGO_LABEL);
+    Mk(L"BUTTON", L"Выбрать…", btn, IDC_LOGO_PICK);
+    Mk(L"BUTTON", L"Убрать", btn, IDC_LOGO_CLEAR);
+    Mk(L"STATIC", L"Угол и размер:", 0, IDC_LPOS_LABEL);
+    AddCombo(IDC_LOGOCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
+    AddCombo(IDC_LOGOSIZE, {L"10%", L"15%", L"20%", L"30%"});
+    Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_LOGO_NAME);
+    Mk(L"STATIC", L"Переходы", 0, IDC_TRANS_HDR);
+    Mk(L"STATIC", L"Плавный переход:", 0, IDC_TRANS_LABEL);
+    AddCombo(IDC_TRANS, {L"Без перехода", L"Растворение", L"Через чёрный", L"Шторка", L"Сдвиг"});
+    AddCombo(IDC_TRANSDUR, {L"0,3 с", L"0,5 с", L"1 с"});
 
-    // page 2
-    mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, IDC_MEDIA_LIST, WS_EX_CLIENTEDGE);
-    mk(L"BUTTON", L"Добавить…", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_ADD);
-    mk(L"BUTTON", L"Убрать", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_DEL);
-    mk(L"BUTTON", L"▲", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_UP);
-    mk(L"BUTTON", L"▼", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_DOWN);
-    mk(L"STATIC", L"Картинку показывать:", 0, IDC_IMGSEC_LABEL);
-    AddCombo(hwnd, IDC_IMGSEC, {L"3 секунды", L"5 секунд", L"10 секунд", L"30 секунд", L"1 минуту"});
-    mk(L"BUTTON", L"⏭  Следующий файл", WS_TABSTOP | BS_PUSHBUTTON, IDC_MEDIA_NEXT);
-    mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_MEDIA_NOW);
-    mk(L"STATIC",
-       L"Файлы идут по кругу. Картинки: PNG, JPG, BMP, GIF (анимация). Видео: MP4, MOV, AVI, WMV, MKV — если в Windows "
-       L"есть кодек. Звук в камеру не передаётся. Чтобы показать: «Большая картинка» или «Окошко» → «Медиафайлы».",
-       0, IDC_MEDIA_HINT);
+    // ---- tab "Настройки"
+    g_mkParent = g_pageWnd[2];
+    Mk(L"STATIC", L"Формат камеры", 0, IDC_FMT_HDR);
+    Mk(L"STATIC", L"Качество:", 0, IDC_Q_LABEL);
+    AddCombo(IDC_QUALITY, {L"720p", L"1080p"});
+    Mk(L"STATIC", L"Соотношение сторон:", 0, IDC_A_LABEL);
+    AddCombo(IDC_ASPECT, {L"16:9 (обычное)", L"4:3", L"1:1 (квадрат)", L"9:16 (вертикальное)"});
+    Mk(L"STATIC", L"Частота кадров:", 0, IDC_FPS_LABEL);
+    AddCombo(IDC_FPS, {L"30 кадров/с", L"60 кадров/с"});
+    Mk(L"STATIC", L"Пауза и стоп", 0, IDC_PAUSE_HDR);
+    Mk(L"STATIC", L"Показывать в камере:", 0, IDC_PAUSE_LABEL);
+    AddCombo(IDC_PAUSE, {L"Последний кадр", L"Чёрный экран", L"Текст (ниже)", L"Свою картинку"});
+    Mk(L"STATIC", L"Текст паузы:", 0, IDC_PAUSETEXT_LABEL);
+    {
+        HWND pe = Mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_PAUSETEXT, WS_EX_CLIENTEDGE);
+        SendMessageW(pe, EM_LIMITTEXT, 80, 0);
+    }
+    Mk(L"BUTTON", L"Выбрать картинку…", btn, IDC_PAUSE_IMG);
+    Mk(L"STATIC", L"Поведение", 0, IDC_BEH_HDR);
+    Mk(L"BUTTON", L"Держать веб-камеру включённой", chk, IDC_KEEPCAM);
+    Mk(L"BUTTON", L"Зелёная рамка вокруг области, когда трансляция выключена", chk, IDC_IDLEFRAME);
+    Mk(L"BUTTON", L"Запускать вместе с Windows (сразу в трей)", chk, IDC_AUTOSTART);
+    Mk(L"BUTTON", L"Сразу включать трансляцию при запуске", chk, IDC_AUTOSTREAM);
+    Mk(L"STATIC", L"Горячие клавиши", 0, IDC_HK_HDR);
+    Mk(L"BUTTON", L"Настроить горячие клавиши…", btn, IDC_HK_EDIT);
+    Mk(L"BUTTON", L"▸  Список горячих клавиш", btn | BS_LEFT, IDC_SEC_KEYS);
+    Mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL, IDC_HK_LIST, WS_EX_CLIENTEDGE);
+    Mk(L"STATIC", L"Файл настроек", 0, IDC_FILE_HDR);
+    Mk(L"BUTTON", L"Сохранить всё в JSON…", btn, IDC_JSON_EXPORT);
+    Mk(L"BUTTON", L"Загрузить из JSON…", btn, IDC_JSON_IMPORT);
+    Mk(L"STATIC", L"Камера в Windows", 0, IDC_CAMSYS_HDR);
+    Mk(L"BUTTON", L"Установить камеру", btn, IDC_INSTALL);
+    Mk(L"BUTTON", L"Удалить камеру", btn, IDC_UNINSTALL);
 
-    // page 3
-    mk(L"STATIC", L"Сцена:", 0, IDC_PROF_LABEL);
-    AddCombo(hwnd, IDC_PROFILE, {});
-    mk(L"BUTTON", L"Загрузить", WS_TABSTOP | BS_PUSHBUTTON, IDC_PROF_LOAD);
-    mk(L"BUTTON", L"Сохранить…", WS_TABSTOP | BS_PUSHBUTTON, IDC_PROF_SAVE);
-    mk(L"BUTTON", L"Удалить", WS_TABSTOP | BS_PUSHBUTTON, IDC_PROF_DEL);
-    mk(L"STATIC",
-       L"Сцена запоминает рамку, окно программы, что где показано, окошко, формы, надпись, логотип, медиафайлы и паузу. "
-       L"Качество и частота в сцену не входят. При запуске WVC возвращает всё как было.",
+    // ---- left column (always visible)
+    g_mkParent = hwnd;
+    Mk(L"STATIC", L"Предпросмотр (то, что видят другие):", 0, IDC_PREV_LABEL);
+    Mk(L"STATIC", L"", SS_RIGHT, IDC_FPS_VALUE);
+    g_preview = Mk(L"WVCPreview", L"", 0, IDC_PREVIEW, WS_EX_CLIENTEDGE);
+    Mk(L"BUTTON", L"▶  Старт", btn, IDC_START);
+    Mk(L"BUTTON", L"⏸  Пауза", btn, IDC_PAUSEBTN);
+    Mk(L"STATIC", L"", 0, IDC_STATUS);
+    Mk(L"STATIC", L"Сцены", 0, IDC_SCENE_HDR);
+    for (int i = 0; i < 4; ++i) Mk(L"BUTTON", L"", btn, IDC_SCENE1 + i);
+    Mk(L"STATIC", L"Сцена:", 0, IDC_PROF_LABEL);
+    AddCombo(IDC_PROFILE, {});
+    Mk(L"BUTTON", L"Загрузить", btn, IDC_PROF_LOAD);
+    Mk(L"BUTTON", L"Сохранить…", btn, IDC_PROF_SAVE);
+    Mk(L"BUTTON", L"Удалить", btn, IDC_PROF_DEL);
+    Mk(L"STATIC",
+       L"Сцена запоминает обе области, окно, источники и раскладку, окошко, формы, надпись, логотип, медиафайлы и "
+       L"паузу. Формат, переходы и «держать веб-камеру» — общие для всех сцен. Кнопки 1–4 — первые четыре сцены.",
        0, IDC_PROF_HINT);
-    mk(L"BUTTON", L"Запускать вместе с Windows (сразу в трей)", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_AUTOSTART);
-    mk(L"BUTTON", L"Сразу включать трансляцию при запуске", WS_TABSTOP | BS_AUTOCHECKBOX, IDC_AUTOSTREAM);
-    mk(L"BUTTON", L"Сохранить всё в JSON…", WS_TABSTOP | BS_PUSHBUTTON, IDC_JSON_EXPORT);
-    mk(L"BUTTON", L"Загрузить из JSON…", WS_TABSTOP | BS_PUSHBUTTON, IDC_JSON_IMPORT);
-    mk(L"BUTTON", L"Настроить горячие клавиши…", WS_TABSTOP | BS_PUSHBUTTON, IDC_HK_EDIT);
-    mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | WS_VSCROLL, IDC_HK_LIST);
-
-    // right column
-    mk(L"STATIC", L"Предпросмотр (то, что видят другие):", 0, IDC_PREV_LABEL);
-    mk(L"STATIC", L"", SS_RIGHT, IDC_FPS_VALUE);
-    g_preview = CreateWindowExW(WS_EX_CLIENTEDGE, L"WVCPreview", L"", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, hwnd,
-                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PREVIEW)), g_hInst, nullptr);
-    mk(L"BUTTON", L"▶  Старт", WS_TABSTOP | BS_PUSHBUTTON, IDC_START);
-    mk(L"BUTTON", L"⏸  Пауза", WS_TABSTOP | BS_PUSHBUTTON, IDC_PAUSEBTN);
-    mk(L"STATIC", L"", 0, IDC_STATUS);
-    mk(L"STATIC", L"На паузе и стопе показывать:", 0, IDC_PAUSE_LABEL);
-    AddCombo(hwnd, IDC_PAUSE, {L"Последний кадр", L"Чёрный экран", L"«Скоро вернусь»", L"Свою картинку"});
-    mk(L"BUTTON", L"Выбрать картинку…", WS_TABSTOP | BS_PUSHBUTTON, IDC_PAUSE_IMG);
-    mk(L"BUTTON", L"Установить камеру", WS_TABSTOP | BS_PUSHBUTTON, IDC_INSTALL);
-    mk(L"BUTTON", L"Удалить камеру", WS_TABSTOP | BS_PUSHBUTTON, IDC_UNINSTALL);
 }
 // --- tooltips: what a control does + its hotkey (read live, so edited hotkeys show up at once)
 struct TipDef {
     int id;
     const wchar_t* text;
-    int hk;  // HotkeyAction or -1
+    int hk;  // HotkeyAction, -1 none, -2 scenes 1-4
 };
 static const TipDef kTips[] = {
     {IDC_START, L"Начать или остановить трансляцию. Когда остановлено, в камере картинка паузы.", HA_TOGGLE},
     {IDC_PAUSEBTN, L"Пауза: в камере картинка паузы, всё остальное остаётся включённым. «Продолжить» — мгновенно.",
      HA_PAUSE},
-    {IDC_SELECT, L"Выделить мышью область экрана.", HA_SELECT},
-    {IDC_MONITOR, L"Показывать целый монитор. Клавиша переключает на следующий.", HA_MONITOR},
-    {IDC_WINDOW, L"Показывать окно программы: рамка следует за окном.", -1},
-    {IDC_CURSOR, L"Показывать указатель мыши в кадре.", HA_CURSOR},
-    {IDC_FRAMESHAPE, L"Форма кадра. Рамка на экране повторяет форму.", -1},
+    {IDC_PREVIEW, L"То, что видят другие. Окошко можно перетаскивать мышью, а за любой угол (белые квадратики) — "
+                  L"менять размер.", -1},
+    {IDC_SCENE1, L"Загрузить сцену 1 (первая в списке).", HA_PROFILE1},
+    {IDC_SCENE2, L"Загрузить сцену 2 (вторая в списке).", HA_PROFILE2},
+    {IDC_SCENE3, L"Загрузить сцену 3 (третья в списке).", HA_PROFILE3},
+    {IDC_SCENE4, L"Загрузить сцену 4 (четвёртая в списке).", HA_PROFILE4},
+    {IDC_PROFILE, L"Все сохранённые сцены. Первые четыре — на кнопках 1–4 и горячих клавишах.", -2},
+    {IDC_PROF_LOAD, L"Загрузить выбранную сцену.", -2},
+    {IDC_PROF_SAVE, L"Сохранить всё, что сейчас настроено, как сцену (то же название — перезаписать).", -1},
+    {IDC_PROF_DEL, L"Удалить выбранную сцену.", -1},
+    {IDC_SELECT, L"Экран 1: выделить мышью область экрана.", HA_SELECT},
+    {IDC_MONITOR, L"Экран 1: показывать целый монитор. Клавиша переключает на следующий.", HA_MONITOR},
+    {IDC_WINDOW, L"Экран 1: показывать окно программы — рамка следует за окном.", -1},
+    {IDC_SEC_WIN, L"Показать или скрыть редкие настройки захвата окна.", -1},
+    {IDC_WINCAP, L"«Из самого окна» — картинка берётся, даже если окно перекрыто другими.", -1},
     {IDC_HIDEWIN, L"Увести окно-источник за край экрана: оно продолжает работать, WVC берёт картинку из самого окна.",
      HA_HIDE_WINDOW},
-    {IDC_TRANS, L"Плавный переход при смене источника, окошка, сцены, а также при старте, стопе и паузе.", -1},
-    {IDC_TRANSDUR, L"Длительность перехода.", -1},
-    {IDC_IDLEFRAME, L"Рамка: зелёная — трансляция выключена, красная — идёт, жёлтая — пауза.", -1},
-    {IDC_VIEW, L"Что показывать большим кадром. Клавиша меняет экран ↔ веб-камера.", HA_SCREEN_CAM},
-    {IDC_PIPSRC, L"Что показывать в окошке поверх кадра. Клавиша включает и выключает окошко.", HA_PIP},
-    {IDC_SWAP, L"Поменять местами большой кадр и окошко.", HA_SWAP},
-    {IDC_PIPCORNER, L"Поставить окошко в угол.", -1},
+    {IDC_SELECT2, L"Экран 2: выделить мышью вторую область. Камера на неё не переключается — для этого «Экран 1 ⇄ 2».",
+     -1},
+    {IDC_MONITOR2, L"Экран 2: взять целый монитор как вторую область.", -1},
+    {IDC_SCR_TOGGLE, L"Главный источник: Экран 1 ⇄ Экран 2. Рамки не двигаются.", HA_SCREEN12},
+    {IDC_VIEW, L"Что показывать главным (большим) кадром. Клавиша меняет экран ↔ веб-камера.", HA_SCREEN_CAM},
+    {IDC_LAYOUT, L"Только главный; второй источник окошком поверх; или оба рядом, каждый на половине кадра. "
+                 L"Клавиша включает и выключает второй источник.", HA_PIP},
+    {IDC_PIPSRC, L"Второй источник — для окошка или для правой половины в раскладке «Рядом».", -1},
+    {IDC_SWAP, L"Поменять местами главный и второй источник.", HA_SWAP},
+    {IDC_CAMDEV, L"Какая веб-камера используется (WVC Camera в списке не показывается).", -1},
+    {IDC_CAMMIRROR, L"Отразить веб-камеру по горизонтали, как в зеркале.", -1},
+    {IDC_MEDIA_LIST, L"Файлы идут по кругу. Картинки: PNG, JPG, BMP, GIF (анимация). Видео: MP4, MOV, AVI, WMV, MKV — "
+                     L"если в Windows есть кодек. Звук не передаётся. Двойной щелчок — показать файл.", -1},
+    {IDC_MEDIA_NEXT, L"Перейти к следующему файлу в списке.", HA_MEDIA_NEXT},
+    {IDC_PIPCORNER, L"Поставить окошко в угол (ширина сохраняется).", -1},
     {IDC_PIPSIZE, L"Ширина окошка в процентах от кадра: стрелки ▲▼ или введите число. "
                   L"Ещё можно тянуть за угол окошка в предпросмотре.", -1},
     {IDC_PIPSIZE_UD, L"Больше / меньше на 1%.", -1},
+    {IDC_PIPSHAPE, L"Форма окошка. Круг и многоугольники — в квадрате.", -1},
+    {IDC_FIT, L"Как вписать картинку другой формы: с полями или обрезав края. В раскладке «Рядом» действует на обе "
+              L"половины (веб-камера справа всегда заполняет половину).", -1},
+    {IDC_FRAMESHAPE, L"Форма всего кадра. Рамка на экране повторяет форму.", -1},
+    {IDC_SEC_FRAME, L"Показать или скрыть редкие настройки: поворот, увеличение, зеркало, курсор, фон формы.", -1},
+    {IDC_ROT, L"Повернуть главный источник.", -1},
+    {IDC_ZOOM, L"Увеличить центр главного источника.", -1},
+    {IDC_MIRROR, L"Отразить главный источник по горизонтали.", -1},
+    {IDC_CURSOR, L"Показывать указатель мыши в кадре.", HA_CURSOR},
+    {IDC_SHAPECOLOR, L"Цвет вокруг формы кадра или окошка.", -1},
+    {IDC_TEXT, L"Текст надписи поверх кадра.", -1},
     {IDC_TEXTON, L"Показывать надпись поверх кадра.", HA_TEXT},
-    {IDC_MEDIA_NEXT, L"Перейти к следующему файлу в списке.", HA_MEDIA_NEXT},
-    {IDC_PROF_LOAD, L"Загрузить выбранную сцену. Сцены 1–4 из списка — на горячих клавишах.", -2},
-    {IDC_PROF_SAVE, L"Сохранить всё, что сейчас настроено, как сцену.", -1},
+    {IDC_LOGO_PICK, L"Выбрать логотип (PNG с прозрачностью).", -1},
+    {IDC_LOGO_CLEAR, L"Убрать логотип.", -1},
+    {IDC_TRANS, L"Плавный переход при смене источника, раскладки, окошка, сцены, а также при старте, стопе и паузе.",
+     -1},
+    {IDC_TRANSDUR, L"Длительность перехода.", -1},
+    {IDC_QUALITY, L"Разрешение камеры. При смене переподключите камеру в Zoom/Telegram.", -1},
+    {IDC_ASPECT, L"Форма кадра камеры. При смене переподключите камеру в Zoom/Telegram.", -1},
+    {IDC_FPS, L"Частота кадров камеры.", -1},
+    {IDC_PAUSE, L"Что видят другие на паузе и когда трансляция остановлена.", -1},
+    {IDC_PAUSETEXT, L"Текст на картинке паузы (вариант «Текст»).", -1},
+    {IDC_PAUSE_IMG, L"Выбрать свою картинку для паузы.", -1},
+    {IDC_KEEPCAM, L"Веб-камера открывается при запуске WVC и не выключается, поэтому переключение на неё мгновенное. "
+                  L"Минус: индикатор камеры горит всё время, а другие программы не смогут взять эту же камеру.", -1},
+    {IDC_IDLEFRAME, L"Рамка: зелёная — трансляция выключена, красная — идёт, жёлтая — пауза. "
+                    L"Рамка Экрана 2 — пунктирная.", -1},
+    {IDC_AUTOSTART, L"Запускать WVC при входе в Windows, сразу свёрнутым в трей.", -1},
+    {IDC_AUTOSTREAM, L"При запуске сразу включать трансляцию.", -1},
     {IDC_HK_EDIT, L"Назначить свои сочетания клавиш.", -1},
+    {IDC_SEC_KEYS, L"Показать или скрыть список горячих клавиш.", -1},
+    {IDC_JSON_EXPORT, L"Сохранить все настройки, сцены и горячие клавиши в файл.", -1},
+    {IDC_JSON_IMPORT, L"Загрузить настройки, сцены и горячие клавиши из файла.", -1},
     {IDC_INSTALL, L"Зарегистрировать «WVC Camera» в Windows (один раз, нужны права администратора).", -1},
     {IDC_UNINSTALL, L"Убрать «WVC Camera» из Windows.", -1},
 };
@@ -4194,7 +4726,7 @@ static const wchar_t* TooltipText(HWND ctl) {
         g_tipText = t.text;
         if (t.hk >= 0) {
             g_tipText += L"\nКлавиши: ";
-            g_tipText += g_hk[t.hk] ? HotkeyName(g_hk[t.hk]) : L"не назначены (вкладка «Сцены и клавиши»)";
+            g_tipText += g_hk[t.hk] ? HotkeyName(g_hk[t.hk]) : L"не назначены (Настройки → Горячие клавиши)";
         } else if (t.hk == -2) {
             for (int i = 0; i < 4; ++i) {
                 g_tipText += L"\nСцена " + std::to_wstring(i + 1) + L": ";
@@ -4244,8 +4776,21 @@ static void OnControlChanged(int id) {
         case IDC_MIRROR: s.mirror = CheckGet(id); break;
         case IDC_CURSOR: s.cursor = CheckGet(id); break;
         case IDC_WINCAP: s.winCapture = sel == 1 ? 1 : 0; break;
-        case IDC_VIEW: s.mainSrc = (std::min)(sel, 2); layers = true; break;
-        case IDC_PIPSRC: s.pipSrc = (std::min)(sel, 3); layers = true; break;
+        case IDC_VIEW: s.mainSrc = (std::min)(sel, 3); layers = true; break;
+        case IDC_LAYOUT: s.layout = (std::min)(sel, 2); layers = true; break;
+        case IDC_PIPSRC:
+            s.pipSrc = std::clamp(sel + 1, 1, 4);
+            if (s.layout == 0) s.layout = 1;  // picking a second source = show it
+            layers = true;
+            break;
+        case IDC_KEEPCAM: s.keepCamOn = CheckGet(id); layers = true; break;
+        case IDC_PAUSETEXT: {
+            wchar_t buf[256] = {};
+            GetWindowTextW(Ctl(IDC_PAUSETEXT), buf, 256);
+            s.pauseText = buf;
+            pause = true;
+            break;
+        }
         case IDC_CAMDEV:
             if (sel >= 1 && sel <= static_cast<int>(g_camList.size())) {
                 s.camLink = g_camList[sel - 1].link;
@@ -4259,9 +4804,9 @@ static void OnControlChanged(int id) {
         case IDC_PIPCORNER: s.pipCorner = (std::min)(sel, 3); PipPreset(s, W, H); break;
         case IDC_PIPSIZE: {
             BOOL ok = FALSE;
-            const int pct = static_cast<int>(GetDlgItemInt(g_main, IDC_PIPSIZE, &ok, FALSE));
-            if (!ok || pct < 5 || pct > 90) return;  // still typing
-            if (std::abs(pct * 100 - s.pipW) < 50) return;
+            const int pct = static_cast<int>(GetDlgItemInt(GetParent(Ctl(IDC_PIPSIZE)), IDC_PIPSIZE, &ok, FALSE));
+            if (!ok || pct < 5 || pct > 90) break;  // still typing: nothing changes
+            if (std::abs(pct * 100 - s.pipW) < 50) break;
             // grow / shrink around the nearest corner of the frame
             RECT r = PipRect(s, W, H);
             const bool right = (r.left + r.right) > W, bottom = (r.top + r.bottom) > H;
@@ -4308,6 +4853,11 @@ static void OnControlChanged(int id) {
     if (layers) {
         SyncSources();
         UpdateStatus();
+        if (id == IDC_PIPSRC) {
+            g_syncing = true;
+            ComboSet(IDC_LAYOUT, GetSettings().layout);
+            g_syncing = false;
+        }
     }
     UpdateFrame();
 }
@@ -4318,14 +4868,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_dpi = GetDpiForWindow(hwnd);
         RegisterHotkeys(hwnd);
         MakeFont();
+        g_expanded = IniInt(kMainSec, L"UiExpanded", 0) & (SEC_WIN | SEC_FRAME | SEC_KEYS);
         CreateControls(hwnd);
+        ResizeForDpi(hwnd);
         Layout();
         CreateTooltips(hwnd);
-        ResizeForDpi(hwnd);
         SyncControls();
         FillProfileCombo(IniStr(kMainSec, L"LastScene"));
         SetTextIfChanged(Ctl(IDC_HK_LIST), HotkeyListText());
-        ShowPage(0);
+        {
+            const int tabNo = std::clamp(IniInt(kMainSec, L"UiTab", 0), 0, kPages - 1);
+            SendMessageW(Ctl(IDC_TAB), TCM_SETCURSEL, tabNo, 0);
+            ShowPage(tabNo);
+        }
         UpdateSourceLabel();
 
         g_nid.cbSize = sizeof(g_nid);
@@ -4351,14 +4906,26 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Layout();
         return 0;
     }
-    case WM_CTLCOLORSTATIC: {
-        // controls sitting on the (white, themed) tab page get a matching background
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        // left column on the light-grey window background
+        HDC dc = reinterpret_cast<HDC>(wp);
         const int id = GetDlgCtrlID(reinterpret_cast<HWND>(lp));
-        if (OnTabPage(id) && IsAppThemed()) {
-            HDC dc = reinterpret_cast<HDC>(wp);
-            SetBkColor(dc, GetSysColor(COLOR_WINDOW));
-            return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+        SetBkColor(dc, kBgMain);
+        if (msg == WM_CTLCOLORSTATIC) {
+            if (IsHeaderId(id))
+                SetTextColor(dc, kHdrText);
+            else if (id == IDC_PROF_HINT || id == IDC_FPS_VALUE)
+                SetTextColor(dc, kHintText);
         }
+        return reinterpret_cast<LRESULT>(g_brMain);
+    }
+    case WM_MOUSEWHEEL: {
+        // wheel over the tab page scrolls it even when the focus is elsewhere
+        POINT pt{static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
+        RECT pr;
+        if (g_pageWnd[g_page] && GetWindowRect(g_pageWnd[g_page], &pr) && PtInRect(&pr, pt))
+            return SendMessageW(g_pageWnd[g_page], WM_MOUSEWHEEL, wp, lp);
         break;
     }
     case WM_NOTIFY: {
@@ -4368,8 +4935,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             di->lpszText = const_cast<wchar_t*>(TooltipText(reinterpret_cast<HWND>(nh->idFrom)));
             return 0;
         }
-        if (nh->idFrom == IDC_TAB && nh->code == TCN_SELCHANGE)
+        if (nh->idFrom == IDC_TAB && nh->code == TCN_SELCHANGE) {
             ShowPage(static_cast<int>(SendMessageW(Ctl(IDC_TAB), TCM_GETCURSEL, 0, 0)));
+            IniSetInt(kMainSec, L"UiTab", g_page);
+        }
         return 0;
     }
     case WM_DISPLAYCHANGE:
@@ -4420,7 +4989,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_START: ToggleStreaming(); break;
         case ID_TRAY_EXIT: DestroyWindow(hwnd); break;
         case IDC_SELECT: DoSelectRegion(); break;
-        case IDC_MONITOR: ShowMonitorMenu(); break;
+        case IDC_MONITOR: ShowMonitorMenu(0); break;
+        case IDC_SELECT2: DoSelectRegionN(1); break;
+        case IDC_MONITOR2: ShowMonitorMenu(1); break;
+        case IDC_SCR_TOGGLE: ToggleScreens(); break;
+        case IDC_SEC_WIN: ToggleSection(SEC_WIN); break;
+        case IDC_SEC_FRAME: ToggleSection(SEC_FRAME); break;
+        case IDC_SEC_KEYS: ToggleSection(SEC_KEYS); break;
+        case IDC_SCENE1:
+        case IDC_SCENE2:
+        case IDC_SCENE3:
+        case IDC_SCENE4: LoadProfileByIndex(id - IDC_SCENE1); break;
         case IDC_WINDOW: ShowWindowMenu(); break;
         case IDC_PAUSE_IMG: ChoosePauseImage(); break;
         case IDC_LOGO_PICK: ChooseLogo(); break;
@@ -4490,8 +5069,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case IDC_TEXT:
+        case IDC_PAUSETEXT:
             if (code == EN_CHANGE) OnControlChanged(id);
             break;
+        case IDC_KEEPCAM:
         case IDC_MIRROR:
         case IDC_CURSOR:
         case IDC_CAMMIRROR:
@@ -4595,9 +5176,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     fc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     fc.lpszClassName = L"WVCFrame";
     RegisterClassW(&fc);
-    g_frame = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WVCFrame", L"",
-                              WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
-    if (g_frame) SetLayeredWindowAttributes(g_frame, kKey, 255, LWA_COLORKEY);
+    for (HWND& f : g_frame) {
+        f = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WVCFrame", L"",
+                            WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, hInst, nullptr);
+        if (f) SetLayeredWindowAttributes(f, kKey, 255, LWA_COLORKEY);
+    }
 
     WNDCLASSW pc{};
     pc.lpfnWndProc = PreviewProc;
@@ -4617,18 +5200,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     dc.lpszClassName = L"WVCHotkeys";
     RegisterClassW(&dc);
 
+    g_brMain = CreateSolidBrush(kBgMain);
+    g_brPage = CreateSolidBrush(kBgPage);
+    WNDCLASSW pg{};
+    pg.lpfnWndProc = PageProc;
+    pg.hInstance = hInst;
+    pg.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pg.hbrBackground = g_brPage;
+    pg.lpszClassName = L"WVCPage";
+    RegisterClassW(&pg);
+
     WNDCLASSW wc{};
     wc.lpfnWndProc = MainProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    wc.hbrBackground = g_brMain;
     wc.lpszClassName = L"WVCMain";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC — камера из области экрана",
+    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC 0.7 — виртуальная камера",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
-                                840, 520, nullptr, nullptr, hInst, nullptr);
+                                940, 660, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
     const bool tray = cmdLine && wcsstr(cmdLine, L"--tray");
     if (!tray) {
@@ -4640,7 +5233,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.hwnd == g_frame && msg.message == WM_FRAME_DONE) {
+        if (msg.message == WM_FRAME_DONE && msg.hwnd && (msg.hwnd == g_frame[0] || msg.hwnd == g_frame[1])) {
             SaveSettings();
             UpdateSourceLabel();
             UpdateFrame();
@@ -4656,8 +5249,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     WebcamStop();
     MediaStop();
     StopCamera();
-    if (g_frame) DestroyWindow(g_frame);
+    for (HWND f : g_frame)
+        if (f) DestroyWindow(f);
     if (g_font) DeleteObject(g_font);
+    if (g_fontBold) DeleteObject(g_fontBold);
     if (g_frameFont) DeleteObject(g_frameFont);
     MFShutdown();
     CoUninitialize();
