@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build x64 (app + camera DLL)
+        run: |
+          cmake -S . -B build64 -A x64
+          cmake --build build64 --config Release
+
+      - name: Build x86 (camera DLL for 32-bit apps)
+        run: |
+          cmake -S . -B build32 -A Win32
+          cmake --build build32 --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/WVC | Out-Null
+          Copy-Item build64/bin/Release/WVC.exe dist/WVC/
+          Copy-Item build64/bin/Release/WVCCam.dll dist/WVC/
+          Copy-Item build32/bin/Release/WVCCam32.dll dist/WVC/
+          Copy-Item docs/README-RU.txt dist/WVC/README.txt
+          Copy-Item third_party/softcam/LICENSE dist/WVC/LICENSE-softcam.txt
+          Compress-Archive -Path dist/WVC -DestinationPath dist/WVC.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WVC
+          path: dist/WVC
+
+      - name: Publish "latest" release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/WVC.zip --prerelease --target "$GITHUB_SHA" \
+            --title "WVC — сборка $GITHUB_RUN_NUMBER" \
+            --notes "Автоматическая сборка из коммита ${GITHUB_SHA::7}. Скачайте WVC.zip ниже."
