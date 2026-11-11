@@ -1,7 +1,7 @@
 // WVC — лёгкая виртуальная камера, которая показывает выбранную область экрана.
 // Камера: DirectShow-фильтр на базе tshino/softcam (MIT) в WVCCam.dll / WVCCam32.dll.
 // Это приложение: источник (область / монитор / окно / веб-камера), захват GDI,
-// поворот/зеркало/зум, надпись и логотип поверх кадра, картинка-в-картинке, телефон (WVC Phone по Wi-Fi),
+// поворот/зеркало/зум, надпись и логотип поверх кадра, картинка-в-картинке, телефон (WVC Phone по Wi-Fi или USB),
 // профили, настраиваемые горячие клавиши, предпросмотр, автовосстановление.
 
 #include <winsock2.h>
@@ -112,6 +112,8 @@ struct Settings {
     std::wstring phoneIp;  // WVC Phone: last IP address
     int  phoneSrc = 0;     // what the phone sends: 0 back camera, 1 front camera, 2 its screen
     int  phoneRes = 0;     // 0 = 720p, 1 = 1080p (long side)
+    int  phoneConn = 0;    // 0 = Wi-Fi (phoneIp), 1 = USB cable (adb forward)
+    std::wstring phoneUsbSerial;  // USB: preferred device serial (empty = the first one found)
 };
 
 static const double kZoom[] = {1.0, 1.25, 1.5, 2.0, 3.0, 4.0};
@@ -292,6 +294,8 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
         s.phoneIp = IniStr(sec, L"PhoneIp");
         s.phoneSrc = std::clamp(IniInt(sec, L"PhoneSrc", s.phoneSrc), 0, 2);
         s.phoneRes = std::clamp(IniInt(sec, L"PhoneRes", s.phoneRes), 0, 1);
+        s.phoneConn = std::clamp(IniInt(sec, L"PhoneConn", s.phoneConn), 0, 1);
+        s.phoneUsbSerial = IniStr(sec, L"PhoneUsbSerial");
     }
     s.cursor = IniInt(sec, L"Cursor", s.cursor) != 0;
     s.fit = std::clamp(IniInt(sec, L"Fit", s.fit), 0, 1);
@@ -381,6 +385,8 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
         IniSetStr(sec, L"PhoneIp", s.phoneIp);
         IniSetInt(sec, L"PhoneSrc", s.phoneSrc);
         IniSetInt(sec, L"PhoneRes", s.phoneRes);
+        IniSetInt(sec, L"PhoneConn", s.phoneConn);
+        IniSetStr(sec, L"PhoneUsbSerial", s.phoneUsbSerial);
     }
     IniSetInt(sec, L"Cursor", s.cursor ? 1 : 0);
     IniSetInt(sec, L"Fit", s.fit);
@@ -1120,26 +1126,29 @@ static void MediaNext() {
 }
 
 // ---------------------------------------------------------------------------
-// Phone: the WVC Phone app (Android) streams JPEG frames over Wi-Fi.
+// Phone: the WVC Phone app (Android) streams JPEG frames over Wi-Fi or a USB cable.
 // The phone is the server (TCP 47800), discovery by UDP broadcast to 47801. See docs/PHONE-PROTOCOL.md.
+// USB: adb forwards a local port to tcp:47800 on the phone (like scrcpy), then the same protocol runs on 127.0.0.1.
 // Connected only while the source is used during streaming, or after «Подключить».
 // ---------------------------------------------------------------------------
-static const char* kPhonePort = "47800";
+static const int kPhoneTcpPort = 47800;
 static const u_short kPhoneDiscPort = 47801;
 static const char* kPhoneSrcCmd[3] = {"back", "front", "screen"};
 static const UINT WM_PHONE_FOUND = WM_APP + 10;  // lParam = std::vector<PhoneFound>*
 static const UINT WM_PHONE_STATE = WM_APP + 11;  // the phone reported a new state
+static const UINT WM_PHONE_USBLIST = WM_APP + 12; // USB device list updated; wParam 0 quiet, 1 ok, 2 no adb, 3 adb failed
 
 struct PhoneFound {
     std::wstring name, ip;
 };
 
-static FrameSource       g_phone;                    // link = IP address in use
+static FrameSource       g_phone;                    // link = IP address in use, or "usb:<serial>"
 static std::mutex        g_phoneMx;                  // guards the socket and the strings below
 static SOCKET            g_phoneSock = INVALID_SOCKET;
 static std::wstring      g_phoneName;                // device model reported by the phone
 static std::wstring      g_phoneState;               // back / front / screen / need_consent / error ...
-static std::wstring      g_phoneErr;                 // why the last connection failed
+static std::wstring      g_phoneErr;                 // why the last connection failed (USB: a whole sentence)
+static std::wstring      g_phoneUsbModel;            // USB: model reported by adb
 static std::atomic<int>  g_phoneFpsX10{0};
 static std::atomic<int>  g_phoneUser{0};             // 1 = «Подключить», -1 = «Отключить», 0 = only while used
 static std::atomic<bool> g_phoneSearching{false};
@@ -1191,13 +1200,14 @@ static bool PhoneSendSource(int src) { return PhoneSendLine(std::string("SRC ") 
 static bool PhoneSendRes(int res) { return PhoneSendLine(res == 1 ? "RES 1080" : "RES 720"); }
 
 // TCP connect with a ~3 s timeout that still reacts to a stop request
-static SOCKET PhoneConnect(const std::wstring& ip, std::wstring* err) {
+static SOCKET PhoneConnect(const std::wstring& ip, int port, std::wstring* err) {
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     addrinfo* res = nullptr;
-    if (getaddrinfo(PhoneA(ip).c_str(), kPhonePort, &hints, &res) != 0 || !res) {
+    const std::string portText = std::to_string(port);
+    if (getaddrinfo(PhoneA(ip).c_str(), portText.c_str(), &hints, &res) != 0 || !res) {
         *err = L"неверный IP-адрес";
         return INVALID_SOCKET;
     }
@@ -1313,12 +1323,371 @@ static void PhoneHandleText(const std::string& t) {
     }
 }
 
-static void PhoneThread(std::wstring ip, int src, int res) {
+// ---------------------------------------------------------------------------
+// USB cable via adb: bundled adb\adb.exe next to WVC.exe (else adb.exe from PATH). All adb calls run hidden
+// (CREATE_NO_WINDOW) with a timeout, on worker threads only.
+// ---------------------------------------------------------------------------
+static const wchar_t* kPhoneActivity = L"com.wvc.phone/.MainActivity";
+
+struct AdbDev {
+    std::wstring serial, state, model;  // state: device / unauthorized / offline / no permissions ...
+};
+
+static std::mutex          g_adbMx;          // guards the values below
+static std::wstring        g_adbExe;         // found adb.exe (cached once found)
+static std::wstring        g_adbFwdSerial;   // the forward WVC made: removed on disconnect and on exit
+static int                 g_adbFwdPort = 0;
+static std::vector<AdbDev> g_usbDevs;        // last `adb devices -l`
+static std::atomic<bool>   g_adbStartedServer{false};  // WVC started the adb server: kill it on exit
+static std::atomic<bool>   g_usbListing{false};
+static ULONGLONG           g_adbLaunchAt = 0;  // last `am start` (phone thread only)
+
+static std::wstring AdbExe() {
+    std::lock_guard<std::mutex> lk(g_adbMx);
+    if (g_adbExe.empty()) {
+        const std::wstring dir = ExeDir();
+        for (const wchar_t* rel : {L"\\adb\\adb.exe", L"\\adb.exe"}) {
+            const std::wstring p = dir + rel;
+            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                g_adbExe = p;
+                break;
+            }
+        }
+        if (g_adbExe.empty()) {
+            wchar_t buf[MAX_PATH] = {};
+            if (SearchPathW(nullptr, L"adb.exe", nullptr, MAX_PATH, buf, nullptr)) g_adbExe = buf;
+        }
+    }
+    return g_adbExe;
+}
+
+static std::wstring AdbSerialArg(const std::wstring& serial) {
+    return serial.empty() ? std::wstring() : L"-s \"" + serial + L"\" ";
+}
+
+// Runs adb hidden; stdout + stderr -> *out. Returns the exit code, -1 = adb not found / not started,
+// -2 = timed out or stopped (the process is killed). Never waits for the pipe to close: an adb server started
+// by this call may keep it open.
+static int AdbRun(const std::wstring& args, std::string* out, DWORD timeoutMs, const std::atomic<bool>* stop) {
+    if (out) out->clear();
+    const std::wstring exe = AdbExe();
+    if (exe.empty()) return -1;
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 64 * 1024)) return -1;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    if (nul == INVALID_HANDLE_VALUE) nul = nullptr;
+
+    // inherit only these handles
+    HANDLE inherit[2] = {wr, nul};
+    const DWORD nInherit = nul ? 2 : 1;
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    std::vector<uint8_t> attrBuf(attrSize ? attrSize : 64);
+    auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    bool haveAttrs = InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) &&
+                     UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
+                                               nInherit * sizeof(HANDLE), nullptr, nullptr);
+
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.StartupInfo.wShowWindow = SW_HIDE;
+    si.StartupInfo.hStdInput = nul;
+    si.StartupInfo.hStdOutput = wr;
+    si.StartupInfo.hStdError = wr;
+    if (haveAttrs) si.lpAttributeList = attrs;
+    std::wstring cmd = L"\"" + exe + L"\" " + args;
+    const size_t slash = exe.find_last_of(L"\\/");
+    const std::wstring dir = slash == std::wstring::npos ? std::wstring() : exe.substr(0, slash);
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, TRUE,
+                                   CREATE_NO_WINDOW | (haveAttrs ? EXTENDED_STARTUPINFO_PRESENT : 0), nullptr,
+                                   dir.empty() ? nullptr : dir.c_str(), reinterpret_cast<STARTUPINFOW*>(&si), &pi);
+    if (haveAttrs) DeleteProcThreadAttributeList(attrs);
+    CloseHandle(wr);
+    if (nul) CloseHandle(nul);
+    if (!ok) {
+        CloseHandle(rd);
+        return -1;
+    }
+    std::string buf;
+    auto drain = [&] {
+        DWORD avail = 0;
+        while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail) {
+            char tmp[4096];
+            DWORD got = 0;
+            if (!ReadFile(rd, tmp, (std::min)(avail, static_cast<DWORD>(sizeof(tmp))), &got, nullptr) || !got) break;
+            if (buf.size() < (1u << 20)) buf.append(tmp, got);
+        }
+    };
+    const ULONGLONG t0 = GetTickCount64();
+    int code = -2;
+    for (;;) {
+        drain();
+        if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) {
+            drain();
+            DWORD ec = 0;
+            GetExitCodeProcess(pi.hProcess, &ec);
+            code = static_cast<int>(ec);
+            break;
+        }
+        if ((stop && stop->load()) || GetTickCount64() - t0 > timeoutMs) {
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 1000);
+            break;
+        }
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(rd);
+    if (buf.find("daemon started successfully") != std::string::npos) g_adbStartedServer = true;
+    if (out) out->swap(buf);
+    return code;
+}
+
+static std::string AdbTrim(std::string t) {
+    while (!t.empty() && (t.back() == '\r' || t.back() == '\n' || t.back() == ' ' || t.back() == '\t')) t.pop_back();
+    size_t b = 0;
+    while (b < t.size() && (t[b] == ' ' || t[b] == '\t' || t[b] == '\r' || t[b] == '\n')) ++b;
+    return t.substr(b);
+}
+
+static std::vector<std::string> AdbLines(const std::string& out) {
+    std::vector<std::string> v;
+    size_t pos = 0;
+    while (pos < out.size()) {
+        size_t e = out.find('\n', pos);
+        if (e == std::string::npos) e = out.size();
+        std::string line = AdbTrim(out.substr(pos, e - pos));
+        if (!line.empty()) v.push_back(line);
+        pos = e + 1;
+    }
+    return v;
+}
+
+// `adb devices -l`; *rc = adb exit code (see AdbRun)
+static std::vector<AdbDev> AdbDevices(const std::atomic<bool>* stop, int* rc) {
+    std::string out;
+    *rc = AdbRun(L"devices -l", &out, 15000, stop);  // the first call may start the adb server (a few seconds)
+    std::vector<AdbDev> v;
+    if (*rc != 0) return v;
+    for (const std::string& line : AdbLines(out)) {
+        if (line[0] == '*' || line.rfind("List of devices", 0) == 0 || line.rfind("adb ", 0) == 0) continue;
+        const size_t a = line.find_first_of(" \t");
+        if (a == std::string::npos) continue;
+        const size_t b = line.find_first_not_of(" \t", a);
+        if (b == std::string::npos) continue;
+        const size_t c = line.find_first_of(" \t", b);
+        std::string state = line.substr(b, c == std::string::npos ? std::string::npos : c - b);
+        if (state == "no") state = "no permissions";
+        AdbDev d;
+        d.serial = PhoneW(line.substr(0, a));
+        d.state = PhoneW(state);
+        const size_t m = line.find(" model:");
+        if (m != std::string::npos) {
+            const size_t me = line.find_first_of(" \t", m + 7);
+            std::string model = line.substr(m + 7, me == std::string::npos ? std::string::npos : me - m - 7);
+            std::replace(model.begin(), model.end(), '_', ' ');
+            d.model = PhoneW(model);
+        }
+        v.push_back(d);
+    }
+    return v;
+}
+
+static std::wstring AdbModel(const std::wstring& serial, const std::atomic<bool>* stop) {
+    std::string out;
+    if (AdbRun(AdbSerialArg(serial) + L"shell getprop ro.product.model", &out, 5000, stop) != 0) return std::wstring();
+    return PhoneW(AdbTrim(out));
+}
+
+static bool LocalPortFree(int port) {
+    SOCKET t = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (t == INVALID_SOCKET) return false;
+    BOOL ex = TRUE;
+    setsockopt(t, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&ex), sizeof(ex));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(static_cast<u_short>(port));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool ok = bind(t, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+    closesocket(t);
+    return ok;
+}
+
+static void AdbPostList(WPARAM kind) {
+    if (g_phoneNotify) PostMessageW(g_phoneNotify, WM_PHONE_USBLIST, kind, 0);
+}
+
+// USB: finds the phone and (re)creates `adb forward tcp:<local> tcp:47800`.
+// Returns the local port, 0 = failed (*err = a sentence for the UI).
+static int PhoneUsbPrepare(const std::wstring& prefSerial, std::wstring* model, std::wstring* serialOut,
+                           std::wstring* err) {
+    const std::atomic<bool>* stop = &g_phone.stop;
+    if (AdbExe().empty()) {
+        *err = L"Не найден adb.exe: он должен лежать в папке «adb» рядом с WVC.exe — распакуйте WVC.zip целиком.";
+        return 0;
+    }
+    int rc = 0;
+    std::vector<AdbDev> devs = AdbDevices(stop, &rc);
+    if (stop->load()) return 0;
+    if (rc != 0) {
+        *err = rc == -2 ? L"adb не ответил вовремя. Закройте другие программы, которые используют adb (Android Studio, "
+                          L"scrcpy), или переподключите кабель."
+                        : L"adb не запустился (код " + std::to_wstring(rc) + L"). Переподключите кабель.";
+        return 0;
+    }
+    for (auto& d : devs)
+        if (d.state == L"device" && d.model.empty()) d.model = AdbModel(d.serial, stop);
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_adbMx);
+        changed = devs.size() != g_usbDevs.size();
+        for (size_t i = 0; !changed && i < devs.size(); ++i)
+            changed = devs[i].serial != g_usbDevs[i].serial || devs[i].state != g_usbDevs[i].state ||
+                      devs[i].model != g_usbDevs[i].model;
+        g_usbDevs = devs;
+    }
+    if (changed) AdbPostList(0);  // refresh the combo only when something changed (it may be open)
+    const AdbDev* pick = nullptr;
+    for (const auto& d : devs)
+        if (d.state == L"device" && d.serial == prefSerial) pick = &d;
+    for (const auto& d : devs)
+        if (!pick && d.state == L"device") pick = &d;  // the chosen phone is not plugged in: take the one that is
+    if (!pick) {
+        bool unauthorized = false, offline = false, noperm = false;
+        for (const auto& d : devs) {
+            unauthorized = unauthorized || d.state == L"unauthorized";
+            offline = offline || d.state == L"offline";
+            noperm = noperm || d.state.rfind(L"no", 0) == 0;
+        }
+        if (unauthorized)
+            *err = L"Подтвердите доступ на телефоне (unauthorized): нажмите на телефоне «Разрешить» в запросе "
+                   L"«Разрешить отладку по USB?» (можно отметить «Всегда разрешать с этого компьютера»).";
+        else if (offline)
+            *err = L"Телефон по USB в состоянии offline: переподключите кабель или выключите и включите Отладку по USB.";
+        else if (noperm)
+            *err = L"Нет доступа к телефону по USB: переподключите кабель и подтвердите запрос на телефоне.";
+        else
+            *err = L"Телефон по USB не найден — подключите кабель и включите Отладку по USB.";
+        return 0;
+    }
+    const std::wstring serial = pick->serial;
+    *serialOut = serial;
+    *model = pick->model.empty() ? std::wstring(L"телефон") : pick->model;
+    const std::wstring sa = AdbSerialArg(serial);
+
+    // local port: the one an existing forward to tcp:47800 of this phone uses, else 47800 if free, else adb picks
+    int want = 0;
+    std::string out;
+    if (AdbRun(L"forward --list", &out, 5000, stop) == 0) {
+        const std::string ser = PhoneA(serial);
+        for (const std::string& line : AdbLines(out)) {  // "<serial> tcp:<local> tcp:<remote>"
+            const std::string tail = " tcp:" + std::to_string(kPhoneTcpPort);
+            if (line.rfind(ser + " tcp:", 0) == 0 && line.size() > tail.size() &&
+                line.compare(line.size() - tail.size(), tail.size(), tail) == 0) {
+                want = std::atoi(line.c_str() + ser.size() + 5);
+                break;
+            }
+        }
+    }
+    if (stop->load()) return 0;
+    if (!want) {
+        std::lock_guard<std::mutex> lk(g_adbMx);
+        if (g_adbFwdSerial == serial) want = g_adbFwdPort;
+    }
+    if (!want && LocalPortFree(kPhoneTcpPort)) want = kPhoneTcpPort;
+    const std::wstring remote = L" tcp:" + std::to_wstring(kPhoneTcpPort);
+    int port = 0;
+    if (want && AdbRun(sa + L"forward tcp:" + std::to_wstring(want) + remote, &out, 5000, stop) == 0) port = want;
+    if (!port && !stop->load() && AdbRun(sa + L"forward tcp:0" + remote, &out, 5000, stop) == 0) {
+        port = std::atoi(AdbTrim(out).c_str());  // adb prints the port it picked
+    }
+    if (stop->load()) return 0;
+    if (port <= 0 || port > 65535) {
+        std::string why = AdbTrim(out);
+        if (why.size() > 160) why.resize(160);
+        *err = L"adb не смог пробросить порт к телефону" + (why.empty() ? std::wstring() : L" (" + PhoneW(why) + L")") +
+               L". Переподключите кабель.";
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_adbMx);
+        g_adbFwdSerial = serial;
+        g_adbFwdPort = port;
+    }
+    return port;
+}
+
+// Removes the forward WVC made (async = on a detached thread, so the UI never waits)
+static void AdbReleaseForward(bool async) {
+    std::wstring serial;
+    int port = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_adbMx);
+        serial.swap(g_adbFwdSerial);
+        port = g_adbFwdPort;
+        g_adbFwdPort = 0;
+    }
+    if (!port) return;
+    auto fn = [serial, port] {
+        AdbRun(AdbSerialArg(serial) + L"forward --remove tcp:" + std::to_wstring(port), nullptr, 3000, nullptr);
+    };
+    if (async)
+        std::thread(fn).detach();
+    else
+        fn();
+}
+
+// On exit: remove the forward; stop the adb server only if WVC started it
+static void AdbShutdown() {
+    AdbReleaseForward(false);
+    if (g_adbStartedServer) AdbRun(L"kill-server", nullptr, 3000, nullptr);
+}
+
+// «Найти» in USB mode: list the phones adb sees
+static void PhoneUsbListThread() {
+    int rc = 0;
+    std::vector<AdbDev> devs = AdbDevices(nullptr, &rc);
+    for (auto& d : devs)
+        if (d.state == L"device" && d.model.empty()) d.model = AdbModel(d.serial, nullptr);
+    if (rc == 0) {
+        std::lock_guard<std::mutex> lk(g_adbMx);
+        g_usbDevs = devs;
+    }
+    g_usbListing = false;
+    AdbPostList(rc == 0 ? 1 : rc == -1 ? 2 : 3);
+}
+
+static void PhoneUsbList() {
+    if (g_usbListing.exchange(true)) return;
+    std::thread(PhoneUsbListThread).detach();
+}
+
+static void PhoneThread(std::wstring link, int src, int res) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IWICImagingFactory* f = nullptr;
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
-    std::wstring err;
-    SOCKET s = PhoneConnect(ip, &err);
+    const bool usb = link.rfind(L"usb:", 0) == 0;
+    std::wstring err, usbModel, usbSerial;
+    SOCKET s = INVALID_SOCKET;
+    if (usb) {
+        const int port = PhoneUsbPrepare(link.substr(4), &usbModel, &usbSerial, &err);
+        if (port) {
+            {
+                std::lock_guard<std::mutex> lk(g_phoneMx);
+                g_phoneUsbModel = usbModel;
+            }
+            s = PhoneConnect(L"127.0.0.1", port, &err);
+            if (s == INVALID_SOCKET)
+                err = L"Не удалось подключиться к порту adb (" + err + L"). Переподключите кабель.";
+        }
+    } else {
+        s = PhoneConnect(link, kPhoneTcpPort, &err);
+    }
+    bool gotAny = false;
     if (s != INVALID_SOCKET) {
         std::lock_guard<std::mutex> lk(g_phoneMx);
         if (g_phone.stop) {
@@ -1341,6 +1710,7 @@ static void PhoneThread(std::wstring ip, int src, int res) {
         while (!g_phone.stop) {
             uint8_t hdr[8];
             if (!PhoneRecvAll(s, hdr, 8)) break;
+            gotAny = true;
             const uint32_t len = static_cast<uint32_t>(hdr[4]) | (static_cast<uint32_t>(hdr[5]) << 8) |
                                  (static_cast<uint32_t>(hdr[6]) << 16) | (static_cast<uint32_t>(hdr[7]) << 24);
             if (std::memcmp(hdr, "WVCF", 4) == 0) {
@@ -1384,6 +1754,24 @@ static void PhoneThread(std::wstring ip, int src, int res) {
             g_phoneSock = INVALID_SOCKET;
         }
         g_phoneState.clear();
+    }
+    if (usb && !g_phone.stop && s != INVALID_SOCKET) {
+        if (!gotAny) {
+            // adb accepted the local connection, but nothing listens on the phone: WVC Phone is not running
+            err = L"Телефон «" + usbModel + L"» подключён по USB, но WVC Phone на нём не запущен — открываю приложение. "
+                  L"Если не открылось, откройте WVC Phone вручную.";
+            if (g_adbLaunchAt == 0 || GetTickCount64() - g_adbLaunchAt > 15000) {
+                g_adbLaunchAt = GetTickCount64();
+                AdbRun(AdbSerialArg(usbSerial) + L"shell am start -n " + kPhoneActivity, nullptr, 8000, &g_phone.stop);
+            }
+        } else if (err == L"связь прервалась") {
+            err = L"Связь с телефоном по USB прервалась (кабель отключён или WVC Phone закрыт).";
+        } else {
+            err = L"Ошибка связи по USB: " + err + L".";
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_phoneMx);
         if (!g_phone.stop) g_phoneErr = err;
     }
     {
@@ -1419,30 +1807,40 @@ static void PhoneStop() {
     g_phoneState.clear();
 }
 
+// What the phone thread connects to: the IP address, or "usb:<preferred serial>"
+static std::wstring PhoneLink(const Settings& s) { return s.phoneConn == 1 ? L"usb:" + s.phoneUsbSerial : s.phoneIp; }
+
+static bool PhoneWantedNow(const Settings& s) {
+    const int user = g_phoneUser;
+    const bool have = s.phoneConn == 1 || !s.phoneIp.empty();
+    return have && (user == 1 || (user == 0 && g_streaming && PhoneNeeded(s)));
+}
+
 // Called on the UI timer: connects while the phone is shown (or after «Подключить»), retries every 3 s.
 static void PhoneSync() {
     if (!g_wsaOk) return;
     Settings s = GetSettings();
-    const int user = g_phoneUser;
-    const bool want = !s.phoneIp.empty() && (user == 1 || (user == 0 && g_streaming && PhoneNeeded(s)));
+    const bool want = PhoneWantedNow(s);
+    const std::wstring link = PhoneLink(s);
     if (g_phone.th.joinable()) {
         const bool dead = g_phone.status == 3;
-        if (!want || g_phone.link != s.phoneIp || dead) {
+        if (!want || g_phone.link != link || dead) {
             const ULONGLONG failedAt = g_phone.failedAt;
-            const bool sameIp = g_phone.link == s.phoneIp;
+            const bool sameLink = g_phone.link == link;
             PhoneStop();
-            if (dead && sameIp) {
+            if (dead && sameLink) {
                 g_phone.status = 3;
                 g_phone.failedAt = failedAt;
             }
+            if (!want || !sameLink) AdbReleaseForward(true);  // disconnected or switched: drop the USB forward
         }
     }
     if (want && !g_phone.th.joinable()) {
         if (g_phone.status == 3 && GetTickCount64() - g_phone.failedAt < 3000) return;  // retry every 3 s
         g_phone.stop = false;
         g_phone.status = 1;
-        g_phone.link = s.phoneIp;
-        g_phone.th = std::thread(PhoneThread, s.phoneIp, s.phoneSrc, s.phoneRes);
+        g_phone.link = link;
+        g_phone.th = std::thread(PhoneThread, link, s.phoneSrc, s.phoneRes);
     }
     if (!want && g_phone.status == 3) g_phone.status = 0;
 }
@@ -2145,11 +2543,11 @@ static const wchar_t* WebcamMessage(const Settings& s) {
 }
 
 static const wchar_t* PhoneMessage(const Settings& s) {
-    if (s.phoneIp.empty()) return L"Телефон не выбран";
+    if (s.phoneConn == 0 && s.phoneIp.empty()) return L"Телефон не выбран";
     switch (g_phone.status.load()) {
-    case 1: return L"Подключаюсь к телефону…";
+    case 1: return s.phoneConn == 1 ? L"Подключаюсь к телефону по USB…" : L"Подключаюсь к телефону…";
     case 2: return PhoneStateNow() == L"need_consent" ? L"Разрешите показ экрана на телефоне" : L"Телефон подключён, жду картинку…";
-    default: return L"Телефон не подключён";
+    default: return s.phoneConn == 1 ? L"Телефон по USB не подключён" : L"Телефон не подключён";
     }
 }
 
@@ -3216,7 +3614,7 @@ enum {
     IDC_SRC2_HDR, IDC_SRC2_VALUE, IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE,
     IDC_SHOW_HDR, IDC_VIEW_LABEL, IDC_VIEW, IDC_LAYOUT_LABEL, IDC_LAYOUT, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP,
     IDC_CAM_HDR, IDC_CAM_LABEL, IDC_CAMDEV, IDC_CAMMIRROR,
-    IDC_PHONE_HDR, IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, IDC_PHONEIP_LABEL, IDC_PHONE_IP, IDC_PHONE_CONN,
+    IDC_PHONE_HDR, IDC_PHONEMODE_LABEL, IDC_PHONE_MODE, IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, IDC_PHONEIP_LABEL, IDC_PHONE_IP, IDC_PHONE_CONN,
     IDC_PHONE_BACK, IDC_PHONE_FRONT, IDC_PHONE_SCREEN, IDC_PHONERES_LABEL, IDC_PHONE_RES, IDC_PHONE_STATUS,
     IDC_MEDIA_HDR, IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN, IDC_IMGSEC_LABEL,
     IDC_IMGSEC, IDC_MEDIA_NEXT, IDC_MEDIA_NOW,
@@ -3389,14 +3787,27 @@ static void LayoutPage(int p) {
         row1(IDC_CAM_LABEL, IDC_CAMDEV, 240);
         chk(IDC_CAMMIRROR);
         hdr(IDC_PHONE_HDR);
-        row2(IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, 76);
-        P(IDC_PHONEIP_LABEL, pad, y + 4, lw, 20);
-        P(IDC_PHONE_IP, cx, y, cw - 110 - 6, 24);
-        P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
+        const bool phoneUsb = GetSettings().phoneConn == 1;
+        P(IDC_PHONEMODE_LABEL, pad, y + 4, lw, 20);
+        if (phoneUsb) {  // USB: no IP row, «Подключить» sits next to the mode
+            P(IDC_PHONE_MODE, cx, y, cw - 110 - 6, 200);
+            P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
+        } else {
+            P(IDC_PHONE_MODE, cx, y, cw, 200);
+        }
         y += 32;
+        row2(IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, 76);
+        if (phoneUsb) {
+            hide({IDC_PHONEIP_LABEL, IDC_PHONE_IP});
+        } else {
+            P(IDC_PHONEIP_LABEL, pad, y + 4, lw, 20);
+            P(IDC_PHONE_IP, cx, y, cw - 110 - 6, 24);
+            P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
+            y += 32;
+        }
         btns({IDC_PHONE_BACK, IDC_PHONE_FRONT, IDC_PHONE_SCREEN});
         row1(IDC_PHONERES_LABEL, IDC_PHONE_RES);
-        full(IDC_PHONE_STATUS, 54);
+        full(IDC_PHONE_STATUS, 72);
         hdr(IDC_MEDIA_HDR);
         full(IDC_MEDIA_LIST, 104);
         {
@@ -3737,6 +4148,7 @@ static void SyncControls() {
     CheckSet(IDC_KEEPCAM, s.keepCamOn);
     SetTextIfChanged(Ctl(IDC_PHONE_IP), s.phoneIp);
     ComboSet(IDC_PHONE_RES, s.phoneRes);
+    ComboSet(IDC_PHONE_MODE, s.phoneConn);
     SetTextIfChanged(Ctl(IDC_PAUSETEXT), s.pauseText);
     ComboSet(IDC_PIPCORNER, s.pipCorner);
     SendMessageW(Ctl(IDC_PIPSIZE_UD), UDM_SETPOS32, 0, std::clamp((s.pipW + 50) / 100, 5, 90));
@@ -3809,13 +4221,40 @@ static void UpdateStartButton() {
 static std::vector<PhoneFound> g_phoneList;  // what the combo shows
 static std::wstring g_phoneNote;             // result of the last search / command while not connected
 
-static bool PhoneWanted(const Settings& s) {
-    const int user = g_phoneUser;
-    return !s.phoneIp.empty() && (user == 1 || (user == 0 && g_streaming && PhoneNeeded(s)));
-}
+static std::vector<std::wstring> g_usbShown;   // serials in the combo (USB mode)
+
+static bool PhoneWanted(const Settings& s) { return PhoneWantedNow(s); }
 
 static void FillPhoneCombo() {
     Settings s = GetSettings();
+    if (s.phoneConn == 1) {  // USB: phones adb sees
+        std::vector<AdbDev> devs;
+        {
+            std::lock_guard<std::mutex> lk(g_adbMx);
+            devs = g_usbDevs;
+        }
+        HWND h = Ctl(IDC_PHONE_LIST);
+        const bool was = g_syncing;
+        g_syncing = true;
+        SendMessageW(h, CB_RESETCONTENT, 0, 0);
+        g_usbShown.clear();
+        int sel = -1, firstOk = -1;
+        for (const auto& d : devs) {
+            std::wstring t = (d.model.empty() ? std::wstring(L"Телефон") : d.model) + L" — USB";
+            if (d.state == L"unauthorized")
+                t += L" (подтвердите доступ на телефоне)";
+            else if (d.state != L"device")
+                t += L" (" + d.state + L")";
+            const int i = static_cast<int>(g_usbShown.size());
+            SendMessageW(h, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(t.c_str()));
+            g_usbShown.push_back(d.serial);
+            if (d.serial == s.phoneUsbSerial) sel = i;
+            if (firstOk < 0 && d.state == L"device") firstOk = i;
+        }
+        SendMessageW(h, CB_SETCURSEL, sel >= 0 ? sel : firstOk, 0);
+        g_syncing = was;
+        return;
+    }
     if (!s.phoneIp.empty()) {
         bool have = false;
         for (const auto& p : g_phoneList) have = have || p.ip == s.phoneIp;
@@ -3846,9 +4285,38 @@ static void UpdatePhoneUi() {
         err = g_phoneErr;
     }
     const int status = g_phone.status;
+    const bool usb = s.phoneConn == 1;
+    std::wstring usbModel;
+    if (usb) {
+        std::lock_guard<std::mutex> lk(g_phoneMx);
+        usbModel = g_phoneUsbModel;
+    }
     std::wstring t;
     if (!g_wsaOk) {
         t = L"Сеть Windows недоступна: телефон подключить нельзя.";
+    } else if (usb) {
+        if (status == 2) {
+            t = L"Подключено по USB: " + (!name.empty() ? name : !usbModel.empty() ? usbModel : std::wstring(L"телефон")) +
+                L" — " + PhoneStateName(st);
+            if (st == L"need_consent") {
+                t += L". Подтвердите запись экрана на телефоне.";
+            } else {
+                wchar_t b[64];
+                swprintf(b, 64, L", %.1f кадров/с.", g_phoneFpsX10 / 10.0);
+                t += b;
+            }
+        } else if (status == 1) {
+            t = L"Подключаюсь по USB…";
+        } else if (status == 3) {
+            t = err + L" Пробую снова каждые 3 с.";
+        } else if (g_usbListing) {
+            t = L"Ищу телефоны по USB…";
+        } else if (!g_phoneNote.empty()) {
+            t = g_phoneNote;
+        } else {
+            t = L"USB-кабель: подключите телефон, включите на нём «Отладку по USB» и откройте WVC Phone. WVC подключится "
+                L"сам, когда «Телефон» выбран источником и идёт трансляция; или нажмите «Подключить».";
+        }
     } else if (g_phoneSearching) {
         t = L"Ищу телефоны в сети…";
     } else if (status == 2) {
@@ -3877,7 +4345,8 @@ static void UpdatePhoneUi() {
     }
     SetTextIfChanged(Ctl(IDC_PHONE_STATUS), t);
     SetTextIfChanged(Ctl(IDC_PHONE_CONN), PhoneWanted(s) ? L"Отключить" : L"Подключить");
-    SetTextIfChanged(Ctl(IDC_PHONE_FIND), g_phoneSearching ? L"Ищу…" : L"Найти");
+    SetTextIfChanged(Ctl(IDC_PHONE_FIND), (usb ? g_usbListing.load() : g_phoneSearching.load()) ? L"Ищу…" : L"Найти");
+    SetTextIfChanged(Ctl(IDC_PHONE_LABEL), usb ? L"Телефоны по USB:" : L"Найденные телефоны:");
     static const wchar_t* names[3] = {L"Задняя камера", L"Передняя камера", L"Экран телефона"};
     for (int i = 0; i < 3; ++i)
         SetTextIfChanged(Ctl(IDC_PHONE_BACK + i), (s.phoneSrc == i ? L"● " : L"") + std::wstring(names[i]));
@@ -3910,10 +4379,11 @@ static void UpdateStatus() {
         line2 = L"Веб-камера недоступна: занята другой программой или отключена. Пробую снова…";
     else if (g_streaming && MediaNeeded(s) && s.media.empty())
         line2 = L"Добавьте медиафайлы на вкладке «Источники».";
-    else if (g_streaming && PhoneNeeded(s) && s.phoneIp.empty())
+    else if (g_streaming && PhoneNeeded(s) && s.phoneConn == 0 && s.phoneIp.empty())
         line2 = L"Телефон: нажмите «Найти» или введите IP на вкладке «Источники».";
     else if (g_streaming && PhoneNeeded(s) && g_phone.status == 3)
-        line2 = L"Телефон не отвечает: проверьте WVC Phone, Wi-Fi и брандмауэр. Пробую снова…";
+        line2 = s.phoneConn == 1 ? L"Телефон по USB не подключён: подробности на вкладке «Источники». Пробую снова…"
+                                 : L"Телефон не отвечает: проверьте WVC Phone, Wi-Fi и брандмауэр. Пробую снова…";
     else if (g_streaming && g_paused)
         line2 = L"Пауза: в камере картинка паузы. «Продолжить» — вернуть трансляцию.";
     else if (g_streaming && g_sourceLost)
@@ -3979,12 +4449,12 @@ static std::wstring PhoneIpFromEdit() {
 }
 
 static void TogglePhoneConnection() {
-    ApplyPhoneIp(PhoneIpFromEdit());
+    if (GetSettings().phoneConn == 0) ApplyPhoneIp(PhoneIpFromEdit());
     Settings s = GetSettings();
     if (PhoneWanted(s)) {
         g_phoneUser = -1;  // stay disconnected until «Подключить» or the next «Старт»
         g_phoneNote = L"Отключено.";
-    } else if (s.phoneIp.empty()) {
+    } else if (s.phoneConn == 0 && s.phoneIp.empty()) {
         g_phoneNote = L"Введите IP-адрес телефона или нажмите «Найти».";
     } else {
         g_phoneUser = 1;
@@ -5100,6 +5570,8 @@ static void CreateControls(HWND hwnd) {
     AddCombo(IDC_CAMDEV, {});
     Mk(L"BUTTON", L"Зеркалить веб-камеру (как в зеркале)", chk, IDC_CAMMIRROR);
     Mk(L"STATIC", L"Телефон (приложение WVC Phone)", 0, IDC_PHONE_HDR);
+    Mk(L"STATIC", L"Подключение:", 0, IDC_PHONEMODE_LABEL);
+    AddCombo(IDC_PHONE_MODE, {L"Wi-Fi", L"USB-кабель"});
     Mk(L"STATIC", L"Найденные телефоны:", 0, IDC_PHONE_LABEL);
     AddCombo(IDC_PHONE_LIST, {});
     Mk(L"BUTTON", L"Найти", btn, IDC_PHONE_FIND);
@@ -5268,9 +5740,12 @@ static const TipDef kTips[] = {
     {IDC_SWAP, L"Поменять местами главный и второй источник.", HA_SWAP},
     {IDC_CAMDEV, L"Какая веб-камера используется (WVC Camera в списке не показывается).", -1},
     {IDC_CAMMIRROR, L"Отразить веб-камеру по горизонтали, как в зеркале.", -1},
-    {IDC_PHONE_LIST, L"Телефоны с открытым WVC Phone, найденные в вашей сети. Выберите, чтобы подставить IP-адрес.", -1},
-    {IDC_PHONE_FIND, L"Поискать телефоны с WVC Phone в той же сети Wi-Fi (около 2 секунд). Если Windows спросит про "
-                     L"брандмауэр — разрешите доступ для частных сетей.", -1},
+    {IDC_PHONE_MODE, L"Как WVC связывается с телефоном: по Wi-Fi (телефон и компьютер в одной сети) или по USB-кабелю "
+                     L"(на телефоне нужна «Отладка по USB»; надёжнее и без задержек сети).", -1},
+    {IDC_PHONE_LIST, L"Wi-Fi: телефоны с открытым WVC Phone в вашей сети — выберите, чтобы подставить IP-адрес. "
+                     L"USB: телефоны, подключённые кабелем, — выберите, какой использовать.", -1},
+    {IDC_PHONE_FIND, L"Wi-Fi: поискать телефоны с WVC Phone в той же сети (около 2 секунд; если Windows спросит про "
+                     L"брандмауэр — разрешите доступ для частных сетей). USB: обновить список телефонов на кабеле.", -1},
     {IDC_PHONE_IP, L"IP-адрес телефона — он крупно написан в приложении WVC Phone. Можно ввести вручную.", -1},
     {IDC_PHONE_CONN, L"Подключиться к телефону сейчас или отключиться. Без этой кнопки WVC подключается сам, когда "
                      L"«Телефон» выбран источником и идёт трансляция.", -1},
@@ -5374,7 +5849,7 @@ static void ResizeForDpi(HWND hwnd) {
 // one combo / checkbox / edit changed -> settings
 static void OnControlChanged(int id) {
     if (g_syncing) return;
-    bool format = false, pause = false, layers = false, media = false, phoneRes = false;
+    bool format = false, pause = false, layers = false, media = false, phoneRes = false, phoneMode = false;
     int W, H;
     {
         Settings cur = GetSettings();
@@ -5410,6 +5885,7 @@ static void OnControlChanged(int id) {
             break;
         case IDC_KEEPCAM: s.keepCamOn = CheckGet(id); layers = true; break;
         case IDC_PHONE_RES: s.phoneRes = (std::min)(sel, 1); phoneRes = true; break;
+        case IDC_PHONE_MODE: phoneMode = (std::min)(sel, 1) != s.phoneConn; s.phoneConn = (std::min)(sel, 1); break;
         case IDC_PAUSETEXT: {
             wchar_t buf[256] = {};
             GetWindowTextW(Ctl(IDC_PAUSETEXT), buf, 256);
@@ -5469,6 +5945,14 @@ static void OnControlChanged(int id) {
     SaveSettings();
     if (format) RestartCameraForFormat();
     if (phoneRes) PhoneSendRes(GetSettings().phoneRes);
+    if (phoneMode) {
+        g_phoneNote.clear();
+        if (GetSettings().phoneConn == 1) PhoneUsbList();
+        FillPhoneCombo();
+        Layout();
+        SyncSources();
+        UpdateStatus();
+    }
     if (pause) {
         g_pauseDirty = true;
         if (GetSettings().pauseMode == 3 && GetSettings().pauseImage.empty()) ChoosePauseImage();
@@ -5610,6 +6094,37 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateStatus();
         return 0;
     }
+    case WM_PHONE_USBLIST: {
+        if (wp == 1) {
+            size_t ok = 0, unauth = 0, total = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_adbMx);
+                total = g_usbDevs.size();
+                for (const auto& d : g_usbDevs) {
+                    ok += d.state == L"device";
+                    unauth += d.state == L"unauthorized";
+                }
+            }
+            if (ok)
+                g_phoneNote = L"Найдено по USB: " + std::to_wstring(ok) + L". Нажмите «Подключить» или выберите «Телефон» "
+                              L"источником и нажмите «Старт».";
+            else if (unauth)
+                g_phoneNote = L"Подтвердите доступ на телефоне (unauthorized): нажмите «Разрешить» в запросе «Разрешить "
+                              L"отладку по USB?», затем «Найти» ещё раз.";
+            else if (total)
+                g_phoneNote = L"Телефон виден, но недоступен: переподключите кабель.";
+            else
+                g_phoneNote = L"Телефон по USB не найден — подключите кабель и включите Отладку по USB. Если не помогает — "
+                              L"установите USB-драйвер производителя телефона (см. README).";
+        } else if (wp == 2) {
+            g_phoneNote = L"Не найден adb.exe: он должен лежать в папке «adb» рядом с WVC.exe — распакуйте WVC.zip целиком.";
+        } else if (wp == 3) {
+            g_phoneNote = L"adb не ответил. Закройте другие программы, которые используют adb, и нажмите «Найти» ещё раз.";
+        }
+        FillPhoneCombo();
+        UpdateStatus();
+        return 0;
+    }
     case WM_PHONE_STATE: {
         const std::wstring st = PhoneStateNow();
         const int src = st == L"back" ? 0 : st == L"front" ? 1 : st == L"screen" ? 2 : -1;
@@ -5733,7 +6248,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case IDC_PHONE_FIND:
             g_phoneNote.clear();
-            PhoneDiscover(hwnd);
+            if (GetSettings().phoneConn == 1)
+                PhoneUsbList();
+            else
+                PhoneDiscover(hwnd);
             UpdateStatus();
             break;
         case IDC_PHONE_CONN: TogglePhoneConnection(); break;
@@ -5743,7 +6261,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_PHONE_LIST:
             if (code == CBN_SELCHANGE && !g_syncing) {
                 const int sel = ComboSel(IDC_PHONE_LIST);
-                if (sel >= 0 && sel < static_cast<int>(g_phoneList.size())) ApplyPhoneIp(g_phoneList[sel].ip);
+                if (GetSettings().phoneConn == 1) {
+                    if (sel >= 0 && sel < static_cast<int>(g_usbShown.size())) {
+                        {
+                            std::lock_guard<std::mutex> lk(g_setMx);
+                            g_set.phoneUsbSerial = g_usbShown[sel];
+                        }
+                        SaveSettings();
+                        g_phoneNote.clear();
+                        SyncSources();
+                        UpdateStatus();
+                    }
+                } else if (sel >= 0 && sel < static_cast<int>(g_phoneList.size())) {
+                    ApplyPhoneIp(g_phoneList[sel].ip);
+                }
             }
             break;
         case IDC_PHONE_IP:
@@ -5916,7 +6447,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     wc.lpszClassName = L"WVCMain";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC 0.8 — виртуальная камера",
+    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC 0.9 — виртуальная камера",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
                                 940, 660, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
@@ -5946,6 +6477,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     WebcamStop();
     MediaStop();
     PhoneStop();
+    AdbShutdown();  // remove the USB forward; stop the adb server if WVC started it
     StopCamera();
     for (HWND f : g_frame)
         if (f) DestroyWindow(f);

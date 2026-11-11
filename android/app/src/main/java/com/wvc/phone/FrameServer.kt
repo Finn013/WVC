@@ -14,6 +14,7 @@ import java.net.Socket
 /**
  * TCP server for WVC (port 47800) + UDP discovery (port 47801). See docs/PHONE-PROTOCOL.md.
  * One client at a time: a new connection replaces the old one.
+ * Listens on all interfaces, loopback included: over a USB cable WVC comes through `adb forward` from 127.0.0.1.
  * Frames are never queued: while one frame is being sent, new ones are dropped (latency first).
  */
 class FrameServer(private val listener: Listener, private val deviceName: String) {

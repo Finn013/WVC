@@ -221,7 +221,7 @@ class MainActivity : Activity() {
             source = svc.source
             res = svc.longSide
             val c = svc.clientAddr
-            tvStatus.text = if (c == null) "Ожидание WVC…" else "Подключено к $c"
+            tvStatus.text = if (c == null) "Ожидание WVC…" else "Подключено ${Net.clientLabel(c)}"
             tvDetail.text = if (c == null) {
                 "Сейчас выбрано: ${Net.stateName(source)}"
             } else {

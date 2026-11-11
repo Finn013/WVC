@@ -337,9 +337,9 @@ class StreamService : LifecycleService(), FrameServer.Listener {
         val c = clientAddr
         return if (c == null) {
             val ip = Net.localIps().firstOrNull()
-            "Ожидание WVC…" + if (ip != null) " · IP $ip" else " · нет Wi-Fi"
+            "Ожидание WVC…" + if (ip != null) " · IP $ip" else " · нет Wi-Fi (можно по USB)"
         } else {
-            "Подключено к $c · ${Net.stateName(state)}"
+            "Подключено ${Net.clientLabel(c)} · ${Net.stateName(state)}"
         }
     }
 

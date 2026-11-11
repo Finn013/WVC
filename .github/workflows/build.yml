@@ -35,6 +35,14 @@ jobs:
           Copy-Item docs/README-RU.txt dist/WVC/README.txt
           Copy-Item docs/PHONE-PROTOCOL.md dist/WVC/PHONE-PROTOCOL.md
           Copy-Item third_party/softcam/LICENSE dist/WVC/LICENSE-softcam.txt
+          # adb for the phone over USB (Android SDK Platform-Tools; license in adb/NOTICE.txt)
+          Invoke-WebRequest -Uri https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile pt.zip
+          Expand-Archive pt.zip -DestinationPath pt -Force
+          New-Item -ItemType Directory -Force dist/WVC/adb | Out-Null
+          foreach ($f in 'adb.exe','AdbWinApi.dll','AdbWinUsbApi.dll','NOTICE.txt','source.properties') {
+            Copy-Item "pt/platform-tools/$f" dist/WVC/adb/ -ErrorAction Stop
+          }
+          Get-ChildItem dist/WVC -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
           Compress-Archive -Path dist/WVC -DestinationPath dist/WVC.zip -Force
 
       - uses: actions/upload-artifact@v4
@@ -101,4 +109,4 @@ jobs:
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest dist/WVC.zip dist/WVC-Phone.apk --prerelease --target "$GITHUB_SHA" \
             --title "WVC — сборка $GITHUB_RUN_NUMBER" \
-            --notes "Автоматическая сборка из коммита ${GITHUB_SHA::7}. WVC.zip — программа для Windows, WVC-Phone.apk — приложение для Android (телефон как камера)."
+            --notes "Автоматическая сборка из коммита ${GITHUB_SHA::7}. WVC.zip — программа для Windows (с adb для телефона по USB), WVC-Phone.apk — приложение для Android (телефон как камера)."

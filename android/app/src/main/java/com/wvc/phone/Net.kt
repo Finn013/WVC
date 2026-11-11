@@ -33,6 +33,16 @@ object Net {
         return result.sortedBy { it.first }.map { it.second }.distinct()
     }
 
+    /** WVC came through `adb forward` over a USB cable: adbd connects from the phone's own loopback. */
+    fun isUsbClient(addr: String?): Boolean {
+        if (addr == null) return false
+        val a = addr.removePrefix("/")
+        return a == "127.0.0.1" || a == "::1" || a == "::ffff:127.0.0.1" || a == "0:0:0:0:0:0:0:1" || a.startsWith("127.")
+    }
+
+    /** "по USB" or "к <ip>" */
+    fun clientLabel(addr: String): String = if (isUsbClient(addr)) "по USB" else "к $addr"
+
     fun deviceName(): String {
         val man = Build.MANUFACTURER ?: ""
         val model = Build.MODEL ?: "Android"
