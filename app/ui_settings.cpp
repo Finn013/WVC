@@ -662,11 +662,12 @@ void OnSetCommand(int id, int code) {
     if (s.syncing) return;
     // live: what the output preview needs
     if (code == CBN_SELCHANGE || code == EN_CHANGE || code == BN_CLICKED) {
-        ReadAll();
         if (id == S_QUALITY) {
             EnableWindow(Q(S_ASPECT), CGet(S_QUALITY) != 2);
             EnableWindow(Q(S_NATIVE), CGet(S_QUALITY) == 2);
+            if (CGet(S_QUALITY) == 2 && CGet(S_NATIVE) < 0 && !s.nativeUids.empty()) CSet(S_NATIVE, 0);
         }
+        ReadAll();
         if (id == S_OCOLOR && CGet(S_OCOLOR) == 5) {
             static COLORREF custom[16];
             CHOOSECOLORW cc{};
