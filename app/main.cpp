@@ -80,7 +80,8 @@ struct Settings {
     int  fps = 30;         // 30 or 60
     // picture
     bool cursor = false;   // Экран 1: show the mouse pointer
-    SrcFrame fr[kSrcKinds];  // v0.10: frame settings of each source (rotation, mirror, zoom, crop, fit), by kind
+    // v0.10: frame settings of each source (rotation, mirror, zoom, crop, fit), by kind; the webcam fills by default
+    SrcFrame fr[kSrcKinds] = {SrcFrame{}, SrcFrame{0, false, 0, 1, {0, 0, 0, 0}}, SrcFrame{}, SrcFrame{}, SrcFrame{}};
     int  pauseMode = 2;    // 0 = freeze, 1 = black, 2 = text card, 3 = image
     std::wstring pauseImage;
     std::wstring pauseText = L"Скоро вернусь";  // text on the pause card

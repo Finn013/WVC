@@ -140,26 +140,36 @@ class CameraSource(
                 .setResolutionStrategy(
                     ResolutionStrategy(size, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
                 .build()
-            val builder = ImageAnalysis.Builder()
-                .setResolutionSelector(selector)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .setTargetRotation(targetRotation)
             val range = pickFpsRange(p, cam)
-            if (range != null) {
-                try {
-                    Camera2Interop.Extender(builder)
-                        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
-                } catch (_: Exception) {
-                }
+            val a = try {
+                makeAnalysis(selector, range).also { p.bindToLifecycle(owner, cam, it) }
+            } catch (e: Exception) {
+                if (range == null) throw e
+                p.unbindAll()  // the frame-rate hint was refused: bind without it
+                makeAnalysis(selector, null).also { p.bindToLifecycle(owner, cam, it) }
             }
-            val a = builder.build()
-            a.setAnalyzer(analyzeExecutor) { img -> analyze(img) }
-            p.bindToLifecycle(owner, cam, a)
             analysis = a
         } catch (e: Exception) {
             onError("camera_error")
         }
+    }
+
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun makeAnalysis(selector: ResolutionSelector, range: Range<Int>?): ImageAnalysis {
+        val builder = ImageAnalysis.Builder()
+            .setResolutionSelector(selector)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+            .setTargetRotation(targetRotation)
+        if (range != null) {
+            try {
+                Camera2Interop.Extender(builder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+            } catch (_: Exception) {
+            }
+        }
+        val a = builder.build()
+        a.setAnalyzer(analyzeExecutor) { img -> analyze(img) }
+        return a
     }
 
     /** A buffer to copy the next frame into; null = all busy (the frame is dropped). */
@@ -185,7 +195,7 @@ class CameraSource(
         try {
             if (!server.hasClient()) return
             val now = SystemClock.elapsedRealtime()
-            if (now - lastFrameAt < 30) return  // ~30 fps at most
+            if (now - lastFrameAt < 25) return  // ~30-40 fps at most (a 30 fps camera's jitter never drops a frame)
             val w = img.width and 1.inv()
             val h = img.height and 1.inv()
             if (w < 2 || h < 2) return
