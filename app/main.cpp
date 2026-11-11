@@ -1,9 +1,12 @@
 // WVC — лёгкая виртуальная камера, которая показывает выбранную область экрана.
 // Камера: DirectShow-фильтр на базе tshino/softcam (MIT) в WVCCam.dll / WVCCam32.dll.
 // Это приложение: источник (область / монитор / окно / веб-камера), захват GDI,
-// поворот/зеркало/зум, надпись и логотип поверх кадра, картинка-в-картинке,
+// поворот/зеркало/зум, надпись и логотип поверх кадра, картинка-в-картинке, телефон (WVC Phone по Wi-Fi),
 // профили, настраиваемые горячие клавиши, предпросмотр, автовосстановление.
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
@@ -25,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -78,8 +82,8 @@ struct Settings {
     int  winCapture = 0;   // window source: 0 = from the screen, 1 = straight from the window (PrintWindow)
     RECT region2{};        // "Экран 2": a second fixed area (virtual-screen coordinates)
     // what is shown
-    int  mainSrc = 0;      // big picture: 0 = screen 1, 1 = webcam, 2 = media files, 3 = screen 2
-    int  pipSrc = 2;       // second source: 1 = screen 1, 2 = webcam, 3 = media files, 4 = screen 2 (= kind + 1)
+    int  mainSrc = 0;      // big picture: 0 = screen 1, 1 = webcam, 2 = media files, 3 = screen 2, 4 = phone
+    int  pipSrc = 2;       // second source: 1 = screen 1, 2 = webcam, 3 = media, 4 = screen 2, 5 = phone (= kind + 1)
     int  layout = 0;       // 0 = only the main source, 1 = small window on top, 2 = side by side
     std::wstring camLink, camName;
     bool camMirror = true;
@@ -105,6 +109,9 @@ struct Settings {
     int  transDur = 1;     // index into kTransMs
     bool idleFrame = true; // green frame around the source while not streaming
     bool keepCamOn = false; // keep the webcam open all the time (instant switching)
+    std::wstring phoneIp;  // WVC Phone: last IP address
+    int  phoneSrc = 0;     // what the phone sends: 0 back camera, 1 front camera, 2 its screen
+    int  phoneRes = 0;     // 0 = 720p, 1 = 1080p (long side)
 };
 
 static const double kZoom[] = {1.0, 1.25, 1.5, 2.0, 3.0, 4.0};
@@ -119,11 +126,12 @@ static const COLORREF kShapeColors[] = {RGB(0, 0, 0), RGB(255, 255, 255), RGB(0,
 static bool SquareShape(int shape) { return shape >= 2; }
 
 // second source actually shown: 0 = none, else 1..4 (source kind + 1)
-static int SecondSrc(const Settings& s) { return s.layout == 0 ? 0 : std::clamp(s.pipSrc, 1, 4); }
+static int SecondSrc(const Settings& s) { return s.layout == 0 ? 0 : std::clamp(s.pipSrc, 1, 5); }
 static bool ScreenNeeded(const Settings& s) { return s.mainSrc == 0 || SecondSrc(s) == 1; }
 static bool Screen2Needed(const Settings& s) { return s.mainSrc == 3 || SecondSrc(s) == 4; }
 static bool CamNeeded(const Settings& s) { return s.mainSrc == 1 || SecondSrc(s) == 2; }
 static bool MediaNeeded(const Settings& s) { return s.mainSrc == 2 || SecondSrc(s) == 3; }
+static bool PhoneNeeded(const Settings& s) { return s.mainSrc == 4 || SecondSrc(s) == 5; }
 
 // Small window rectangle in output pixels (16:9, or square for circle/hexagon/octagon)
 static RECT PipRect(const Settings& s, int W, int H) {
@@ -281,6 +289,9 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
         s.transDur = std::clamp(IniInt(sec, L"TransitionTime", s.transDur), 0, 2);
         s.idleFrame = IniInt(sec, L"IdleFrame", s.idleFrame) != 0;
         s.keepCamOn = IniInt(sec, L"KeepCamOn", s.keepCamOn) != 0;
+        s.phoneIp = IniStr(sec, L"PhoneIp");
+        s.phoneSrc = std::clamp(IniInt(sec, L"PhoneSrc", s.phoneSrc), 0, 2);
+        s.phoneRes = std::clamp(IniInt(sec, L"PhoneRes", s.phoneRes), 0, 1);
     }
     s.cursor = IniInt(sec, L"Cursor", s.cursor) != 0;
     s.fit = std::clamp(IniInt(sec, L"Fit", s.fit), 0, 1);
@@ -315,12 +326,12 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
         s.mainSrc = oldView == 1 ? 1 : 0;
         rawPip = oldView == 2 ? 2 : 0;
     }
-    s.mainSrc = std::clamp(s.mainSrc, 0, 3);
-    rawPip = std::clamp(rawPip, 0, 4);
+    s.mainSrc = std::clamp(s.mainSrc, 0, 4);
+    rawPip = std::clamp(rawPip, 0, 5);
     const int lay = IniInt(sec, L"Layout", -1);     // v0.7
     const int second = IniInt(sec, L"SecondSrc", -1);
     s.layout = lay < 0 ? (rawPip ? 1 : 0) : std::clamp(lay, 0, 2);
-    s.pipSrc = second >= 1 ? std::clamp(second, 1, 4) : rawPip >= 1 ? rawPip : (s.mainSrc == 1 ? 1 : 2);
+    s.pipSrc = second >= 1 ? std::clamp(second, 1, 5) : rawPip >= 1 ? rawPip : (s.mainSrc == 1 ? 1 : 2);
     s.camLink = IniStr(sec, L"CamLink");
     s.camName = IniStr(sec, L"CamName");
     s.camMirror = IniInt(sec, L"CamMirror", s.camMirror) != 0;
@@ -367,6 +378,9 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
         IniSetInt(sec, L"TransitionTime", s.transDur);
         IniSetInt(sec, L"IdleFrame", s.idleFrame ? 1 : 0);
         IniSetInt(sec, L"KeepCamOn", s.keepCamOn ? 1 : 0);
+        IniSetStr(sec, L"PhoneIp", s.phoneIp);
+        IniSetInt(sec, L"PhoneSrc", s.phoneSrc);
+        IniSetInt(sec, L"PhoneRes", s.phoneRes);
     }
     IniSetInt(sec, L"Cursor", s.cursor ? 1 : 0);
     IniSetInt(sec, L"Fit", s.fit);
@@ -390,7 +404,7 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
     IniSetInt(sec, L"Region2H", s.region2.bottom - s.region2.top);
     IniSetInt(sec, L"MainSrc", s.mainSrc);
     IniSetInt(sec, L"PipSrc", SecondSrc(s));  // what v0.6 understood: 0 = none
-    IniSetInt(sec, L"SecondSrc", std::clamp(s.pipSrc, 1, 4));
+    IniSetInt(sec, L"SecondSrc", std::clamp(s.pipSrc, 1, 5));
     IniSetInt(sec, L"Layout", s.layout);
     WritePrivateProfileStringW(sec, L"View", nullptr, IniPath().c_str());
     IniSetStr(sec, L"CamLink", s.camLink);
@@ -1106,6 +1120,424 @@ static void MediaNext() {
 }
 
 // ---------------------------------------------------------------------------
+// Phone: the WVC Phone app (Android) streams JPEG frames over Wi-Fi.
+// The phone is the server (TCP 47800), discovery by UDP broadcast to 47801. See docs/PHONE-PROTOCOL.md.
+// Connected only while the source is used during streaming, or after «Подключить».
+// ---------------------------------------------------------------------------
+static const char* kPhonePort = "47800";
+static const u_short kPhoneDiscPort = 47801;
+static const char* kPhoneSrcCmd[3] = {"back", "front", "screen"};
+static const UINT WM_PHONE_FOUND = WM_APP + 10;  // lParam = std::vector<PhoneFound>*
+static const UINT WM_PHONE_STATE = WM_APP + 11;  // the phone reported a new state
+
+struct PhoneFound {
+    std::wstring name, ip;
+};
+
+static FrameSource       g_phone;                    // link = IP address in use
+static std::mutex        g_phoneMx;                  // guards the socket and the strings below
+static SOCKET            g_phoneSock = INVALID_SOCKET;
+static std::wstring      g_phoneName;                // device model reported by the phone
+static std::wstring      g_phoneState;               // back / front / screen / need_consent / error ...
+static std::wstring      g_phoneErr;                 // why the last connection failed
+static std::atomic<int>  g_phoneFpsX10{0};
+static std::atomic<int>  g_phoneUser{0};             // 1 = «Подключить», -1 = «Отключить», 0 = only while used
+static std::atomic<bool> g_phoneSearching{false};
+static std::atomic<int>  g_phoneResRep{-1};          // quality the phone reported: 0 = 720p, 1 = 1080p
+static HWND              g_phoneNotify = nullptr;    // main window, for posted results
+static bool              g_wsaOk = false;
+
+static std::string PhoneA(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string r(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &r[0], n, nullptr, nullptr);
+    return r;
+}
+
+static std::wstring PhoneW(const std::string& a) {
+    if (a.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, a.data(), static_cast<int>(a.size()), nullptr, 0);
+    std::wstring r(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, a.data(), static_cast<int>(a.size()), &r[0], n);
+    return r;
+}
+
+static std::wstring PhoneStateNow() {
+    std::lock_guard<std::mutex> lk(g_phoneMx);
+    return g_phoneState;
+}
+
+static bool PhoneRecvAll(SOCKET s, void* buf, int n) {
+    char* p = static_cast<char*>(buf);
+    while (n > 0) {
+        const int r = recv(s, p, n, 0);
+        if (r <= 0) return false;
+        p += r;
+        n -= r;
+    }
+    return true;
+}
+
+// One command line to the phone ("SRC back", "RES 1080"); false when not connected
+static bool PhoneSendLine(const std::string& line) {
+    std::lock_guard<std::mutex> lk(g_phoneMx);
+    if (g_phoneSock == INVALID_SOCKET) return false;
+    const std::string l = line + "\n";
+    return send(g_phoneSock, l.data(), static_cast<int>(l.size()), 0) == static_cast<int>(l.size());
+}
+
+static bool PhoneSendSource(int src) { return PhoneSendLine(std::string("SRC ") + kPhoneSrcCmd[std::clamp(src, 0, 2)]); }
+static bool PhoneSendRes(int res) { return PhoneSendLine(res == 1 ? "RES 1080" : "RES 720"); }
+
+// TCP connect with a ~3 s timeout that still reacts to a stop request
+static SOCKET PhoneConnect(const std::wstring& ip, std::wstring* err) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(PhoneA(ip).c_str(), kPhonePort, &hints, &res) != 0 || !res) {
+        *err = L"неверный IP-адрес";
+        return INVALID_SOCKET;
+    }
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        freeaddrinfo(res);
+        *err = L"сеть недоступна";
+        return INVALID_SOCKET;
+    }
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen));
+    freeaddrinfo(res);
+    bool ok = false;
+    for (int i = 0; i < 12 && !g_phone.stop; ++i) {  // 12 x 250 ms
+        fd_set w, e;
+        FD_ZERO(&w);
+        FD_ZERO(&e);
+        FD_SET(s, &w);
+        FD_SET(s, &e);
+        timeval tv{0, 250000};
+        const int r = select(0, nullptr, &w, &e, &tv);
+        if (r < 0 || FD_ISSET(s, &e)) {
+            *err = L"телефон не принимает подключение";
+            break;
+        }
+        if (r > 0 && FD_ISSET(s, &w)) {
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) {
+        if (err->empty()) *err = L"телефон не отвечает";
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    nb = 0;
+    ioctlsocket(s, FIONBIO, &nb);
+    BOOL nd = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nd), sizeof(nd));
+    DWORD to = 7000;  // the phone sends its state every 2 s, so silence means the link is gone
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
+    int rb = 1 << 20;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rb), sizeof(rb));
+    return s;
+}
+
+// JPEG bytes -> BGRA top-down, rotated clockwise by rot * 90 degrees
+static bool PhoneDecodeJpeg(IWICImagingFactory* f, const uint8_t* data, size_t n, int rot, std::vector<uint8_t>& out,
+                            int* ow, int* oh) {
+    if (!f || !data || n < 4) return false;
+    bool ok = false;
+    IWICStream* st = nullptr;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* fr = nullptr;
+    IWICBitmapFlipRotator* fl = nullptr;
+    IWICFormatConverter* cv = nullptr;
+    do {
+        if (FAILED(f->CreateStream(&st))) break;
+        if (FAILED(st->InitializeFromMemory(const_cast<BYTE*>(data), static_cast<DWORD>(n)))) break;
+        if (FAILED(f->CreateDecoderFromStream(st, nullptr, WICDecodeMetadataCacheOnDemand, &dec))) break;
+        if (FAILED(dec->GetFrame(0, &fr))) break;
+        IWICBitmapSource* src = fr;
+        if (rot & 3) {
+            const WICBitmapTransformOptions t = (rot & 3) == 1   ? WICBitmapTransformRotate90
+                                                : (rot & 3) == 2 ? WICBitmapTransformRotate180
+                                                                 : WICBitmapTransformRotate270;
+            if (FAILED(f->CreateBitmapFlipRotator(&fl)) || FAILED(fl->Initialize(fr, t))) break;
+            src = fl;
+        }
+        if (FAILED(f->CreateFormatConverter(&cv))) break;
+        if (FAILED(cv->Initialize(src, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                  WICBitmapPaletteTypeCustom)))
+            break;
+        UINT w = 0, h = 0;
+        cv->GetSize(&w, &h);
+        if (!w || !h || w > 8192 || h > 8192) break;
+        out.resize(static_cast<size_t>(w) * h * 4);
+        if (FAILED(cv->CopyPixels(nullptr, w * 4, static_cast<UINT>(out.size()), out.data()))) break;
+        *ow = static_cast<int>(w);
+        *oh = static_cast<int>(h);
+        ok = true;
+    } while (false);
+    SafeRelease(cv);
+    SafeRelease(fl);
+    SafeRelease(fr);
+    SafeRelease(dec);
+    SafeRelease(st);
+    return ok;
+}
+
+static void PhoneHandleText(const std::string& t) {
+    if (t.rfind("STATE ", 0) == 0) {
+        const std::wstring st = PhoneW(t.substr(6));
+        bool changed;
+        {
+            std::lock_guard<std::mutex> lk(g_phoneMx);
+            changed = st != g_phoneState;
+            g_phoneState = st;
+        }
+        if (st != L"back" && st != L"front" && st != L"screen") {  // no picture now: show the card, not an old frame
+            std::lock_guard<std::mutex> lk(g_phone.mx);
+            g_phone.buf.clear();
+            ++g_phone.seq;
+        }
+        if (changed && g_phoneNotify) PostMessageW(g_phoneNotify, WM_PHONE_STATE, 0, 0);
+    } else if (t.rfind("RES ", 0) == 0) {
+        const int r = std::atoi(t.c_str() + 4) >= 1080 ? 1 : 0;
+        if (g_phoneResRep.exchange(r) != r && g_phoneNotify) PostMessageW(g_phoneNotify, WM_PHONE_STATE, 0, 0);
+    } else if (t.rfind("NAME ", 0) == 0) {
+        std::lock_guard<std::mutex> lk(g_phoneMx);
+        g_phoneName = PhoneW(t.substr(5));
+    }
+}
+
+static void PhoneThread(std::wstring ip, int src, int res) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* f = nullptr;
+    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f));
+    std::wstring err;
+    SOCKET s = PhoneConnect(ip, &err);
+    if (s != INVALID_SOCKET) {
+        std::lock_guard<std::mutex> lk(g_phoneMx);
+        if (g_phone.stop) {
+            closesocket(s);
+            s = INVALID_SOCKET;
+        } else {
+            g_phoneSock = s;
+            g_phoneErr.clear();
+            g_phoneResRep = res;
+        }
+    }
+    if (s != INVALID_SOCKET) {
+        g_phone.status = 2;
+        PhoneSendSource(src);
+        PhoneSendRes(res);
+        std::vector<uint8_t> jpg, px;
+        int frames = 0;
+        ULONGLONG t0 = GetTickCount64();
+        err = L"связь прервалась";
+        while (!g_phone.stop) {
+            uint8_t hdr[8];
+            if (!PhoneRecvAll(s, hdr, 8)) break;
+            const uint32_t len = static_cast<uint32_t>(hdr[4]) | (static_cast<uint32_t>(hdr[5]) << 8) |
+                                 (static_cast<uint32_t>(hdr[6]) << 16) | (static_cast<uint32_t>(hdr[7]) << 24);
+            if (std::memcmp(hdr, "WVCF", 4) == 0) {
+                uint8_t ext[5];  // width, height (uint16 LE, informational), rotation (0..3, clockwise x 90)
+                if (len > (16u << 20) || !PhoneRecvAll(s, ext, 5)) break;
+                jpg.resize(len);
+                if (len && !PhoneRecvAll(s, jpg.data(), static_cast<int>(len))) break;
+                int w = 0, h = 0;
+                if (PhoneDecodeJpeg(f, jpg.data(), jpg.size(), ext[4] & 3, px, &w, &h)) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_phone.mx);
+                        g_phone.buf.swap(px);
+                        g_phone.w = w;
+                        g_phone.h = h;
+                    }
+                    ++g_phone.seq;
+                    ++frames;
+                }
+            } else if (std::memcmp(hdr, "WVCS", 4) == 0) {
+                if (len > 4096) break;
+                std::string t(len, '\0');
+                if (len && !PhoneRecvAll(s, &t[0], static_cast<int>(len))) break;
+                while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+                PhoneHandleText(t);
+            } else {
+                err = L"неизвестный ответ (это точно WVC Phone?)";
+                break;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now - t0 >= 1000) {
+                g_phoneFpsX10 = static_cast<int>(frames * 10000 / (now - t0));
+                frames = 0;
+                t0 = now;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_phoneMx);
+        if (s != INVALID_SOCKET && g_phoneSock == s) {
+            closesocket(s);
+            g_phoneSock = INVALID_SOCKET;
+        }
+        g_phoneState.clear();
+        if (!g_phone.stop) g_phoneErr = err;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_phone.mx);
+        g_phone.buf.clear();
+    }
+    g_phoneFpsX10 = 0;
+    SafeRelease(f);
+    if (!g_phone.stop) {
+        g_phone.failedAt = GetTickCount64();
+        g_phone.status = 3;
+        if (g_phoneNotify) PostMessageW(g_phoneNotify, WM_PHONE_STATE, 0, 0);
+    }
+    CoUninitialize();
+}
+
+static void PhoneStop() {
+    if (g_phone.th.joinable()) {
+        g_phone.stop = true;
+        {
+            std::lock_guard<std::mutex> lk(g_phoneMx);
+            if (g_phoneSock != INVALID_SOCKET) {  // wakes the blocked recv()
+                closesocket(g_phoneSock);
+                g_phoneSock = INVALID_SOCKET;
+            }
+        }
+        g_phone.th.join();
+    }
+    g_phone.status = 0;
+    g_phone.link.clear();
+    g_phoneFpsX10 = 0;
+    std::lock_guard<std::mutex> lk(g_phoneMx);
+    g_phoneState.clear();
+}
+
+// Called on the UI timer: connects while the phone is shown (or after «Подключить»), retries every 3 s.
+static void PhoneSync() {
+    if (!g_wsaOk) return;
+    Settings s = GetSettings();
+    const int user = g_phoneUser;
+    const bool want = !s.phoneIp.empty() && (user == 1 || (user == 0 && g_streaming && PhoneNeeded(s)));
+    if (g_phone.th.joinable()) {
+        const bool dead = g_phone.status == 3;
+        if (!want || g_phone.link != s.phoneIp || dead) {
+            const ULONGLONG failedAt = g_phone.failedAt;
+            const bool sameIp = g_phone.link == s.phoneIp;
+            PhoneStop();
+            if (dead && sameIp) {
+                g_phone.status = 3;
+                g_phone.failedAt = failedAt;
+            }
+        }
+    }
+    if (want && !g_phone.th.joinable()) {
+        if (g_phone.status == 3 && GetTickCount64() - g_phone.failedAt < 3000) return;  // retry every 3 s
+        g_phone.stop = false;
+        g_phone.status = 1;
+        g_phone.link = s.phoneIp;
+        g_phone.th = std::thread(PhoneThread, s.phoneIp, s.phoneSrc, s.phoneRes);
+    }
+    if (!want && g_phone.status == 3) g_phone.status = 0;
+}
+
+// Broadcast "WVCP?" on every IPv4 network (and 255.255.255.255), collect "WVCP!<name>" for ~2 s
+static void PhoneDiscoverThread(HWND notify) {
+    auto* found = new std::vector<PhoneFound>();
+    SOCKET u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (u != INVALID_SOCKET) {
+        BOOL yes = TRUE;
+        setsockopt(u, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&yes), sizeof(yes));
+        sockaddr_in me{};
+        me.sin_family = AF_INET;
+        bind(u, reinterpret_cast<sockaddr*>(&me), sizeof(me));
+        std::vector<uint32_t> targets{0xFFFFFFFFu};  // host order
+        ULONG size = 32 * 1024;
+        std::vector<uint8_t> abuf(size);
+        auto* aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(abuf.data());
+        ULONG rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                        nullptr, aa, &size);
+        if (rc == ERROR_BUFFER_OVERFLOW) {
+            abuf.resize(size);
+            aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(abuf.data());
+            rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                      nullptr, aa, &size);
+        }
+        if (rc == NO_ERROR) {
+            for (auto* a = aa; a; a = a->Next) {
+                if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
+                    if (!ua->Address.lpSockaddr || ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+                    const UINT8 pl = ua->OnLinkPrefixLength;
+                    if (pl == 0 || pl >= 31) continue;
+                    const uint32_t ipv4 = ntohl(reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr)->sin_addr.s_addr);
+                    const uint32_t mask = pl >= 32 ? 0xFFFFFFFFu : ~((1u << (32 - pl)) - 1u);
+                    const uint32_t bc = ipv4 | ~mask;
+                    if (std::find(targets.begin(), targets.end(), bc) == targets.end()) targets.push_back(bc);
+                }
+            }
+        }
+        const ULONGLONG t0 = GetTickCount64();
+        int sentRounds = 0;
+        while (GetTickCount64() - t0 < 2000) {
+            if (sentRounds < 3 && GetTickCount64() - t0 >= static_cast<ULONGLONG>(sentRounds) * 500) {
+                for (uint32_t t : targets) {
+                    sockaddr_in to{};
+                    to.sin_family = AF_INET;
+                    to.sin_port = htons(kPhoneDiscPort);
+                    to.sin_addr.s_addr = htonl(t);
+                    sendto(u, "WVCP?", 5, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
+                }
+                ++sentRounds;
+            }
+            fd_set r;
+            FD_ZERO(&r);
+            FD_SET(u, &r);
+            timeval tv{0, 100000};
+            if (select(0, &r, nullptr, nullptr, &tv) <= 0) continue;
+            char buf[300];
+            sockaddr_in from{};
+            int fl = sizeof(from);
+            const int n = recvfrom(u, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from), &fl);
+            if (n < 5 || std::memcmp(buf, "WVCP!", 5) != 0) continue;
+            char ipText[64] = {};
+            inet_ntop(AF_INET, &from.sin_addr, ipText, sizeof(ipText));
+            PhoneFound pf;
+            pf.name = PhoneW(std::string(buf + 5, buf + n));
+            if (pf.name.empty()) pf.name = L"Телефон";
+            pf.ip = PhoneW(ipText);
+            bool dup = false;
+            for (const auto& x : *found) dup = dup || x.ip == pf.ip;
+            if (!dup) found->push_back(pf);
+        }
+        closesocket(u);
+    }
+    g_phoneSearching = false;
+    if (!notify || !PostMessageW(notify, WM_PHONE_FOUND, 0, reinterpret_cast<LPARAM>(found))) delete found;
+}
+
+static void PhoneDiscover(HWND notify) {
+    if (!g_wsaOk || g_phoneSearching.exchange(true)) return;
+    std::thread(PhoneDiscoverThread, notify).detach();
+}
+
+static const wchar_t* PhoneStateName(const std::wstring& st) {
+    if (st == L"back") return L"задняя камера";
+    if (st == L"front") return L"передняя камера";
+    if (st == L"screen") return L"экран телефона";
+    if (st == L"need_consent") return L"ждёт разрешения на показ экрана";
+    if (st == L"camera_error") return L"камера недоступна";
+    if (st == L"no_camera_permission") return L"нет разрешения на камеру";
+    return L"…";
+}
+
+// ---------------------------------------------------------------------------
 // Rendering: screen/webcam -> canvas -> rotate/mirror -> overlays -> BGR frame
 // ---------------------------------------------------------------------------
 struct CamImage {
@@ -1338,8 +1770,10 @@ public:
         const RECT* screen2;     // "Экран 2" rectangle or nullptr
         const CamImage* cam;     // webcam frame or nullptr
         const CamImage* media;   // media frame or nullptr
+        const CamImage* phone;   // phone frame or nullptr
         const wchar_t* camMsg;
         const wchar_t* mediaMsg;
+        const wchar_t* phoneMsg;
     };
 
     // false = the screen grab for the big picture failed
@@ -1391,6 +1825,7 @@ public:
 
     void CamChanged() { camFresh = false; }
     void MediaChanged() { mediaFresh = false; }
+    void PhoneChanged() { phoneFresh = false; }
 
 private:
     bool Upload(Surface& surf, bool& fresh, const CamImage& img) {
@@ -1402,18 +1837,19 @@ private:
         return true;
     }
 
-    // kind: 0 screen 1, 1 webcam, 2 media, 3 screen 2. Draws into dst (dw x dh) with zoom and fit.
+    // kind: 0 screen 1, 1 webcam, 2 media, 3 screen 2, 4 phone. Draws into dst (dw x dh) with zoom and fit.
     bool DrawSource(int kind, const Settings& s, const Inputs& in, HDC dst, int dw, int dh, double zoom, int fit,
                     bool cursor) {
-        if (kind == 1 || kind == 2) {
-            const CamImage* img = kind == 1 ? in.cam : in.media;
-            Surface& surf = kind == 1 ? camSurf : mediaSurf;
-            bool& fresh = kind == 1 ? camFresh : mediaFresh;
+        if (kind == 1 || kind == 2 || kind == 4) {
+            const CamImage* img = kind == 1 ? in.cam : kind == 2 ? in.media : in.phone;
+            Surface& surf = kind == 1 ? camSurf : kind == 2 ? mediaSurf : phoneSurf;
+            bool& fresh = kind == 1 ? camFresh : kind == 2 ? mediaFresh : phoneFresh;
             if (img && Upload(surf, fresh, *img)) {
                 FitRect f = ComputeFit(0, 0, img->w, img->h, zoom, fit, dw, dh);
                 StretchBlt(dst, f.dx, f.dy, f.dw, f.dh, surf.dc, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
             } else {
-                DrawCard(dst, dw, dh, kind == 1 ? in.camMsg : in.mediaMsg);
+                const wchar_t* msg = kind == 1 ? in.camMsg : kind == 2 ? in.mediaMsg : in.phoneMsg;
+                DrawCard(dst, dw, dh, msg ? msg : L"Нет картинки");
             }
             return true;
         }
@@ -1527,8 +1963,8 @@ private:
         const int pw = W - TW, ph = H;
         if (pw < 8 || !pipSurf.Ensure(screenDC, pw, ph)) return;
         pipSurf.Clear();
-        const int kind = std::clamp(s.pipSrc, 1, 4) - 1;
-        const int fit = kind == 1 ? 1 : s.fit;
+        const int kind = std::clamp(s.pipSrc, 1, 5) - 1;
+        const int fit = (kind == 1 || kind == 4) ? 1 : s.fit;  // cameras fill their half
         if (!DrawSource(kind, s, in, pipSurf.dc, pw, ph, 1.0, fit, false)) DrawCard(pipSurf.dc, pw, ph, L"Нет картинки");
         GdiFlush();
         for (int y = 0; y < ph; ++y)
@@ -1548,8 +1984,8 @@ private:
         const int pw = r.right - r.left, ph = r.bottom - r.top;
         if (!pipSurf.Ensure(screenDC, pw, ph)) return;
         pipSurf.Clear();
-        // pip kinds 1 screen 1, 2 webcam, 3 media, 4 screen 2 -> source kinds 0..3
-        if (!DrawSource(std::clamp(s.pipSrc, 1, 4) - 1, s, in, pipSurf.dc, pw, ph, 1.0, 1, false))
+        // pip kinds 1 screen 1, 2 webcam, 3 media, 4 screen 2, 5 phone -> source kinds 0..4
+        if (!DrawSource(std::clamp(s.pipSrc, 1, 5) - 1, s, in, pipSurf.dc, pw, ph, 1.0, 1, false))
             DrawCard(pipSurf.dc, pw, ph, L"Нет картинки");
         GdiFlush();
         const int b = (std::max)(2, H / 360);
@@ -1673,9 +2109,9 @@ private:
 
     int W, H;
     HDC screenDC = nullptr;
-    Surface canvas, out, camSurf, mediaSurf, pipSurf, winSurf;
+    Surface canvas, out, camSurf, mediaSurf, phoneSurf, pipSurf, winSurf;
     RECT winRect{};
-    bool camFresh = false, mediaFresh = false;
+    bool camFresh = false, mediaFresh = false, phoneFresh = false;
     MaskCache frameMask, pipMask, pipBorderMask;
     std::wstring logoPath;
     int logoMaxW = 0, logoMaxH = 0, logoW = 0, logoH = 0;
@@ -1705,6 +2141,15 @@ static const wchar_t* WebcamMessage(const Settings& s) {
     switch (g_web.status.load()) {
     case 3: return L"Веб-камера недоступна";
     default: return L"Включаю веб-камеру…";
+    }
+}
+
+static const wchar_t* PhoneMessage(const Settings& s) {
+    if (s.phoneIp.empty()) return L"Телефон не выбран";
+    switch (g_phone.status.load()) {
+    case 1: return L"Подключаюсь к телефону…";
+    case 2: return PhoneStateNow() == L"need_consent" ? L"Разрешите показ экрана на телефоне" : L"Телефон подключён, жду картинку…";
+    default: return L"Телефон не подключён";
     }
 }
 
@@ -1766,9 +2211,9 @@ static void SenderLoop(int W, int H) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     std::vector<uint8_t> frame(static_cast<size_t>(W) * H * 3, 0);
     std::unique_ptr<Renderer> rnd(new Renderer(W, H));
-    std::vector<uint8_t> camBuf, mediaBuf;
-    int camW = 0, camH = 0, mediaW = 0, mediaH = 0;
-    uint64_t camSeq = 0, mediaSeq = 0;
+    std::vector<uint8_t> camBuf, mediaBuf, phoneBuf;
+    int camW = 0, camH = 0, mediaW = 0, mediaH = 0, phoneW = 0, phoneH = 0;
+    uint64_t camSeq = 0, mediaSeq = 0, phoneSeq = 0;
     std::wstring pauseKey;
     int fails = 0, frames = 0;
     ULONGLONG fpsT0 = GetTickCount64(), prevT = 0;
@@ -1783,6 +2228,7 @@ static void SenderLoop(int W, int H) {
             pauseKey.clear();
             camSeq = 0;
             mediaSeq = 0;
+            phoneSeq = 0;
             fails = 0;
         }
         Settings s = GetSettings();
@@ -1801,7 +2247,7 @@ static void SenderLoop(int W, int H) {
         if (live) {
             pauseKey.clear();
             auto fetch = [&](FrameSource& fs, bool need, std::vector<uint8_t>& buf, int& w, int& h, uint64_t& seq,
-                             bool cam, CamImage& img) -> const CamImage* {
+                             int which, CamImage& img) -> const CamImage* {
                 if (!need || fs.status != 2) return nullptr;
                 const uint64_t q = fs.seq;
                 if (q != seq) {
@@ -1810,18 +2256,20 @@ static void SenderLoop(int W, int H) {
                     w = fs.w;
                     h = fs.h;
                     seq = q;
-                    if (cam) rnd->CamChanged(); else rnd->MediaChanged();
+                    if (which == 0) rnd->CamChanged(); else if (which == 1) rnd->MediaChanged(); else rnd->PhoneChanged();
                 }
                 if (buf.empty()) return nullptr;
                 img = CamImage{buf.data(), w, h};
                 return &img;
             };
-            CamImage ci{}, mi{};
+            CamImage ci{}, mi{}, phi{};
             Renderer::Inputs in{};
-            in.cam = fetch(g_web, CamNeeded(s), camBuf, camW, camH, camSeq, true, ci);
-            in.media = fetch(g_media, MediaNeeded(s), mediaBuf, mediaW, mediaH, mediaSeq, false, mi);
+            in.cam = fetch(g_web, CamNeeded(s), camBuf, camW, camH, camSeq, 0, ci);
+            in.media = fetch(g_media, MediaNeeded(s), mediaBuf, mediaW, mediaH, mediaSeq, 1, mi);
+            in.phone = fetch(g_phone, PhoneNeeded(s), phoneBuf, phoneW, phoneH, phoneSeq, 2, phi);
             in.camMsg = WebcamMessage(s);
             in.mediaMsg = MediaMessage(s);
+            in.phoneMsg = PhoneMessage(s);
             RECT src, src2;
             const bool haveScreen = ScreenNeeded(s) && ResolveSource(s, &src);
             const bool haveScreen2 = Screen2Needed(s) && ResolveSource2(s, &src2);
@@ -2768,6 +3216,8 @@ enum {
     IDC_SRC2_HDR, IDC_SRC2_VALUE, IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE,
     IDC_SHOW_HDR, IDC_VIEW_LABEL, IDC_VIEW, IDC_LAYOUT_LABEL, IDC_LAYOUT, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP,
     IDC_CAM_HDR, IDC_CAM_LABEL, IDC_CAMDEV, IDC_CAMMIRROR,
+    IDC_PHONE_HDR, IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, IDC_PHONEIP_LABEL, IDC_PHONE_IP, IDC_PHONE_CONN,
+    IDC_PHONE_BACK, IDC_PHONE_FRONT, IDC_PHONE_SCREEN, IDC_PHONERES_LABEL, IDC_PHONE_RES, IDC_PHONE_STATUS,
     IDC_MEDIA_HDR, IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN, IDC_IMGSEC_LABEL,
     IDC_IMGSEC, IDC_MEDIA_NEXT, IDC_MEDIA_NOW,
     // tab "Кадр"
@@ -2827,7 +3277,7 @@ static int g_expanded = 0;
 
 static bool IsHeaderId(int id) {
     switch (id) {
-    case IDC_SRC_HDR: case IDC_SRC2_HDR: case IDC_SHOW_HDR: case IDC_CAM_HDR: case IDC_MEDIA_HDR:
+    case IDC_SRC_HDR: case IDC_SRC2_HDR: case IDC_SHOW_HDR: case IDC_CAM_HDR: case IDC_MEDIA_HDR: case IDC_PHONE_HDR:
     case IDC_PIP_HDR: case IDC_FRAME_HDR: case IDC_TEXT_HDR: case IDC_LOGO_HDR: case IDC_TRANS_HDR:
     case IDC_FMT_HDR: case IDC_PAUSE_HDR: case IDC_BEH_HDR: case IDC_HK_HDR: case IDC_FILE_HDR:
     case IDC_CAMSYS_HDR: case IDC_SCENE_HDR:
@@ -2938,6 +3388,15 @@ static void LayoutPage(int p) {
         hdr(IDC_CAM_HDR);
         row1(IDC_CAM_LABEL, IDC_CAMDEV, 240);
         chk(IDC_CAMMIRROR);
+        hdr(IDC_PHONE_HDR);
+        row2(IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, 76);
+        P(IDC_PHONEIP_LABEL, pad, y + 4, lw, 20);
+        P(IDC_PHONE_IP, cx, y, cw - 110 - 6, 24);
+        P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
+        y += 32;
+        btns({IDC_PHONE_BACK, IDC_PHONE_FRONT, IDC_PHONE_SCREEN});
+        row1(IDC_PHONERES_LABEL, IDC_PHONE_RES);
+        full(IDC_PHONE_STATUS, 54);
         hdr(IDC_MEDIA_HDR);
         full(IDC_MEDIA_LIST, 104);
         {
@@ -3124,7 +3583,8 @@ static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_CTLCOLORSTATIC) {
             if (IsHeaderId(id))
                 SetTextColor(dc, kHdrText);
-            else if (id == IDC_MEDIA_NOW || id == IDC_LOGO_NAME || id == IDC_SRC_VALUE || id == IDC_SRC2_VALUE)
+            else if (id == IDC_MEDIA_NOW || id == IDC_LOGO_NAME || id == IDC_SRC_VALUE || id == IDC_SRC2_VALUE ||
+                     id == IDC_PHONE_STATUS)
                 SetTextColor(dc, kHintText);
         }
         return reinterpret_cast<LRESULT>(g_brPage);
@@ -3273,8 +3733,10 @@ static void SyncControls() {
     ComboSet(IDC_WINCAP, s.winCapture);
     ComboSet(IDC_VIEW, s.mainSrc);
     ComboSet(IDC_LAYOUT, s.layout);
-    ComboSet(IDC_PIPSRC, std::clamp(s.pipSrc, 1, 4) - 1);
+    ComboSet(IDC_PIPSRC, std::clamp(s.pipSrc, 1, 5) - 1);
     CheckSet(IDC_KEEPCAM, s.keepCamOn);
+    SetTextIfChanged(Ctl(IDC_PHONE_IP), s.phoneIp);
+    ComboSet(IDC_PHONE_RES, s.phoneRes);
     SetTextIfChanged(Ctl(IDC_PAUSETEXT), s.pauseText);
     ComboSet(IDC_PIPCORNER, s.pipCorner);
     SendMessageW(Ctl(IDC_PIPSIZE_UD), UDM_SETPOS32, 0, std::clamp((s.pipW + 50) / 100, 5, 90));
@@ -3304,6 +3766,7 @@ static const wchar_t* SrcKindName(int mainKind) {
     case 1: return L"веб-камера";
     case 2: return L"медиафайлы";
     case 3: return L"Экран 2";
+    case 4: return L"телефон";
     default: return L"Экран 1";
     }
 }
@@ -3342,6 +3805,84 @@ static void UpdateStartButton() {
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
+// --- phone section on «Источники»
+static std::vector<PhoneFound> g_phoneList;  // what the combo shows
+static std::wstring g_phoneNote;             // result of the last search / command while not connected
+
+static bool PhoneWanted(const Settings& s) {
+    const int user = g_phoneUser;
+    return !s.phoneIp.empty() && (user == 1 || (user == 0 && g_streaming && PhoneNeeded(s)));
+}
+
+static void FillPhoneCombo() {
+    Settings s = GetSettings();
+    if (!s.phoneIp.empty()) {
+        bool have = false;
+        for (const auto& p : g_phoneList) have = have || p.ip == s.phoneIp;
+        if (!have) g_phoneList.insert(g_phoneList.begin(), PhoneFound{L"Последний", s.phoneIp});
+    }
+    HWND h = Ctl(IDC_PHONE_LIST);
+    const bool was = g_syncing;
+    g_syncing = true;
+    SendMessageW(h, CB_RESETCONTENT, 0, 0);
+    int sel = -1;
+    for (size_t i = 0; i < g_phoneList.size(); ++i) {
+        const std::wstring t = g_phoneList[i].name + L" — " + g_phoneList[i].ip;
+        SendMessageW(h, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(t.c_str()));
+        if (g_phoneList[i].ip == s.phoneIp) sel = static_cast<int>(i);
+    }
+    SendMessageW(h, CB_SETCURSEL, sel, 0);
+    g_syncing = was;
+}
+
+static void UpdatePhoneUi() {
+    if (!g_main) return;
+    Settings s = GetSettings();
+    std::wstring st, name, err;
+    {
+        std::lock_guard<std::mutex> lk(g_phoneMx);
+        st = g_phoneState;
+        name = g_phoneName;
+        err = g_phoneErr;
+    }
+    const int status = g_phone.status;
+    std::wstring t;
+    if (!g_wsaOk) {
+        t = L"Сеть Windows недоступна: телефон подключить нельзя.";
+    } else if (g_phoneSearching) {
+        t = L"Ищу телефоны в сети…";
+    } else if (status == 2) {
+        t = L"Подключено: " + (name.empty() ? std::wstring(L"телефон") : name) + L" (" + s.phoneIp + L") — " +
+            PhoneStateName(st);
+        if (st == L"need_consent") {
+            t += L". Подтвердите запись экрана на телефоне.";
+        } else {
+            wchar_t b[64];
+            swprintf(b, 64, L", %.1f кадров/с.", g_phoneFpsX10 / 10.0);
+            t += b;
+        }
+    } else if (status == 1) {
+        t = L"Подключаюсь к " + s.phoneIp + L"…";
+    } else if (status == 3) {
+        t = L"Нет связи с " + s.phoneIp + L" (" + err +
+            L"). Пробую снова каждые 3 с. Проверьте: WVC Phone открыт, телефон в той же сети Wi-Fi, WVC разрешён в "
+            L"брандмауэре Windows.";
+    } else if (!g_phoneNote.empty()) {
+        t = g_phoneNote;
+    } else if (s.phoneIp.empty()) {
+        t = L"Откройте WVC Phone на телефоне и нажмите «Найти» или введите IP-адрес с экрана телефона.";
+    } else {
+        t = L"Не подключено. WVC подключится сам, когда «Телефон» выбран источником и идёт трансляция; или нажмите "
+            L"«Подключить».";
+    }
+    SetTextIfChanged(Ctl(IDC_PHONE_STATUS), t);
+    SetTextIfChanged(Ctl(IDC_PHONE_CONN), PhoneWanted(s) ? L"Отключить" : L"Подключить");
+    SetTextIfChanged(Ctl(IDC_PHONE_FIND), g_phoneSearching ? L"Ищу…" : L"Найти");
+    static const wchar_t* names[3] = {L"Задняя камера", L"Передняя камера", L"Экран телефона"};
+    for (int i = 0; i < 3; ++i)
+        SetTextIfChanged(Ctl(IDC_PHONE_BACK + i), (s.phoneSrc == i ? L"● " : L"") + std::wstring(names[i]));
+}
+
 static void UpdateStatus() {
     std::wstring line1;
     if (!g_camDll) {
@@ -3369,6 +3910,10 @@ static void UpdateStatus() {
         line2 = L"Веб-камера недоступна: занята другой программой или отключена. Пробую снова…";
     else if (g_streaming && MediaNeeded(s) && s.media.empty())
         line2 = L"Добавьте медиафайлы на вкладке «Источники».";
+    else if (g_streaming && PhoneNeeded(s) && s.phoneIp.empty())
+        line2 = L"Телефон: нажмите «Найти» или введите IP на вкладке «Источники».";
+    else if (g_streaming && PhoneNeeded(s) && g_phone.status == 3)
+        line2 = L"Телефон не отвечает: проверьте WVC Phone, Wi-Fi и брандмауэр. Пробую снова…";
     else if (g_streaming && g_paused)
         line2 = L"Пауза: в камере картинка паузы. «Продолжить» — вернуть трансляцию.";
     else if (g_streaming && g_sourceLost)
@@ -3393,6 +3938,7 @@ static void UpdateStatus() {
     swprintf(fps, 64, L"%.1f кадров/с", g_fpsX10 / 10.0);
     SetTextIfChanged(Ctl(IDC_FPS_VALUE), g_cam ? fps : L"");
     UpdateSourceLabel();
+    UpdatePhoneUi();
 }
 
 static bool HaveSource() {
@@ -3404,6 +3950,58 @@ static bool HaveSource() {
 static void SyncSources() {
     WebcamSync();
     MediaSync();
+    PhoneSync();
+}
+
+static void ApplyPhoneIp(std::wstring ip) {
+    while (!ip.empty() && iswspace(ip.back())) ip.pop_back();
+    while (!ip.empty() && iswspace(ip.front())) ip.erase(ip.begin());
+    if (ip != GetSettings().phoneIp) {
+        {
+            std::lock_guard<std::mutex> lk(g_setMx);
+            g_set.phoneIp = ip;
+        }
+        SaveSettings();
+        g_phoneNote.clear();
+    }
+    const bool was = g_syncing;
+    g_syncing = true;
+    SetTextIfChanged(Ctl(IDC_PHONE_IP), ip);
+    g_syncing = was;
+    SyncSources();
+    UpdateStatus();
+}
+
+static std::wstring PhoneIpFromEdit() {
+    wchar_t buf[80] = {};
+    GetWindowTextW(Ctl(IDC_PHONE_IP), buf, 80);
+    return buf;
+}
+
+static void TogglePhoneConnection() {
+    ApplyPhoneIp(PhoneIpFromEdit());
+    Settings s = GetSettings();
+    if (PhoneWanted(s)) {
+        g_phoneUser = -1;  // stay disconnected until «Подключить» or the next «Старт»
+        g_phoneNote = L"Отключено.";
+    } else if (s.phoneIp.empty()) {
+        g_phoneNote = L"Введите IP-адрес телефона или нажмите «Найти».";
+    } else {
+        g_phoneUser = 1;
+        g_phoneNote.clear();
+    }
+    SyncSources();
+    UpdateStatus();
+}
+
+static void SetPhoneSource(int src) {
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.phoneSrc = std::clamp(src, 0, 2);
+    }
+    SaveSettings();
+    if (!PhoneSendSource(src)) g_phoneNote = L"Телефон не подключён: источник переключится при подключении.";
+    UpdateStatus();
 }
 
 static void ToggleStreaming() {
@@ -3420,6 +4018,7 @@ static void ToggleStreaming() {
     g_streaming = !g_streaming;
     g_paused = false;
     g_note.clear();
+    if (g_streaming && g_phoneUser == -1) g_phoneUser = 0;  // «Старт» brings back auto-connect
     SyncSources();
     UpdateStartButton();
     UpdateFrame();
@@ -4225,7 +4824,7 @@ static void SwapLayers() {
         std::lock_guard<std::mutex> lk(g_setMx);
         if (g_set.layout == 0) return;
         const int big = g_set.mainSrc;
-        g_set.mainSrc = std::clamp(g_set.pipSrc, 1, 4) - 1;
+        g_set.mainSrc = std::clamp(g_set.pipSrc, 1, 5) - 1;
         g_set.pipSrc = big + 1;
     }
     AfterLayersChanged();
@@ -4237,7 +4836,7 @@ static void ToggleScreens() {
         std::lock_guard<std::mutex> lk(g_setMx);
         const int old = g_set.mainSrc;
         const int now = old == 0 ? 3 : 0;
-        if (g_set.layout != 0 && std::clamp(g_set.pipSrc, 1, 4) == now + 1) g_set.pipSrc = old + 1;
+        if (g_set.layout != 0 && std::clamp(g_set.pipSrc, 1, 5) == now + 1) g_set.pipSrc = old + 1;
         g_set.mainSrc = now;
     }
     AfterLayersChanged();
@@ -4389,7 +4988,7 @@ static void OnHotkey(int action) {
                     g_set.layout = 0;
                 } else {
                     g_set.layout = 1;
-                    if (std::clamp(g_set.pipSrc, 1, 4) == g_set.mainSrc + 1) g_set.pipSrc = g_set.mainSrc == 1 ? 1 : 2;
+                    if (std::clamp(g_set.pipSrc, 1, 5) == g_set.mainSrc + 1) g_set.pipSrc = g_set.mainSrc == 1 ? 1 : 2;
                 }
             }
             if (action == HA_TEXT) g_set.textOn = !g_set.textOn;
@@ -4470,7 +5069,7 @@ static void CreateControls(HWND hwnd) {
                                        WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN, 0, 0, 10, 10, hwnd,
                                        nullptr, g_hInst, nullptr);
     auto shapes = {L"Прямоугольник", L"Скруглённый", L"Круг", L"Шестиугольник", L"Восьмиугольник"};
-    auto kinds = {L"Экран 1", L"Веб-камера", L"Медиафайлы", L"Экран 2"};
+    auto kinds = {L"Экран 1", L"Веб-камера", L"Медиафайлы", L"Экран 2", L"Телефон"};
 
     // ---- tab "Источники"
     g_mkParent = g_pageWnd[0];
@@ -4500,6 +5099,22 @@ static void CreateControls(HWND hwnd) {
     Mk(L"STATIC", L"Устройство:", 0, IDC_CAM_LABEL);
     AddCombo(IDC_CAMDEV, {});
     Mk(L"BUTTON", L"Зеркалить веб-камеру (как в зеркале)", chk, IDC_CAMMIRROR);
+    Mk(L"STATIC", L"Телефон (приложение WVC Phone)", 0, IDC_PHONE_HDR);
+    Mk(L"STATIC", L"Найденные телефоны:", 0, IDC_PHONE_LABEL);
+    AddCombo(IDC_PHONE_LIST, {});
+    Mk(L"BUTTON", L"Найти", btn, IDC_PHONE_FIND);
+    Mk(L"STATIC", L"IP-адрес телефона:", 0, IDC_PHONEIP_LABEL);
+    {
+        HWND pe = Mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_PHONE_IP, WS_EX_CLIENTEDGE);
+        SendMessageW(pe, EM_LIMITTEXT, 64, 0);
+    }
+    Mk(L"BUTTON", L"Подключить", btn, IDC_PHONE_CONN);
+    Mk(L"BUTTON", L"Задняя камера", btn, IDC_PHONE_BACK);
+    Mk(L"BUTTON", L"Передняя камера", btn, IDC_PHONE_FRONT);
+    Mk(L"BUTTON", L"Экран телефона", btn, IDC_PHONE_SCREEN);
+    Mk(L"STATIC", L"Качество с телефона:", 0, IDC_PHONERES_LABEL);
+    AddCombo(IDC_PHONE_RES, {L"720p (быстрее)", L"1080p (чётче)"});
+    Mk(L"STATIC", L"", 0, IDC_PHONE_STATUS);
     Mk(L"STATIC", L"Медиафайлы", 0, IDC_MEDIA_HDR);
     Mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, IDC_MEDIA_LIST, WS_EX_CLIENTEDGE);
     Mk(L"BUTTON", L"Добавить…", btn, IDC_MEDIA_ADD);
@@ -4653,6 +5268,16 @@ static const TipDef kTips[] = {
     {IDC_SWAP, L"Поменять местами главный и второй источник.", HA_SWAP},
     {IDC_CAMDEV, L"Какая веб-камера используется (WVC Camera в списке не показывается).", -1},
     {IDC_CAMMIRROR, L"Отразить веб-камеру по горизонтали, как в зеркале.", -1},
+    {IDC_PHONE_LIST, L"Телефоны с открытым WVC Phone, найденные в вашей сети. Выберите, чтобы подставить IP-адрес.", -1},
+    {IDC_PHONE_FIND, L"Поискать телефоны с WVC Phone в той же сети Wi-Fi (около 2 секунд). Если Windows спросит про "
+                     L"брандмауэр — разрешите доступ для частных сетей.", -1},
+    {IDC_PHONE_IP, L"IP-адрес телефона — он крупно написан в приложении WVC Phone. Можно ввести вручную.", -1},
+    {IDC_PHONE_CONN, L"Подключиться к телефону сейчас или отключиться. Без этой кнопки WVC подключается сам, когда "
+                     L"«Телефон» выбран источником и идёт трансляция.", -1},
+    {IDC_PHONE_BACK, L"Телефон показывает заднюю камеру.", -1},
+    {IDC_PHONE_FRONT, L"Телефон показывает переднюю камеру.", -1},
+    {IDC_PHONE_SCREEN, L"Телефон показывает свой экран. На телефоне нужно один раз подтвердить запись экрана.", -1},
+    {IDC_PHONE_RES, L"Размер картинки с телефона по длинной стороне: 720p — меньше задержка, 1080p — чётче.", -1},
     {IDC_MEDIA_LIST, L"Файлы идут по кругу. Картинки: PNG, JPG, BMP, GIF (анимация). Видео: MP4, MOV, AVI, WMV, MKV — "
                      L"если в Windows есть кодек. Звук не передаётся. Двойной щелчок — показать файл.", -1},
     {IDC_MEDIA_NEXT, L"Перейти к следующему файлу в списке.", HA_MEDIA_NEXT},
@@ -4749,7 +5374,7 @@ static void ResizeForDpi(HWND hwnd) {
 // one combo / checkbox / edit changed -> settings
 static void OnControlChanged(int id) {
     if (g_syncing) return;
-    bool format = false, pause = false, layers = false, media = false;
+    bool format = false, pause = false, layers = false, media = false, phoneRes = false;
     int W, H;
     {
         Settings cur = GetSettings();
@@ -4776,14 +5401,15 @@ static void OnControlChanged(int id) {
         case IDC_MIRROR: s.mirror = CheckGet(id); break;
         case IDC_CURSOR: s.cursor = CheckGet(id); break;
         case IDC_WINCAP: s.winCapture = sel == 1 ? 1 : 0; break;
-        case IDC_VIEW: s.mainSrc = (std::min)(sel, 3); layers = true; break;
+        case IDC_VIEW: s.mainSrc = (std::min)(sel, 4); layers = true; break;
         case IDC_LAYOUT: s.layout = (std::min)(sel, 2); layers = true; break;
         case IDC_PIPSRC:
-            s.pipSrc = std::clamp(sel + 1, 1, 4);
+            s.pipSrc = std::clamp(sel + 1, 1, 5);
             if (s.layout == 0) s.layout = 1;  // picking a second source = show it
             layers = true;
             break;
         case IDC_KEEPCAM: s.keepCamOn = CheckGet(id); layers = true; break;
+        case IDC_PHONE_RES: s.phoneRes = (std::min)(sel, 1); phoneRes = true; break;
         case IDC_PAUSETEXT: {
             wchar_t buf[256] = {};
             GetWindowTextW(Ctl(IDC_PAUSETEXT), buf, 256);
@@ -4842,6 +5468,7 @@ static void OnControlChanged(int id) {
     }
     SaveSettings();
     if (format) RestartCameraForFormat();
+    if (phoneRes) PhoneSendRes(GetSettings().phoneRes);
     if (pause) {
         g_pauseDirty = true;
         if (GetSettings().pauseMode == 3 && GetSettings().pauseImage.empty()) ChoosePauseImage();
@@ -4851,6 +5478,8 @@ static void OnControlChanged(int id) {
         MediaSync();
     }
     if (layers) {
+        if ((id == IDC_VIEW || id == IDC_PIPSRC) && PhoneNeeded(GetSettings()) && g_phoneUser == -1)
+            g_phoneUser = 0;  // the phone was just picked as a source: connect again
         SyncSources();
         UpdateStatus();
         if (id == IDC_PIPSRC) {
@@ -4865,6 +5494,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_main = hwnd;
+        g_phoneNotify = hwnd;
         g_dpi = GetDpiForWindow(hwnd);
         RegisterHotkeys(hwnd);
         MakeFont();
@@ -4876,6 +5506,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SyncControls();
         FillProfileCombo(IniStr(kMainSec, L"LastScene"));
         SetTextIfChanged(Ctl(IDC_HK_LIST), HotkeyListText());
+        FillPhoneCombo();
         {
             const int tabNo = std::clamp(IniInt(kMainSec, L"UiTab", 0), 0, kPages - 1);
             SendMessageW(Ctl(IDC_TAB), TCM_SETCURSEL, tabNo, 0);
@@ -4961,6 +5592,49 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         if (wp >= 1 && wp <= HA_COUNT) OnHotkey(static_cast<int>(wp) - 1);
         return 0;
+    case WM_PHONE_FOUND: {
+        std::unique_ptr<std::vector<PhoneFound>> v(reinterpret_cast<std::vector<PhoneFound>*>(lp));
+        if (!v) return 0;
+        g_phoneList = *v;
+        if (v->empty()) {
+            g_phoneNote = L"Телефон не найден. Проверьте: WVC Phone открыт, телефон и компьютер в одной сети Wi-Fi, WVC "
+                          L"разрешён в брандмауэре Windows (частная сеть). IP можно ввести вручную.";
+        } else {
+            g_phoneNote = L"Найдено телефонов: " + std::to_wstring(v->size()) + L". Выберите в списке и нажмите «Подключить».";
+            const std::wstring cur = GetSettings().phoneIp;
+            bool listed = false;
+            for (const auto& p : *v) listed = listed || p.ip == cur;
+            if (!listed && (cur.empty() || v->size() == 1)) ApplyPhoneIp((*v)[0].ip);
+        }
+        FillPhoneCombo();
+        UpdateStatus();
+        return 0;
+    }
+    case WM_PHONE_STATE: {
+        const std::wstring st = PhoneStateNow();
+        const int src = st == L"back" ? 0 : st == L"front" ? 1 : st == L"screen" ? 2 : -1;
+        if (src >= 0 && src != GetSettings().phoneSrc) {  // switched on the phone: remember it
+            {
+                std::lock_guard<std::mutex> lk(g_setMx);
+                g_set.phoneSrc = src;
+            }
+            SaveSettings();
+        }
+        const int rr = g_phoneResRep;
+        if (g_phone.status == 2 && rr >= 0 && rr != GetSettings().phoneRes) {  // quality changed on the phone
+            {
+                std::lock_guard<std::mutex> lk(g_setMx);
+                g_set.phoneRes = rr;
+            }
+            SaveSettings();
+            g_syncing = true;
+            ComboSet(IDC_PHONE_RES, rr);
+            g_syncing = false;
+        }
+        if (g_phone.status == 2) g_phoneNote.clear();
+        UpdateStatus();
+        return 0;
+    }
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) ShowWindow(hwnd, SW_HIDE);  // live in the tray
         return 0;
@@ -5057,6 +5731,24 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_AUTOSTREAM:
             if (code == BN_CLICKED && !g_syncing) IniSetInt(kMainSec, L"AutoStream", CheckGet(IDC_AUTOSTREAM) ? 1 : 0);
             break;
+        case IDC_PHONE_FIND:
+            g_phoneNote.clear();
+            PhoneDiscover(hwnd);
+            UpdateStatus();
+            break;
+        case IDC_PHONE_CONN: TogglePhoneConnection(); break;
+        case IDC_PHONE_BACK:
+        case IDC_PHONE_FRONT:
+        case IDC_PHONE_SCREEN: SetPhoneSource(id - IDC_PHONE_BACK); break;
+        case IDC_PHONE_LIST:
+            if (code == CBN_SELCHANGE && !g_syncing) {
+                const int sel = ComboSel(IDC_PHONE_LIST);
+                if (sel >= 0 && sel < static_cast<int>(g_phoneList.size())) ApplyPhoneIp(g_phoneList[sel].ip);
+            }
+            break;
+        case IDC_PHONE_IP:
+            if (code == EN_KILLFOCUS && !g_syncing) ApplyPhoneIp(PhoneIpFromEdit());
+            break;
         case IDC_INSTALL: DoInstall(true); break;
         case IDC_UNINSTALL: DoInstall(false); break;
         case IDC_CAMDEV:
@@ -5095,6 +5787,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        g_phoneNotify = nullptr;
         RestoreHiddenWindow();
         UnregisterHotkeys(hwnd);
         KillTimer(hwnd, kTimerStatus);
@@ -5129,6 +5822,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     g_hInst = hInst;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // file dialog, WIC
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    {
+        WSADATA wd;
+        g_wsaOk = WSAStartup(MAKEWORD(2, 2), &wd) == 0;
+    }
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_HOTKEY_CLASS |
                                                   ICC_UPDOWN_CLASS | ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
@@ -5219,7 +5916,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     wc.lpszClassName = L"WVCMain";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC 0.7 — виртуальная камера",
+    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC 0.8 — виртуальная камера",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
                                 940, 660, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
@@ -5248,6 +5945,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     g_streaming = false;
     WebcamStop();
     MediaStop();
+    PhoneStop();
     StopCamera();
     for (HWND f : g_frame)
         if (f) DestroyWindow(f);
@@ -5255,6 +5953,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     if (g_fontBold) DeleteObject(g_fontBold);
     if (g_frameFont) DeleteObject(g_frameFont);
     MFShutdown();
+    if (g_wsaOk) WSACleanup();
     CoUninitialize();
     if (single) CloseHandle(single);
     return 0;

@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+    name: Windows (WVC.zip)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +33,7 @@ jobs:
           Copy-Item build64/bin/Release/WVCCam.dll dist/WVC/
           Copy-Item build32/bin/Release/WVCCam32.dll dist/WVC/
           Copy-Item docs/README-RU.txt dist/WVC/README.txt
+          Copy-Item docs/PHONE-PROTOCOL.md dist/WVC/PHONE-PROTOCOL.md
           Copy-Item third_party/softcam/LICENSE dist/WVC/LICENSE-softcam.txt
           Compress-Archive -Path dist/WVC -DestinationPath dist/WVC.zip -Force
 
@@ -40,12 +42,63 @@ jobs:
           name: WVC
           path: dist/WVC
 
-      - name: Publish "latest" release
-        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WVC-zip
+          path: dist/WVC.zip
+
+  android:
+    name: Android (WVC-Phone.apk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle --no-daemon assembleDebug
+
+      - name: Rename
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/WVC-Phone.apk
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WVC-Phone
+          path: dist/WVC-Phone.apk
+
+  release:
+    name: Publish "latest" release
+    needs: [build, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: WVC-zip
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: WVC-Phone
+          path: dist
+
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          ls -la dist
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest dist/WVC.zip --prerelease --target "$GITHUB_SHA" \
+          gh release create latest dist/WVC.zip dist/WVC-Phone.apk --prerelease --target "$GITHUB_SHA" \
             --title "WVC — сборка $GITHUB_RUN_NUMBER" \
-            --notes "Автоматическая сборка из коммита ${GITHUB_SHA::7}. Скачайте WVC.zip ниже."
+            --notes "Автоматическая сборка из коммита ${GITHUB_SHA::7}. WVC.zip — программа для Windows, WVC-Phone.apk — приложение для Android (телефон как камера)."
