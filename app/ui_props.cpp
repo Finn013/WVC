@@ -786,7 +786,11 @@ void OnCommand(int id, int code) {
 LRESULT CALLBACK PropsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_COMMAND:
-        if (g_ps) OnCommand(LOWORD(wp), HIWORD(wp));
+        if (g_ps) {
+            int id = LOWORD(wp);
+            if (id == IDCANCEL) id = P_CANCEL;  // Esc
+            OnCommand(id, HIWORD(wp));
+        }
         return 0;
     case WM_HSCROLL:
         if (g_ps && !g_ps->syncing) {

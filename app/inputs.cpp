@@ -1337,7 +1337,7 @@ void InputsSync() {
     }
     // a phone the user disconnected stays off until «Подключить» / «Старт»
     for (auto it = want.begin(); it != want.end();) {
-        if (it->first.rfind(L"phone|", 0) == 0 && PhoneUserState(it->first) == -1 && it->second.prio > 0)
+        if (it->first.rfind(L"phone|", 0) == 0 && PhoneUserState(it->first) == -1)
             it = want.erase(it);
         else
             ++it;

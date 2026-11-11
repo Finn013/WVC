@@ -684,7 +684,11 @@ void OnSetCommand(int id, int code) {
 LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_COMMAND:
-        if (g_ss) OnSetCommand(LOWORD(wp), HIWORD(wp));
+        if (g_ss) {
+            int id = LOWORD(wp);
+            if (id == IDCANCEL) id = S_BTNCANCEL;  // Esc
+            OnSetCommand(id, HIWORD(wp));
+        }
         return 0;
     case WM_HSCROLL:
         if (g_ss && !g_ss->syncing) {
