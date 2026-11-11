@@ -10,7 +10,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.View
 import android.view.WindowManager
+import android.widget.FrameLayout
+import androidx.camera.view.PreviewView
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.RadioButton
@@ -39,6 +42,8 @@ class MainActivity : Activity() {
     private lateinit var res720: RadioButton
     private lateinit var res1080: RadioButton
     private lateinit var keepOn: CheckBox
+    private var overlay: PreviewView? = null  // «Камера через экран»: the camera fills the screen
+    private var overlayOn = false
 
     private val ui = Handler(Looper.getMainLooper())
     private var projectionAsked = false
@@ -46,6 +51,7 @@ class MainActivity : Activity() {
 
     private val refresh = object : Runnable {
         override fun run() {
+            syncOverlay()
             updateUi()
             ui.postDelayed(this, 700)
         }
@@ -67,6 +73,15 @@ class MainActivity : Activity() {
         res720 = findViewById(R.id.res720)
         res1080 = findViewById(R.id.res1080)
         keepOn = findViewById(R.id.keepOn)
+        val pv = PreviewView(this).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+            visibility = View.GONE
+            setBackgroundColor(0xFF000000.toInt())
+        }
+        overlay = pv
+        addContentView(pv, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT))
 
         btnBack.setOnClickListener { selectSource("back") }
         btnFront.setOnClickListener { selectSource("front") }
@@ -99,6 +114,7 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        if (overlayOn) hideOverlay()
         StreamService.activity = null
         ui.removeCallbacks(refresh)
         super.onPause()
@@ -115,6 +131,43 @@ class MainActivity : Activity() {
             i.removeExtra(EXTRA_ASK_PROJECTION)
             requestProjection()
         }
+    }
+
+    /** Show the full-screen camera while WVC wants «камера через экран», hide it otherwise. */
+    private fun syncOverlay() {
+        val svc = StreamService.instance
+        val want = svc != null && svc.camThroughScreen && hasCamera()
+        val pv = overlay ?: return
+        if (want && !overlayOn) {
+            overlayOn = true
+            pv.visibility = View.VISIBLE
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_STABLE)
+            svc?.attachPreview(pv.surfaceProvider)
+        } else if (!want && overlayOn) {
+            hideOverlay()
+        }
+    }
+
+    private fun hideOverlay() {
+        overlayOn = false
+        overlay?.visibility = View.GONE
+        window.decorView.systemUiVisibility = 0
+        applyKeepOn()
+        StreamService.instance?.attachPreview(null)
+    }
+
+    override fun onBackPressed() {
+        val svc = StreamService.instance
+        if (overlayOn && svc != null) {  // leave «камера через экран»: the same camera, the normal way
+            val src = if (svc.source == "front_screen") "front" else "back"
+            hideOverlay()
+            selectSource(src)
+            return
+        }
+        super.onBackPressed()
     }
 
     private fun applyKeepOn() {

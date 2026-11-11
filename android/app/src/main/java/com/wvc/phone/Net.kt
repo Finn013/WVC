@@ -57,6 +57,10 @@ object Net {
         "need_consent" -> "ждём разрешения на показ экрана"
         "camera_error" -> "камера недоступна"
         "no_camera_permission" -> "нет разрешения на камеру"
+        "back_screen" -> "задняя камера через экран"
+        "front_screen" -> "передняя камера через экран"
+        "need_activity" -> "откройте WVC Phone (камера через экран)"
+        "encoder_error" -> "нет аппаратного H.264"
         else -> state
     }
 }

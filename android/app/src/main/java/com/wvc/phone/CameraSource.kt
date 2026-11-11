@@ -15,6 +15,7 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -34,6 +35,9 @@ import java.util.concurrent.Executors
  *    to how fast the network takes frames;
  *  - FrameServer send thread: one frame queue, the newest frame wins.
  * The picture is sent as the sensor gives it plus a rotation hint (clockwise, x 90°); WVC turns it upright.
+ *
+ * v0.11: with H.264 the camera draws into the hardware encoder's input surface (CameraX Preview use case), nothing is
+ * copied or compressed by the CPU. «Камера через экран»: the Preview goes to the activity's full-screen view instead.
  */
 class CameraSource(
     private val context: Context,
@@ -46,6 +50,12 @@ class CameraSource(
     private var analysis: ImageAnalysis? = null
     private var wantFront: Boolean? = null  // null = stopped
     private var wantLongSide = 720
+    private var wantH264 = false
+    private var previewTo: Preview.SurfaceProvider? = null
+    private var boundKey = ""
+    private var preview: Preview? = null
+    private var enc: AvcEncoder? = null
+    private val encExecutor: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "wvc-camsurface") }
     @Volatile private var targetRotation = 0  // Surface.ROTATION_*
     @Volatile private var lastFrameAt = 0L
 
@@ -64,10 +74,14 @@ class CameraSource(
 
     val isRunning: Boolean get() = wantFront != null
 
-    /** Main thread. */
-    fun start(front: Boolean, longSide: Int) {
+    /** Main thread. [h264] = into the hardware encoder; [target] = show in a view (camera through the screen). */
+    fun start(front: Boolean, longSide: Int, h264: Boolean = false, target: Preview.SurfaceProvider? = null) {
+        val key = "$front|$longSide|$h264|${target?.hashCode() ?: 0}"
+        if (wantFront != null && key == boundKey && provider != null) return  // already like that
         wantFront = front
         wantLongSide = longSide
+        wantH264 = h264
+        previewTo = target
         val p = provider
         if (p != null) {
             bind(p)
@@ -88,8 +102,12 @@ class CameraSource(
     /** Main thread. */
     fun stop() {
         wantFront = null
+        boundKey = ""
         try { provider?.unbindAll() } catch (_: Exception) {}
         analysis = null
+        preview = null
+        enc?.stop()
+        enc = null
         synchronized(lock) {
             pending?.let { free.add(it) }
             pending = null
@@ -100,11 +118,17 @@ class CameraSource(
     fun setRotation(rotation: Int) {
         targetRotation = rotation
         analysis?.targetRotation = rotation
+        preview?.targetRotation = rotation
+    }
+
+    fun requestKey() {
+        enc?.requestKey()
     }
 
     fun release() {
         stop()
         analyzeExecutor.shutdown()
+        encExecutor.shutdown()
         encoderRunning = false
         synchronized(lock) { lock.notifyAll() }
     }
@@ -141,18 +165,74 @@ class CameraSource(
                     ResolutionStrategy(size, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
                 .build()
             val range = pickFpsRange(p, cam)
-            val a = try {
-                makeAnalysis(selector, range).also { p.bindToLifecycle(owner, cam, it) }
-            } catch (e: Exception) {
-                if (range == null) throw e
-                p.unbindAll()  // the frame-rate hint was refused: bind without it
-                makeAnalysis(selector, null).also { p.bindToLifecycle(owner, cam, it) }
+            enc?.stop()
+            enc = null
+            analysis = null
+            preview = null
+            val target = previewTo
+            if (target != null || wantH264) {
+                val sp = target ?: encoderSurfaceProvider()
+                val pv = try {
+                    makePreview(selector, range, sp).also { p.bindToLifecycle(owner, cam, it) }
+                } catch (e: Exception) {
+                    if (range == null) throw e
+                    p.unbindAll()
+                    makePreview(selector, null, sp).also { p.bindToLifecycle(owner, cam, it) }
+                }
+                preview = pv
+            } else {
+                val a = try {
+                    makeAnalysis(selector, range).also { p.bindToLifecycle(owner, cam, it) }
+                } catch (e: Exception) {
+                    if (range == null) throw e
+                    p.unbindAll()  // the frame-rate hint was refused: bind without it
+                    makeAnalysis(selector, null).also { p.bindToLifecycle(owner, cam, it) }
+                }
+                analysis = a
             }
-            analysis = a
+            boundKey = "$front|$wantLongSide|$wantH264|${target?.hashCode() ?: 0}"
         } catch (e: Exception) {
             onError("camera_error")
         }
     }
+
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun makePreview(selector: ResolutionSelector, range: Range<Int>?, sp: Preview.SurfaceProvider): Preview {
+        val builder = Preview.Builder()
+            .setResolutionSelector(selector)
+            .setTargetRotation(targetRotation)
+        if (range != null) {
+            try {
+                Camera2Interop.Extender(builder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+            } catch (_: Exception) {
+            }
+        }
+        val pv = builder.build()
+        pv.setSurfaceProvider(if (sp is EncoderProvider) encExecutor else ContextCompat.getMainExecutor(context), sp)
+        return pv
+    }
+
+    private inner class EncoderProvider : Preview.SurfaceProvider {
+        override fun onSurfaceRequested(request: androidx.camera.core.SurfaceRequest) {
+            val size = request.resolution
+            val e = AvcEncoder(server) { true }
+            val s = e.start(size.width, size.height)
+            if (s == null) {
+                request.willNotProvideSurface()
+                onError("encoder_error")
+                return
+            }
+            enc?.stop()
+            enc = e
+            request.setTransformationInfoListener(encExecutor) { info ->
+                e.rotation = (info.rotationDegrees / 90) and 3
+            }
+            request.provideSurface(s, encExecutor) { _ -> e.stop() }
+            server.requestKeyFrame()
+        }
+    }
+
+    private fun encoderSurfaceProvider(): Preview.SurfaceProvider = EncoderProvider()
 
     @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     private fun makeAnalysis(selector: ResolutionSelector, range: Range<Int>?): ImageAnalysis {

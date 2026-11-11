@@ -17,6 +17,8 @@ import java.net.Socket
  * Listens on all interfaces, loopback included: over a USB cable WVC comes through `adb forward` from 127.0.0.1.
  * One-frame queue: a frame waits while the previous one is being sent; a newer frame replaces it (latency first).
  * JPEG quality adapts: when frames have to be replaced often (slow Wi-Fi), the encoders are asked for less.
+ * H.264 (after WVC sends "CODEC h264"): every packet is sent in order; when the queue grows too long it is dropped up to
+ * the next key frame (one is requested at once) and the encoder is asked for a lower bitrate.
  */
 class FrameServer(private val listener: Listener, private val deviceName: String) {
 
@@ -46,6 +48,19 @@ class FrameServer(private val listener: Listener, private val deviceName: String
     private var pendingRot = 0
     private val pendingTexts = ArrayList<String>()
     private var sending = false
+
+    // H.264 (guarded by lock)
+    private class Pkt(val data: ByteArray, val flags: Int, val rot: Int, val w: Int, val h: Int, val pts: Long)
+    private val h264q = ArrayDeque<Pkt>()
+    private var h264Bytes = 0
+    private var waitKey = true
+    private var keyRequested = false
+    private var overflows = 0
+    private var maxQueue = 0
+
+    /** WVC asked for H.264 on this connection ("CODEC h264"); reset for every new connection. */
+    @Volatile var h264 = false
+        private set
 
     // adaptive JPEG quality (guarded by lock)
     private var produced = 0
@@ -113,6 +128,67 @@ class FrameServer(private val listener: Listener, private val deviceName: String
         }
     }
 
+    /** Switches the connection to H.264 / back to JPEG (main thread, from the CODEC command). */
+    fun useH264(on: Boolean) {
+        synchronized(lock) {
+            h264 = on
+            h264q.clear()
+            h264Bytes = 0
+            waitKey = true
+            keyRequested = true
+        }
+    }
+
+    fun requestKeyFrame() {
+        synchronized(lock) { keyRequested = true }
+    }
+
+    /** The encoder asks whether it should make a key frame now. */
+    fun takeKeyRequest(): Boolean = synchronized(lock) {
+        val k = keyRequested
+        keyRequested = false
+        k
+    }
+
+    /** Once a second: -1 = the network is behind (lower the bitrate), 1 = it keeps up easily, 0 = leave it. */
+    fun h264Congestion(): Int = synchronized(lock) {
+        val r = when {
+            overflows > 0 || maxQueue > 8 -> -1
+            maxQueue <= 2 -> 1
+            else -> 0
+        }
+        overflows = 0
+        maxQueue = 0
+        r
+    }
+
+    /** One H.264 access unit (Annex-B). [key] = IDR (SPS/PPS in front). */
+    fun sendH264(data: ByteArray, key: Boolean, rotation: Int, width: Int, height: Int, ptsUs: Long) {
+        synchronized(lock) {
+            if (client == null || !h264) return
+            if (waitKey && !key) {
+                keyRequested = true
+                return
+            }
+            if (key) waitKey = false
+            if (h264q.size >= 45 || h264Bytes > 4 * 1024 * 1024) {
+                // the network is far behind: drop what waits, start again at a key frame
+                h264q.clear()
+                h264Bytes = 0
+                overflows++
+                if (!key) {
+                    waitKey = true
+                    keyRequested = true
+                    return
+                }
+            }
+            h264q.addLast(Pkt(data, if (key) 3 else 0, rotation and 3, width, height, ptsUs))
+            h264Bytes += data.size
+            if (h264q.size > maxQueue) maxQueue = h264q.size
+            lock.notifyAll()
+        }
+    }
+
     fun sendText(text: String) {
         synchronized(lock) {
             if (client == null) return
@@ -135,6 +211,9 @@ class FrameServer(private val listener: Listener, private val deviceName: String
         out = null
         pendingFrame = null
         pendingTexts.clear()
+        h264q.clear()
+        h264Bytes = 0
+        h264 = false
         try { c.close() } catch (_: Exception) {}
     }
 
@@ -157,6 +236,9 @@ class FrameServer(private val listener: Listener, private val deviceName: String
                     client = s
                     out = stream
                     qualityOffset = 0
+                    h264 = false
+                    waitKey = true
+                    keyRequested = true
                     lock.notifyAll()
                 }
                 val addr = s.inetAddress?.hostAddress ?: "?"
@@ -194,9 +276,10 @@ class FrameServer(private val listener: Listener, private val deviceName: String
             val h: Int
             val rot: Int
             val texts: List<String>
+            val pkts: List<Pkt>
             val sock: Socket?
             synchronized(lock) {
-                while (running && (client == null || (pendingFrame == null && pendingTexts.isEmpty()))) {
+                while (running && (client == null || (pendingFrame == null && pendingTexts.isEmpty() && h264q.isEmpty()))) {
                     try { lock.wait(1000) } catch (_: InterruptedException) {}
                 }
                 if (!running) return
@@ -210,6 +293,9 @@ class FrameServer(private val listener: Listener, private val deviceName: String
                 texts = ArrayList(pendingTexts)
                 pendingFrame = null
                 pendingTexts.clear()
+                pkts = ArrayList(h264q)
+                h264q.clear()
+                h264Bytes = 0
                 sending = true
             }
             val o = stream
@@ -231,8 +317,22 @@ class FrameServer(private val listener: Listener, private val deviceName: String
                             rot.toByte()))
                         o.write(f, 0, len)
                     }
+                    for (p in pkts) {
+                        o.write(header("WVCH", p.data.size))
+                        val ext = ByteArray(14)
+                        ext[0] = p.flags.toByte()
+                        ext[1] = p.rot.toByte()
+                        ext[2] = (p.w and 0xFF).toByte()
+                        ext[3] = ((p.w shr 8) and 0xFF).toByte()
+                        ext[4] = (p.h and 0xFF).toByte()
+                        ext[5] = ((p.h shr 8) and 0xFF).toByte()
+                        for (i in 0 until 8) ext[6 + i] = ((p.pts shr (8 * i)) and 0xFFL).toByte()
+                        o.write(ext)
+                        o.write(p.data)
+                    }
                     o.flush()
                     if (f != null) framesSent++
+                    framesSent += pkts.size
                 }
             } catch (e: Exception) {
                 val wasCurrent: Boolean

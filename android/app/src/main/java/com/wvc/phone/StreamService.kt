@@ -20,6 +20,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.view.OrientationEventListener
 import android.view.Surface
+import androidx.camera.core.Preview
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
@@ -46,6 +47,8 @@ class StreamService : LifecycleService(), FrameServer.Listener {
 
         /** The visible activity (null when it is in the background). */
         @Volatile var activity: MainActivity? = null
+
+        val SOURCES = listOf("back", "front", "screen", "back_screen", "front_screen")
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -58,7 +61,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
     private var orientation: OrientationEventListener? = null
     private var stopped = false
 
-    /** What should be shown: back / front / screen */
+    /** What should be shown: back / front / screen / back_screen / front_screen (camera through the screen) */
     var source = "back"
         private set
     /** What is shown now (reported to WVC): back / front / screen / need_consent / camera_error ... */
@@ -71,6 +74,12 @@ class StreamService : LifecycleService(), FrameServer.Listener {
     var fps = 0.0
         private set
     val hasProjection: Boolean get() = screen.hasProjection
+    /** WVC asked for H.264 on this connection. */
+    var h264 = false
+        private set
+    /** «Камера через экран»: the activity's full-screen view the camera is shown in. */
+    private var previewTarget: Preview.SurfaceProvider? = null
+    val camThroughScreen: Boolean get() = source.endsWith("_screen")
 
     private var lastFrames = 0
     private var lastTick = 0L
@@ -95,13 +104,18 @@ class StreamService : LifecycleService(), FrameServer.Listener {
         instance = this
         val prefs = getSharedPreferences("wvc", Context.MODE_PRIVATE)
         source = prefs.getString("source", "back") ?: "back"
-        if (source !in listOf("back", "front", "screen")) source = "back"
+        if (source !in SOURCES) source = "back"
         longSide = if (prefs.getInt("res", 720) >= 1080) 1080 else 720
         state = source
         createChannels()
         server = FrameServer(this, Net.deviceName())
-        camera = CameraSource(this, this, server) { err -> main.post { if (source != "screen") setState(err) } }
+        camera = CameraSource(this, this, server) { err ->
+            main.post {
+                if (err == "encoder_error") onEncoderFailed() else if (source != "screen") setState(err)
+            }
+        }
         screen = ScreenSource(this, server) { main.post { onProjectionStopped() } }
+        screen.onEncoderFailed = { main.post { onEncoderFailed() } }
         server.start()
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("wvc-discovery").apply {
@@ -130,7 +144,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
             stopEverything()
             return START_NOT_STICKY
         }
-        intent?.getStringExtra(EXTRA_SOURCE)?.let { if (it in listOf("back", "front", "screen")) saveSource(it) }
+        intent?.getStringExtra(EXTRA_SOURCE)?.let { if (it in SOURCES) saveSource(it) }
         if (!goForeground()) {
             stopEverything()
             return START_NOT_STICKY
@@ -177,7 +191,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
     }
 
     fun setSource(src: String) {
-        if (src !in listOf("back", "front", "screen")) return
+        if (src !in SOURCES) return
         saveSource(src)
         applySource()
     }
@@ -191,7 +205,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
         longSide = r
         getSharedPreferences("wvc", Context.MODE_PRIVATE).edit().putInt("res", r).apply()
         server.sendText("RES $r")
-        if (camera.isRunning) camera.start(source == "front", r)
+        if (camera.isRunning) applySource()
         screen.resize(r)
     }
 
@@ -205,7 +219,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
                     camera.stop()
                     setState("no_camera_permission")
                 } else {
-                    if (connected) camera.start(source == "front", longSide) else camera.stop()
+                    if (connected) camera.start(source == "front", longSide, h264) else camera.stop()
                     setState(source)
                 }
             }
@@ -220,7 +234,53 @@ class StreamService : LifecycleService(), FrameServer.Listener {
                     if (connected) askConsent()
                 }
             }
+            "back_screen", "front_screen" -> {
+                // the camera fills the phone screen (the activity), the screen is what is sent
+                if (!screen.hasProjection) {
+                    camera.stop()
+                    screen.active = false
+                    setState("need_consent")
+                    if (connected) askConsent()
+                    return
+                }
+                val target = previewTarget
+                if (target == null || !hasCameraPermission()) {
+                    camera.stop()
+                    screen.active = false
+                    setState(if (!hasCameraPermission()) "no_camera_permission" else "need_activity")
+                    if (connected) openActivity()
+                    return
+                }
+                camera.start(source == "front_screen", longSide, false, target)
+                screen.active = connected
+                setState(source)
+            }
         }
+    }
+
+    /** The activity shows (or stops showing) the full-screen camera view. */
+    fun attachPreview(target: Preview.SurfaceProvider?) {
+        if (previewTarget === target) return
+        previewTarget = target
+        if (camThroughScreen) applySource()
+    }
+
+    private fun openActivity() {
+        if (activity != null) return
+        try {
+            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        } catch (_: Exception) {
+        }
+    }
+
+    /** No usable H.264 encoder on this phone: tell WVC and go on in JPEG. */
+    private fun onEncoderFailed() {
+        if (!h264) return
+        h264 = false
+        server.useH264(false)
+        server.sendText("CODEC jpeg")
+        screen.setH264(false)
+        applySource()
     }
 
     private fun setState(s: String) {
@@ -266,6 +326,8 @@ class StreamService : LifecycleService(), FrameServer.Listener {
     override fun onClientConnected(address: String) {
         main.post {
             clientAddr = address
+            h264 = false  // WVC 0.11 sends "CODEC h264" first; older WVC gets JPEG as before
+            screen.setH264(false)
             acquireLocks()
             server.sendText("NAME ${Net.deviceName()}")
             server.sendText("RES $longSide")
@@ -292,6 +354,15 @@ class StreamService : LifecycleService(), FrameServer.Listener {
             when (parts[0].uppercase()) {
                 "SRC" -> setSource(arg.lowercase())
                 "RES" -> arg.toIntOrNull()?.let { setResolution(it) }
+                "CODEC" -> {
+                    val on = arg.lowercase() == "h264"
+                    h264 = on
+                    server.useH264(on)
+                    server.sendText(if (on) "CODEC h264" else "CODEC jpeg")
+                    screen.setH264(on)
+                    applySource()
+                }
+                "KEY" -> server.requestKeyFrame()
             }
         }
     }
@@ -339,7 +410,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
             val ip = Net.localIps().firstOrNull()
             "Ожидание WVC…" + if (ip != null) " · IP $ip" else " · нет Wi-Fi (можно по USB)"
         } else {
-            "Подключено ${Net.clientLabel(c)} · ${Net.stateName(state)}"
+            "Подключено ${Net.clientLabel(c)} · ${Net.stateName(state)}" + (if (h264) " · H.264" else "")
         }
     }
 

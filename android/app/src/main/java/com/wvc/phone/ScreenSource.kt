@@ -17,6 +17,7 @@ import java.io.ByteArrayOutputStream
  * Phone screen through MediaProjection -> VirtualDisplay -> ImageReader -> JPEG.
  * The projection stays alive until it is stopped (Android 14: one virtual display per consent),
  * frames are only encoded while [active] is true.
+ * v0.11: with H.264 the virtual display draws straight into the hardware encoder's input surface.
  */
 class ScreenSource(
     private val context: Context,
@@ -33,6 +34,12 @@ class ScreenSource(
     private var longSide = 720
 
     @Volatile var active = false
+        set(v) {
+            if (v && !field) server.requestKeyFrame()
+            field = v
+        }
+    private var h264 = false
+    private val enc = AvcEncoder(server) { active }
     @Volatile private var lastFrameAt = 0L
     private var bitmap: Bitmap? = null
     private val jpegOut = ByteArrayOutputStream(256 * 1024)
@@ -59,9 +66,9 @@ class ScreenSource(
         return try {
             p.registerCallback(callback, h)  // Android 14: before createVirtualDisplay
             val (w, hh, dpi) = targetSize()
-            val r = newReader(w, hh)
+            val surf = outputSurface(w, hh)
             display = p.createVirtualDisplay("WVC", w, hh, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                r.surface, null, h)
+                surf, null, h)
             true
         } catch (e: Exception) {
             try { p.stop() } catch (_: Exception) {}
@@ -76,15 +83,54 @@ class ScreenSource(
         val d = display ?: return
         val (w, h, dpi) = targetSize()
         if (w == curW && h == curH) return
+        retarget(w, h, dpi, d)
+    }
+
+    /** JPEG (ImageReader) or H.264 (encoder surface). Main thread. */
+    fun setH264(on: Boolean) {
+        if (on == h264) return
+        h264 = on
+        val d = display ?: return
+        val (w, h, dpi) = targetSize()
+        retarget(w, h, dpi, d)
+    }
+
+    fun requestKey() {
+        enc.requestKey()
+    }
+
+    private fun retarget(w: Int, h: Int, dpi: Int, d: VirtualDisplay) {
         try {
             val old = reader
-            val r = newReader(w, h)
+            reader = null
+            val oldEnc = enc.isRunning
+            d.surface = null
+            if (oldEnc) enc.stop()
+            val surf = outputSurface(w, h)
             d.resize(w, h, dpi)
-            d.surface = r.surface
-            old?.close()
+            d.surface = surf
+            if (old != null && old !== reader) old.close()
         } catch (_: Exception) {
         }
     }
+
+    /** A new surface for the virtual display: the encoder's, or an ImageReader's (also when the encoder fails). */
+    private fun outputSurface(w: Int, h: Int): android.view.Surface {
+        if (h264) {
+            val s = enc.start(w, h)
+            if (s != null) {
+                curW = w
+                curH = h
+                return s
+            }
+            h264 = false
+            onEncoderFailed()
+        }
+        return newReader(w, h).surface
+    }
+
+    /** Set by the service: called when the phone has no usable H.264 encoder. */
+    var onEncoderFailed: () -> Unit = {}
 
     fun stop() {
         val p = projection
@@ -158,6 +204,7 @@ class ScreenSource(
 
     private fun releaseInternal() {
         active = false
+        enc.stop()
         try { display?.release() } catch (_: Exception) {}
         display = null
         try { reader?.close() } catch (_: Exception) {}
