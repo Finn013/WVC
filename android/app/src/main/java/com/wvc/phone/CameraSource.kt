@@ -4,8 +4,14 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.os.SystemClock
+import android.util.Range
 import android.util.Size
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -19,8 +25,15 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * Back / front camera through CameraX ImageAnalysis: YUV_420_888 -> NV21 -> JPEG.
- * The picture is sent as the sensor gives it plus a rotation hint (clockwise, x 90°), WVC rotates it upright.
+ * Back / front camera through CameraX ImageAnalysis (YUV_420_888, KEEP_ONLY_LATEST).
+ *
+ * v0.10 pipeline, the same on every phone:
+ *  - analyzer thread: copies the frame into a reused NV21 buffer (bulk row copies; the common "semi-planar" layout
+ *    is copied with one get() per row) and closes the image at once — it never waits for encoding or the network;
+ *  - encoder thread: always encodes the newest copied frame (an older one waiting is replaced), JPEG quality adapts
+ *    to how fast the network takes frames;
+ *  - FrameServer send thread: one frame queue, the newest frame wins.
+ * The picture is sent as the sensor gives it plus a rotation hint (clockwise, x 90°); WVC turns it upright.
  */
 class CameraSource(
     private val context: Context,
@@ -28,7 +41,7 @@ class CameraSource(
     private val server: FrameServer,
     private val onError: (String) -> Unit,
 ) {
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val analyzeExecutor: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "wvc-analyze") }
     private var provider: ProcessCameraProvider? = null
     private var analysis: ImageAnalysis? = null
     private var wantFront: Boolean? = null  // null = stopped
@@ -36,8 +49,16 @@ class CameraSource(
     @Volatile private var targetRotation = 0  // Surface.ROTATION_*
     @Volatile private var lastFrameAt = 0L
 
-    private val jpegOut = ByteArrayOutputStream(256 * 1024)
-    private var nv21 = ByteArray(0)
+    // ---- frames between the analyzer and the encoder (guarded by lock)
+    private class Frame(val data: ByteArray, var w: Int, var h: Int, var rot: Int)
+    private val lock = Object()
+    private val free = ArrayList<Frame>()
+    private var pending: Frame? = null
+    private var allocated = 0
+    @Volatile private var encoderRunning = true
+    private val encoderThread = Thread({ encodeLoop() }, "wvc-jpeg").apply { start() }
+
+    // analyzer-thread scratch
     private var rowA = ByteArray(0)
     private var rowB = ByteArray(0)
 
@@ -69,6 +90,10 @@ class CameraSource(
         wantFront = null
         try { provider?.unbindAll() } catch (_: Exception) {}
         analysis = null
+        synchronized(lock) {
+            pending?.let { free.add(it) }
+            pending = null
+        }
     }
 
     /** Device orientation changed (Surface.ROTATION_*). */
@@ -79,30 +104,57 @@ class CameraSource(
 
     fun release() {
         stop()
-        executor.shutdown()
+        analyzeExecutor.shutdown()
+        encoderRunning = false
+        synchronized(lock) { lock.notifyAll() }
     }
 
+    /** Frame rate range for steady ~30 fps: [30,30] when the camera has it, else the closest range ending at 30. */
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun pickFpsRange(p: ProcessCameraProvider, sel: CameraSelector): Range<Int>? {
+        return try {
+            val info = sel.filter(p.availableCameraInfos).firstOrNull() ?: return null
+            val ranges = Camera2CameraInfo.from(info)
+                .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return null
+            val upTo30 = ranges.filter { it.upper in 24..30 }
+            val best = upTo30.maxWithOrNull(compareBy<Range<Int>>({ it.upper }, { it.lower }))
+            best ?: ranges.filter { it.upper >= 24 }.minByOrNull { it.upper }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     private fun bind(p: ProcessCameraProvider) {
         val front = wantFront ?: return
         try {
             p.unbindAll()
-            val size = if (wantLongSide >= 1080) Size(1920, 1080) else Size(1280, 720)
-            val selector = ResolutionSelector.Builder()
-                .setResolutionStrategy(
-                    ResolutionStrategy(size, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
-                .build()
-            val a = ImageAnalysis.Builder()
-                .setResolutionSelector(selector)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                .setTargetRotation(targetRotation)
-                .build()
-            a.setAnalyzer(executor) { img -> analyze(img) }
             val cam = if (front) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
             if (!p.hasCamera(cam)) {
                 onError("camera_error")
                 return
             }
+            // exactly the chosen quality (sensor sizes are landscape); the closest size if the phone lacks it
+            val size = if (wantLongSide >= 1080) Size(1920, 1080) else Size(1280, 720)
+            val selector = ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(size, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+                .build()
+            val builder = ImageAnalysis.Builder()
+                .setResolutionSelector(selector)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .setTargetRotation(targetRotation)
+            val range = pickFpsRange(p, cam)
+            if (range != null) {
+                try {
+                    Camera2Interop.Extender(builder)
+                        .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+                } catch (_: Exception) {
+                }
+            }
+            val a = builder.build()
+            a.setAnalyzer(analyzeExecutor) { img -> analyze(img) }
             p.bindToLifecycle(owner, cam, a)
             analysis = a
         } catch (e: Exception) {
@@ -110,61 +162,143 @@ class CameraSource(
         }
     }
 
+    /** A buffer to copy the next frame into; null = all busy (the frame is dropped). */
+    private fun obtain(size: Int): Frame? = synchronized(lock) {
+        while (free.isNotEmpty()) {
+            val f = free.removeAt(free.size - 1)
+            if (f.data.size == size) return f
+            allocated--  // the quality changed: drop buffers of the old size
+        }
+        if (allocated < 3) {
+            allocated++
+            return Frame(ByteArray(size), 0, 0, 0)
+        }
+        val p = pending  // reuse the frame that is still waiting: a newer one is coming
+        if (p != null && p.data.size == size) {
+            pending = null
+            return p
+        }
+        null
+    }
+
     private fun analyze(img: ImageProxy) {
         try {
+            if (!server.hasClient()) return
             val now = SystemClock.elapsedRealtime()
-            if (now - lastFrameAt < 32 || !server.wantsFrame()) return  // max ~30 fps, never queue
-            lastFrameAt = now
+            if (now - lastFrameAt < 30) return  // ~30 fps at most
             val w = img.width and 1.inv()
             val h = img.height and 1.inv()
             if (w < 2 || h < 2) return
-            toNv21(img, w, h)
-            jpegOut.reset()
-            YuvImage(nv21, ImageFormat.NV21, w, h, null).compressToJpeg(Rect(0, 0, w, h), 80, jpegOut)
-            val bytes = jpegOut.toByteArray()
-            server.sendFrame(bytes, bytes.size, w, h, (img.imageInfo.rotationDegrees / 90) and 3)
+            val f = obtain(w * h * 3 / 2) ?: return
+            if (!toNv21(img, w, h, f.data)) {
+                synchronized(lock) { free.add(f) }
+                return
+            }
+            lastFrameAt = now
+            f.w = w
+            f.h = h
+            f.rot = (img.imageInfo.rotationDegrees / 90) and 3
+            synchronized(lock) {
+                pending?.let { free.add(it) }  // an older frame the encoder has not taken: replaced
+                pending = f
+                lock.notifyAll()
+            }
         } catch (_: Exception) {
         } finally {
             img.close()
         }
     }
 
-    private fun toNv21(img: ImageProxy, w: Int, h: Int) {
-        val need = w * h * 3 / 2
-        if (nv21.size != need) nv21 = ByteArray(need)
-        val yp = img.planes[0]
-        val up = img.planes[1]
-        val vp = img.planes[2]
-        // Y
-        val yb = yp.buffer
+    private fun encodeLoop() {
+        val out = ByteArrayOutputStream(256 * 1024)
+        while (encoderRunning) {
+            val f: Frame = synchronized(lock) {
+                while (encoderRunning && pending == null) {
+                    try { lock.wait(500) } catch (_: InterruptedException) {}
+                }
+                val p = pending
+                pending = null
+                p
+            } ?: continue
+            try {
+                if (server.hasClient()) {
+                    out.reset()
+                    val q = server.jpegQuality(if (f.w * f.h > 1280 * 720) 75 else 80)
+                    YuvImage(f.data, ImageFormat.NV21, f.w, f.h, null).compressToJpeg(Rect(0, 0, f.w, f.h), q, out)
+                    val bytes = out.toByteArray()
+                    server.sendFrame(bytes, bytes.size, f.w, f.h, f.rot)
+                }
+            } catch (_: Exception) {
+            } finally {
+                synchronized(lock) { free.add(f) }
+            }
+        }
+    }
+
+    /** YUV_420_888 -> NV21 (Y plane, then V U interleaved), respecting row and pixel strides. */
+    private fun toNv21(img: ImageProxy, w: Int, h: Int, nv21: ByteArray): Boolean {
+        val planes = img.planes
+        if (planes.size < 3) return false
+        val yp = planes[0]
+        val up = planes[1]
+        val vp = planes[2]
+        // Y: one bulk copy when rows are packed, else one copy per row
+        val yb = yp.buffer.duplicate()
         val yStride = yp.rowStride
-        var pos = 0
         if (yp.pixelStride == 1) {
-            for (row in 0 until h) {
-                yb.position(row * yStride)
-                yb.get(nv21, pos, w)
-                pos += w
+            if (yStride == w && yb.remaining() >= w * h) {
+                yb.position(0)
+                yb.get(nv21, 0, w * h)
+            } else {
+                for (row in 0 until h) {
+                    yb.position(row * yStride)
+                    yb.get(nv21, row * w, w)
+                }
             }
         } else {
+            var pos = 0
             for (row in 0 until h) for (col in 0 until w) nv21[pos++] = yb.get(row * yStride + col * yp.pixelStride)
         }
-        // interleaved V U
-        val ub = up.buffer
-        val vb = vp.buffer
+        val ub = up.buffer.duplicate()
+        val vb = vp.buffer.duplicate()
         val cw = w / 2
         val ch = h / 2
+        val base = w * h
         val uPix = up.pixelStride
         val vPix = vp.pixelStride
-        val rowLen = (cw - 1) * maxOf(uPix, vPix) + 1
-        if (rowA.size < rowLen + 8) {
-            rowA = ByteArray(rowLen + 8)
-            rowB = ByteArray(rowLen + 8)
+        val uRow = up.rowStride
+        val vRow = vp.rowStride
+        // Most phones: semi-planar memory where the V plane already is "V U V U ..." (NV21). Check a few samples.
+        if (uPix == 2 && vPix == 2 && uRow == vRow && isVuInterleaved(ub, vb, vRow, cw, ch)) {
+            val rowBytes = 2 * cw
+            for (row in 0 until ch) {
+                val start = row * vRow
+                val dst = base + row * rowBytes
+                val avail = vb.limit() - start
+                if (avail <= 0) break
+                val n = minOf(rowBytes, avail)
+                vb.position(start)
+                vb.get(nv21, dst, n)
+                if (n < rowBytes) {  // the last U of the last row lies outside the V buffer
+                    val ui = row * uRow + 2 * (cw - 1)
+                    if (ui < ub.limit()) nv21[dst + rowBytes - 1] = ub.get(ui)
+                }
+            }
+            return true
         }
+        // Any other layout (planar I420, NV12 order, padded): row copies, then interleave
+        val rowLenU = (cw - 1) * uPix + 1
+        val rowLenV = (cw - 1) * vPix + 1
+        if (rowA.size < rowLenU || rowB.size < rowLenV) {
+            rowA = ByteArray(maxOf(rowLenU, rowLenV) + 8)
+            rowB = ByteArray(maxOf(rowLenU, rowLenV) + 8)
+        }
+        var pos = base
         for (row in 0 until ch) {
-            val uStart = row * up.rowStride
-            val vStart = row * vp.rowStride
-            val uLen = minOf((cw - 1) * uPix + 1, ub.limit() - uStart)
-            val vLen = minOf((cw - 1) * vPix + 1, vb.limit() - vStart)
+            val uStart = row * uRow
+            val vStart = row * vRow
+            val uLen = minOf(rowLenU, ub.limit() - uStart)
+            val vLen = minOf(rowLenV, vb.limit() - vStart)
             if (uLen <= 0 || vLen <= 0) break
             ub.position(uStart)
             ub.get(rowA, 0, uLen)
@@ -179,8 +313,23 @@ class CameraSource(
                 vi += vPix
             }
         }
-        yb.rewind()
-        ub.rewind()
-        vb.rewind()
+        return true
+    }
+
+    /** true when U[i] == V[i + 1] (same memory, V first) at sample points: the V plane is NV21-ordered. */
+    private fun isVuInterleaved(ub: java.nio.ByteBuffer, vb: java.nio.ByteBuffer, rowStride: Int, cw: Int, ch: Int): Boolean {
+        if (cw < 2 || ch < 1) return false
+        val rows = intArrayOf(0, ch / 3, (2 * ch) / 3, ch - 1)
+        val cols = intArrayOf(0, cw / 4, cw / 2, (3 * cw) / 4, cw - 2)
+        for (r in rows) for (c in cols) {
+            val vi = r * rowStride + 2 * c + 1
+            val ui = r * rowStride + 2 * c
+            if (vi >= vb.limit() || ui >= ub.limit()) return false
+            if (vb.get(vi) != ub.get(ui)) return false
+            val vi2 = r * rowStride + 2 * c + 2  // and V[i + 2] == U[i + 1]
+            val ui2 = r * rowStride + 2 * c + 1
+            if (vi2 < vb.limit() && ui2 < ub.limit() && vb.get(vi2) != ub.get(ui2)) return false
+        }
+        return true
     }
 }

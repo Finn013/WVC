@@ -124,7 +124,7 @@ class ScreenSource(
             b.copyPixelsFromBuffer(buf)
             val src = if (bw != w) Bitmap.createBitmap(b, 0, 0, w, h) else b
             jpegOut.reset()
-            src.compress(Bitmap.CompressFormat.JPEG, 80, jpegOut)
+            src.compress(Bitmap.CompressFormat.JPEG, server.jpegQuality(80), jpegOut)
             if (src !== b) src.recycle()
             val bytes = jpegOut.toByteArray()
             server.sendFrame(bytes, bytes.size, w, h, 0)

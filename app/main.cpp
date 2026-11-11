@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -59,17 +60,27 @@ static const wchar_t* kDll32 = L"WVCCam32.dll";
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
+// Source kinds: 0 Экран 1, 1 веб-камера, 2 медиафайлы, 3 Экран 2, 4 телефон
+static const int kSrcKinds = 5;
+enum { KIND_SCREEN = 0, KIND_CAM = 1, KIND_MEDIA = 2, KIND_SCREEN2 = 3, KIND_PHONE = 4 };
+
+// Frame settings of one source (v0.10: each source has its own)
+struct SrcFrame {
+    int  rot = 0;          // 0..3 = 0/90/180/270 degrees clockwise
+    bool mirror = false;
+    int  zoom = 0;         // index into kZoom (centre zoom)
+    int  fit = 0;          // 0 = fit whole picture (bars), 1 = fill (crop the edges)
+    int  crop[4] = {0, 0, 0, 0};  // cut off edges of the source, % of its size: left, top, right, bottom (0..45)
+};
+
 struct Settings {
     // format (changing it restarts the camera; not part of profiles)
     int  quality = 1;      // 0 = 720p, 1 = 1080p
     int  aspect = 0;       // 0 = 16:9, 1 = 4:3, 2 = 1:1, 3 = 9:16
     int  fps = 30;         // 30 or 60
     // picture
-    bool cursor = false;
-    int  fit = 0;          // 0 = letterbox, 1 = crop
-    int  rotation = 0;     // 0..3 = 0/90/180/270 degrees clockwise
-    bool mirror = false;
-    int  zoom = 0;         // index into kZoom
+    bool cursor = false;   // Экран 1: show the mouse pointer
+    SrcFrame fr[kSrcKinds];  // v0.10: frame settings of each source (rotation, mirror, zoom, crop, fit), by kind
     int  pauseMode = 2;    // 0 = freeze, 1 = black, 2 = text card, 3 = image
     std::wstring pauseImage;
     std::wstring pauseText = L"Скоро вернусь";  // text on the pause card
@@ -114,6 +125,13 @@ struct Settings {
     int  phoneRes = 0;     // 0 = 720p, 1 = 1080p (long side)
     int  phoneConn = 0;    // 0 = Wi-Fi (phoneIp), 1 = USB cable (adb forward)
     std::wstring phoneUsbSerial;  // USB: preferred device serial (empty = the first one found)
+    bool phoneVertical = false;   // v0.10: phone as the main source -> camera switches to 9:16
+    bool srcOn[kSrcKinds] = {true, true, true, false, false};  // v0.10: sources enabled in «Настройки» (Экран 1 always)
+    // v0.10: «Рядом» (in scenes)
+    int  sideSplit = 5000;        // first half's share, 1/10000 (1000..9000)
+    bool sideVertical = false;    // false = left / right, true = top / bottom
+    int  sideX[2] = {0, 0}, sideY[2] = {0, 0};  // pan of each half's picture, 1/10000 of the half
+    int  sideZoom[2] = {10000, 10000};          // scale of each half's picture, 1/10000 (3000..40000)
 };
 
 static const double kZoom[] = {1.0, 1.25, 1.5, 2.0, 3.0, 4.0};
@@ -134,6 +152,11 @@ static bool Screen2Needed(const Settings& s) { return s.mainSrc == 3 || SecondSr
 static bool CamNeeded(const Settings& s) { return s.mainSrc == 1 || SecondSrc(s) == 2; }
 static bool MediaNeeded(const Settings& s) { return s.mainSrc == 2 || SecondSrc(s) == 3; }
 static bool PhoneNeeded(const Settings& s) { return s.mainSrc == 4 || SecondSrc(s) == 5; }
+static bool SrcOn(const Settings& s, int kind) { return kind <= 0 || kind >= kSrcKinds || s.srcOn[kind]; }
+// Camera aspect actually used: «Вертикальная камера для телефона» turns it to 9:16 while the phone is the main source
+static int EffAspect(const Settings& s) {
+    return (s.phoneVertical && s.mainSrc == KIND_PHONE && SrcOn(s, KIND_PHONE)) ? 3 : s.aspect;
+}
 
 // Small window rectangle in output pixels (16:9, or square for circle/hexagon/octagon)
 static RECT PipRect(const Settings& s, int W, int H) {
@@ -171,6 +194,8 @@ static void OutSize(int quality, int aspect, int* w, int* h) {
     *w = sz[quality][aspect][0];
     *h = sz[quality][aspect][1];
 }
+
+static void OutSizeS(const Settings& s, int* w, int* h) { OutSize(s.quality, EffAspect(s), w, h); }
 
 static Settings   g_set;
 static std::mutex g_setMx;
@@ -265,6 +290,8 @@ static std::wstring IniStrDef(const wchar_t* sec, const wchar_t* key, const std:
 }
 
 static RECT PrimaryMonitorRect();
+static std::vector<std::wstring> ProfileNames();
+static std::wstring ProfileSection(const std::wstring& name);
 // "Экран 2" when nothing is saved yet: half of the primary monitor, centred
 static RECT DefaultRegion2() {
     RECT p = PrimaryMonitorRect();
@@ -279,6 +306,123 @@ static void IniSetStr(const wchar_t* sec, const wchar_t* key, const std::wstring
     // GetPrivateProfileString strips surrounding quotes, so quote values that need protecting
     std::wstring q = L"\"" + v + L"\"";
     WritePrivateProfileStringW(sec, key, q.c_str(), IniPath().c_str());
+}
+
+static void FrameKey(wchar_t* buf, int kind, const wchar_t* name) { swprintf(buf, 32, L"Fr%d%ls", kind, name); }
+static const wchar_t* kCropKeys[4] = {L"CropL", L"CropT", L"CropR", L"CropB"};
+
+// v0.10: each source has its own frame settings (Fr<kind>Rot/Mirror/Zoom/Fit/CropL/T/R/B).
+// Older settings and scenes have one set for the main source (Rotation, Mirror, Zoom, Fit): it goes to the screens and
+// media; the webcam keeps «fill» unless it was the main source; the phone starts with «fit» (whole picture).
+static void ReadFrames(const wchar_t* sec, Settings& s) {
+    wchar_t k[32];
+    FrameKey(k, 0, L"Rot");
+    if (IniInt(sec, k, -1) < 0) {
+        const int lRot = IniInt(sec, L"Rotation", -1);
+        if (lRot < 0) return;  // nothing saved here (scene without frame keys): keep the current values
+        SrcFrame g;
+        g.rot = std::clamp(lRot, 0, 3);
+        g.mirror = IniInt(sec, L"Mirror", 0) != 0;
+        g.zoom = std::clamp(IniInt(sec, L"Zoom", 0), 0, kZoomCount - 1);
+        g.fit = std::clamp(IniInt(sec, L"Fit", 0), 0, 1);
+        const int oldMain = IniInt(sec, L"MainSrc", 0);
+        s.fr[KIND_SCREEN] = g;
+        s.fr[KIND_SCREEN2] = g;
+        s.fr[KIND_MEDIA] = g;
+        SrcFrame cam;
+        cam.fit = 1;
+        if (oldMain == KIND_CAM) {
+            cam = g;
+            cam.mirror = false;
+            if (g.mirror) s.camMirror = !s.camMirror;  // the webcam has its own mirror switch
+        }
+        s.fr[KIND_CAM] = cam;
+        s.fr[KIND_PHONE] = SrcFrame{};
+        return;
+    }
+    for (int kind = 0; kind < kSrcKinds; ++kind) {
+        SrcFrame& f = s.fr[kind];
+        FrameKey(k, kind, L"Rot");
+        f.rot = std::clamp(IniInt(sec, k, f.rot), 0, 3);
+        FrameKey(k, kind, L"Mirror");
+        f.mirror = IniInt(sec, k, f.mirror) != 0;
+        FrameKey(k, kind, L"Zoom");
+        f.zoom = std::clamp(IniInt(sec, k, f.zoom), 0, kZoomCount - 1);
+        FrameKey(k, kind, L"Fit");
+        f.fit = std::clamp(IniInt(sec, k, f.fit), 0, 1);
+        for (int e = 0; e < 4; ++e) {
+            FrameKey(k, kind, kCropKeys[e]);
+            f.crop[e] = std::clamp(IniInt(sec, k, f.crop[e]), 0, 45);
+        }
+    }
+}
+
+static void WriteFrames(const wchar_t* sec, const Settings& s) {
+    wchar_t k[32];
+    for (int kind = 0; kind < kSrcKinds; ++kind) {
+        const SrcFrame& f = s.fr[kind];
+        FrameKey(k, kind, L"Rot");
+        IniSetInt(sec, k, f.rot);
+        FrameKey(k, kind, L"Mirror");
+        IniSetInt(sec, k, f.mirror ? 1 : 0);
+        FrameKey(k, kind, L"Zoom");
+        IniSetInt(sec, k, f.zoom);
+        FrameKey(k, kind, L"Fit");
+        IniSetInt(sec, k, f.fit);
+        for (int e = 0; e < 4; ++e) {
+            FrameKey(k, kind, kCropKeys[e]);
+            IniSetInt(sec, k, f.crop[e]);
+        }
+    }
+    // what v0.9 and older understand: the settings of Экран 1
+    IniSetInt(sec, L"Fit", s.fr[KIND_SCREEN].fit);
+    IniSetInt(sec, L"Rotation", s.fr[KIND_SCREEN].rot);
+    IniSetInt(sec, L"Mirror", s.fr[KIND_SCREEN].mirror ? 1 : 0);
+    IniSetInt(sec, L"Zoom", s.fr[KIND_SCREEN].zoom);
+}
+
+// kinds shown by one settings section: main source and the second one (when the layout shows it)
+static void MarkUsedKinds(const wchar_t* sec, bool used[kSrcKinds]) {
+    const int main = IniInt(sec, L"MainSrc", -1);
+    const int view = IniInt(sec, L"View", -1);
+    if (main >= 0 && main < kSrcKinds) used[main] = true;
+    if (main < 0 && view == 1) used[KIND_CAM] = true;
+    if (view == 2) used[KIND_CAM] = true;
+    const int lay = IniInt(sec, L"Layout", -1);
+    const int second = IniInt(sec, L"SecondSrc", -1), pip = IniInt(sec, L"PipSrc", -1);
+    int k2 = -1;
+    if (lay > 0 && second >= 1) k2 = second - 1;
+    else if (lay < 0 && pip >= 1) k2 = pip - 1;
+    if (k2 >= 0 && k2 < kSrcKinds) used[k2] = true;
+}
+
+// v0.10: which sources are switched on. No keys yet: on if the old settings or a scene used the source
+// (or it was set up: a webcam, media files, a phone address); a fresh install starts with webcam and media on.
+static void ReadSourcesOn(const wchar_t* sec, Settings& s) {
+    static const wchar_t* keys[kSrcKinds] = {nullptr, L"SrcWebcam", L"SrcMedia", L"SrcScreen2", L"SrcPhone"};
+    bool need = false;
+    for (int k = 1; k < kSrcKinds; ++k) need = need || IniInt(sec, keys[k], -1) < 0;
+    bool used[kSrcKinds] = {};
+    bool fresh = false;
+    if (need) {
+        fresh = IniInt(sec, L"MainSrc", -1) < 0 && IniInt(sec, L"View", -1) < 0 && IniInt(sec, L"HasRegion", -1) < 0;
+        MarkUsedKinds(sec, used);
+        for (const auto& n : ProfileNames()) MarkUsedKinds(ProfileSection(n).c_str(), used);
+    }
+    for (int k = 1; k < kSrcKinds; ++k) {
+        const int v = IniInt(sec, keys[k], -1);
+        if (v >= 0) {
+            s.srcOn[k] = v != 0;
+            continue;
+        }
+        switch (k) {
+        case KIND_CAM: s.srcOn[k] = fresh || used[k] || !s.camLink.empty(); break;
+        case KIND_MEDIA: s.srcOn[k] = fresh || used[k] || !s.media.empty(); break;
+        case KIND_SCREEN2: s.srcOn[k] = used[k]; break;
+        default: s.srcOn[k] = used[k] || !s.phoneIp.empty() || s.phoneConn == 1; break;
+        }
+    }
+    s.srcOn[0] = true;
 }
 
 // format = also read/write quality, aspect and fps (main section only)
@@ -296,12 +440,9 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
         s.phoneRes = std::clamp(IniInt(sec, L"PhoneRes", s.phoneRes), 0, 1);
         s.phoneConn = std::clamp(IniInt(sec, L"PhoneConn", s.phoneConn), 0, 1);
         s.phoneUsbSerial = IniStr(sec, L"PhoneUsbSerial");
+        s.phoneVertical = IniInt(sec, L"PhoneVertical", s.phoneVertical) != 0;
     }
     s.cursor = IniInt(sec, L"Cursor", s.cursor) != 0;
-    s.fit = std::clamp(IniInt(sec, L"Fit", s.fit), 0, 1);
-    s.rotation = std::clamp(IniInt(sec, L"Rotation", s.rotation), 0, 3);
-    s.mirror = IniInt(sec, L"Mirror", s.mirror) != 0;
-    s.zoom = std::clamp(IniInt(sec, L"Zoom", s.zoom), 0, kZoomCount - 1);
     s.pauseMode = std::clamp(IniInt(sec, L"PauseMode", s.pauseMode), 0, 3);
     s.pauseImage = IniStr(sec, L"PauseImage");
     s.pauseText = IniStrDef(sec, L"PauseText", s.pauseText);
@@ -371,6 +512,20 @@ static void ReadSettings(const wchar_t* sec, Settings& s, bool format) {
     s.logo = IniStr(sec, L"Logo");
     s.logoCorner = std::clamp(IniInt(sec, L"LogoCorner", s.logoCorner), 0, 3);
     s.logoSize = std::clamp(IniInt(sec, L"LogoSize", s.logoSize), 0, 3);
+    ReadFrames(sec, s);
+    // v0.10 «Рядом»: missing keys (older settings / scenes) keep what we have
+    s.sideSplit = std::clamp(IniInt(sec, L"SideSplit", s.sideSplit), 1000, 9000);
+    s.sideVertical = IniInt(sec, L"SideVertical", s.sideVertical) != 0;
+    for (int i = 0; i < 2; ++i) {
+        wchar_t k[24];
+        swprintf(k, 24, L"Side%dX", i + 1);
+        s.sideX[i] = std::clamp(IniInt(sec, k, s.sideX[i]), -10000, 10000);
+        swprintf(k, 24, L"Side%dY", i + 1);
+        s.sideY[i] = std::clamp(IniInt(sec, k, s.sideY[i]), -10000, 10000);
+        swprintf(k, 24, L"Side%dZoom", i + 1);
+        s.sideZoom[i] = std::clamp(IniInt(sec, k, s.sideZoom[i]), 3000, 40000);
+    }
+    if (format) ReadSourcesOn(sec, s);
 }
 
 static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
@@ -387,12 +542,25 @@ static void WriteSettings(const wchar_t* sec, const Settings& s, bool format) {
         IniSetInt(sec, L"PhoneRes", s.phoneRes);
         IniSetInt(sec, L"PhoneConn", s.phoneConn);
         IniSetStr(sec, L"PhoneUsbSerial", s.phoneUsbSerial);
+        IniSetInt(sec, L"PhoneVertical", s.phoneVertical ? 1 : 0);
+        IniSetInt(sec, L"SrcWebcam", s.srcOn[KIND_CAM] ? 1 : 0);
+        IniSetInt(sec, L"SrcMedia", s.srcOn[KIND_MEDIA] ? 1 : 0);
+        IniSetInt(sec, L"SrcScreen2", s.srcOn[KIND_SCREEN2] ? 1 : 0);
+        IniSetInt(sec, L"SrcPhone", s.srcOn[KIND_PHONE] ? 1 : 0);
     }
     IniSetInt(sec, L"Cursor", s.cursor ? 1 : 0);
-    IniSetInt(sec, L"Fit", s.fit);
-    IniSetInt(sec, L"Rotation", s.rotation);
-    IniSetInt(sec, L"Mirror", s.mirror ? 1 : 0);
-    IniSetInt(sec, L"Zoom", s.zoom);
+    WriteFrames(sec, s);
+    IniSetInt(sec, L"SideSplit", s.sideSplit);
+    IniSetInt(sec, L"SideVertical", s.sideVertical ? 1 : 0);
+    for (int i = 0; i < 2; ++i) {
+        wchar_t k[24];
+        swprintf(k, 24, L"Side%dX", i + 1);
+        IniSetInt(sec, k, s.sideX[i]);
+        swprintf(k, 24, L"Side%dY", i + 1);
+        IniSetInt(sec, k, s.sideY[i]);
+        swprintf(k, 24, L"Side%dZoom", i + 1);
+        IniSetInt(sec, k, s.sideZoom[i]);
+    }
     IniSetInt(sec, L"PauseMode", s.pauseMode);
     IniSetStr(sec, L"PauseImage", s.pauseImage);
     IniSetStr(sec, L"PauseText", s.pauseText);
@@ -794,7 +962,7 @@ static std::atomic<bool> g_paused{false};   // streaming, but the camera shows t
 static std::atomic<int>  g_transGen{0};     // bumped by the UI: source / scene changed -> transition
 static void WebcamSync() {
     Settings s = GetSettings();
-    const bool want = ((g_streaming && CamNeeded(s)) || s.keepCamOn) && !s.camLink.empty();
+    const bool want = ((g_streaming && CamNeeded(s)) || s.keepCamOn) && !s.camLink.empty() && SrcOn(s, KIND_CAM);
     if (g_web.th.joinable()) {
         const bool dead = g_web.status == 3;
         if (!want || g_web.link != s.camLink || dead) {
@@ -1149,7 +1317,11 @@ static std::wstring      g_phoneName;                // device model reported by
 static std::wstring      g_phoneState;               // back / front / screen / need_consent / error ...
 static std::wstring      g_phoneErr;                 // why the last connection failed (USB: a whole sentence)
 static std::wstring      g_phoneUsbModel;            // USB: model reported by adb
-static std::atomic<int>  g_phoneFpsX10{0};
+static std::atomic<int>  g_phoneFpsX10{0};             // frames received per second x 10
+static std::atomic<int>  g_phoneDecFpsX10{0};          // frames decoded (ready to show) per second x 10
+static std::atomic<int>  g_phoneCamFpsX10{0};          // new phone frames that reached the camera per second x 10
+static std::atomic<int>  g_phoneWinFpsX10{0};          // new phone frames shown in «Окно телефона» per second x 10
+static std::atomic<bool> g_phoneWinOpen{false};        // «Окно телефона» is open: keep the phone connected
 static std::atomic<int>  g_phoneUser{0};             // 1 = «Подключить», -1 = «Отключить», 0 = only while used
 static std::atomic<bool> g_phoneSearching{false};
 static std::atomic<int>  g_phoneResRep{-1};          // quality the phone reported: 0 = 720p, 1 = 1080p
@@ -1703,7 +1875,44 @@ static void PhoneThread(std::wstring link, int src, int res) {
         g_phone.status = 2;
         PhoneSendSource(src);
         PhoneSendRes(res);
-        std::vector<uint8_t> jpg, px;
+        // v0.10: JPEG decoding runs on its own thread; only the newest received frame is decoded, older ones are dropped
+        std::mutex dmx;
+        std::condition_variable dcv;
+        std::vector<uint8_t> pendingJpg;
+        int pendingRot = 0;
+        bool havePending = false, decStop = false;
+        std::atomic<int> decFrames{0};
+        std::thread decoder([&]() {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            IWICImagingFactory* df = nullptr;
+            CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&df));
+            std::vector<uint8_t> job, px;
+            for (;;) {
+                int rot = 0;
+                {
+                    std::unique_lock<std::mutex> lk(dmx);
+                    dcv.wait(lk, [&] { return decStop || havePending; });
+                    if (decStop) break;
+                    job.swap(pendingJpg);
+                    rot = pendingRot;
+                    havePending = false;
+                }
+                int w = 0, h = 0;
+                if (PhoneDecodeJpeg(df, job.data(), job.size(), rot, px, &w, &h)) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_phone.mx);
+                        g_phone.buf.swap(px);
+                        g_phone.w = w;
+                        g_phone.h = h;
+                    }
+                    ++g_phone.seq;
+                    ++decFrames;
+                }
+            }
+            SafeRelease(df);
+            CoUninitialize();
+        });
+        std::vector<uint8_t> jpg;
         int frames = 0;
         ULONGLONG t0 = GetTickCount64();
         err = L"связь прервалась";
@@ -1718,17 +1927,14 @@ static void PhoneThread(std::wstring link, int src, int res) {
                 if (len > (16u << 20) || !PhoneRecvAll(s, ext, 5)) break;
                 jpg.resize(len);
                 if (len && !PhoneRecvAll(s, jpg.data(), static_cast<int>(len))) break;
-                int w = 0, h = 0;
-                if (PhoneDecodeJpeg(f, jpg.data(), jpg.size(), ext[4] & 3, px, &w, &h)) {
-                    {
-                        std::lock_guard<std::mutex> lk(g_phone.mx);
-                        g_phone.buf.swap(px);
-                        g_phone.w = w;
-                        g_phone.h = h;
-                    }
-                    ++g_phone.seq;
-                    ++frames;
+                {
+                    std::lock_guard<std::mutex> lk(dmx);
+                    pendingJpg.swap(jpg);  // replaces a frame the decoder has not taken yet
+                    pendingRot = ext[4] & 3;
+                    havePending = true;
                 }
+                dcv.notify_one();
+                ++frames;
             } else if (std::memcmp(hdr, "WVCS", 4) == 0) {
                 if (len > 4096) break;
                 std::string t(len, '\0');
@@ -1742,10 +1948,17 @@ static void PhoneThread(std::wstring link, int src, int res) {
             const ULONGLONG now = GetTickCount64();
             if (now - t0 >= 1000) {
                 g_phoneFpsX10 = static_cast<int>(frames * 10000 / (now - t0));
+                g_phoneDecFpsX10 = static_cast<int>(decFrames.exchange(0) * 10000 / (now - t0));
                 frames = 0;
                 t0 = now;
             }
         }
+        {
+            std::lock_guard<std::mutex> lk(dmx);
+            decStop = true;
+        }
+        dcv.notify_one();
+        decoder.join();
     }
     {
         std::lock_guard<std::mutex> lk(g_phoneMx);
@@ -1779,6 +1992,7 @@ static void PhoneThread(std::wstring link, int src, int res) {
         g_phone.buf.clear();
     }
     g_phoneFpsX10 = 0;
+    g_phoneDecFpsX10 = 0;
     SafeRelease(f);
     if (!g_phone.stop) {
         g_phone.failedAt = GetTickCount64();
@@ -1803,6 +2017,7 @@ static void PhoneStop() {
     g_phone.status = 0;
     g_phone.link.clear();
     g_phoneFpsX10 = 0;
+    g_phoneDecFpsX10 = 0;
     std::lock_guard<std::mutex> lk(g_phoneMx);
     g_phoneState.clear();
 }
@@ -1813,7 +2028,8 @@ static std::wstring PhoneLink(const Settings& s) { return s.phoneConn == 1 ? L"u
 static bool PhoneWantedNow(const Settings& s) {
     const int user = g_phoneUser;
     const bool have = s.phoneConn == 1 || !s.phoneIp.empty();
-    return have && (user == 1 || (user == 0 && g_streaming && PhoneNeeded(s)));
+    if (!SrcOn(s, KIND_PHONE)) return false;
+    return have && (user == 1 || (user == 0 && (g_phoneWinOpen || (g_streaming && PhoneNeeded(s)))));
 }
 
 // Called on the UI timer: connects while the phone is shown (or after «Подключить»), retries every 3 s.
@@ -2155,6 +2371,19 @@ struct MaskCache {
     }
 };
 
+// «Рядом»: rectangles of the two halves in output pixels
+static void SideRects(const Settings& s, int W, int H, RECT* a, RECT* b) {
+    if (!s.sideVertical) {
+        const int x = std::clamp(MulDiv(W, std::clamp(s.sideSplit, 1000, 9000), 10000), 8, (std::max)(8, W - 8));
+        *a = RECT{0, 0, x, H};
+        *b = RECT{x, 0, W, H};
+    } else {
+        const int y = std::clamp(MulDiv(H, std::clamp(s.sideSplit, 1000, 9000), 10000), 8, (std::max)(8, H - 8));
+        *a = RECT{0, 0, W, y};
+        *b = RECT{0, y, W, H};
+    }
+}
+
 class Renderer {
 public:
     Renderer(int w, int h) : W(w), H(h) { screenDC = GetDC(nullptr); }
@@ -2177,20 +2406,19 @@ public:
     // false = the screen grab for the big picture failed
     bool Frame(const Settings& s, const Inputs& in, uint8_t* outBGR) {
         if (!screenDC) return false;
-        const bool swap = (s.rotation & 1) != 0;
-        const bool side = s.layout == 2;          // side by side: main source in the left half
-        const int TW = side ? W / 2 : W;
-        const int cw = swap ? H : TW, ch = swap ? TW : H;
-        if (!canvas.Ensure(screenDC, cw, ch) || !out.Ensure(screenDC, W, H)) return false;
-        canvas.Clear();
-        const double zoom = kZoom[std::clamp(s.zoom, 0, kZoomCount - 1)];
-        if (!DrawSource(s.mainSrc, s, in, canvas.dc, cw, ch, zoom, s.fit, s.cursor)) return false;
-        GdiFlush();
-        Convert(s.rotation, s.mirror, TW);
-        if (side)
-            DrawSide(s, in, TW);
-        else if (s.layout == 1)
-            DrawPip(s, in);
+        if (!out.Ensure(screenDC, W, H)) return false;
+        out.Clear();
+        if (s.layout == 2) {  // «Рядом»: two halves, each source with its own frame settings, pan and scale
+            RECT a, b;
+            SideRects(s, W, H, &a, &b);
+            if (!RenderSlot(s.mainSrc, s, in, canvas, a, 0, true)) return false;
+            if (!RenderSlot(std::clamp(s.pipSrc, 1, 5) - 1, s, in, canvas2, b, 1, true))
+                DrawCardAt(out, b.left, b.top, b.right - b.left, b.bottom - b.top, L"Нет картинки");
+            DrawDivider(s, a);
+        } else {
+            if (!RenderSource(s.mainSrc, s, in, canvas, out, 0, 0, W, H, 1.0, 0, 0, s.cursor)) return false;
+            if (s.layout == 1) DrawPip(s, in);
+        }
         if (s.frameShape != 0) ApplyFrameShape(s);
         if (!s.logo.empty()) DrawLogo(s);
         if (s.textOn && !s.text.empty()) DrawTextOverlay(s);
@@ -2235,42 +2463,155 @@ private:
         return true;
     }
 
-    // kind: 0 screen 1, 1 webcam, 2 media, 3 screen 2, 4 phone. Draws into dst (dw x dh) with zoom and fit.
-    bool DrawSource(int kind, const Settings& s, const Inputs& in, HDC dst, int dw, int dh, double zoom, int fit,
-                    bool cursor) {
-        if (kind == 1 || kind == 2 || kind == 4) {
-            const CamImage* img = kind == 1 ? in.cam : kind == 2 ? in.media : in.phone;
-            Surface& surf = kind == 1 ? camSurf : kind == 2 ? mediaSurf : phoneSurf;
-            bool& fresh = kind == 1 ? camFresh : kind == 2 ? mediaFresh : phoneFresh;
-            if (img && Upload(surf, fresh, *img)) {
-                FitRect f = ComputeFit(0, 0, img->w, img->h, zoom, fit, dw, dh);
-                StretchBlt(dst, f.dx, f.dy, f.dw, f.dh, surf.dc, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
-            } else {
-                const wchar_t* msg = kind == 1 ? in.camMsg : kind == 2 ? in.mediaMsg : in.phoneMsg;
-                DrawCard(dst, dw, dh, msg ? msg : L"Нет картинки");
-            }
+    // One half of «Рядом»: pan / scale of that half, then the source with its own frame settings
+    bool RenderSlot(int kind, const Settings& s, const Inputs& in, Surface& cv, const RECT& r, int idx, bool cursor) {
+        const int tw = r.right - r.left, th = r.bottom - r.top;
+        if (tw < 4 || th < 4) return true;
+        const double z = s.sideZoom[idx] / 10000.0;
+        const double px = s.sideX[idx] * tw / 10000.0, py = s.sideY[idx] * th / 10000.0;
+        return RenderSource(kind, s, in, cv, out, r.left, r.top, tw, th, z, px, py, cursor);
+    }
+
+    // Source `kind` (0 screen 1, 1 webcam, 2 media, 3 screen 2, 4 phone) with its own crop, zoom, fit, rotation and
+    // mirror into dst at (ox, oy, tw x th). slotZoom / panX / panY (output pixels) move and scale the picture inside
+    // that rectangle. false = the screen grab failed; a missing camera / phone picture draws its card.
+    bool RenderSource(int kind, const Settings& s, const Inputs& in, Surface& cv, Surface& dst, int ox, int oy, int tw,
+                      int th, double slotZoom, double panX, double panY, bool cursor) {
+        kind = std::clamp(kind, 0, kSrcKinds - 1);
+        const SrcFrame& fr = s.fr[kind];
+        const int rot = fr.rot & 3;
+        const bool mirror = kind == KIND_CAM ? false : fr.mirror;  // the webcam has its own mirror switch
+        const int cw = (rot & 1) ? th : tw, ch = (rot & 1) ? tw : th;
+        if (cw < 1 || ch < 1 || !cv.Ensure(screenDC, cw, ch)) return true;
+        cv.Clear();
+        // pan in output pixels -> canvas pixels (the canvas is rotated / mirrored into the output afterwards)
+        const double mx = mirror ? -panX : panX, my = panY;
+        double px = mx, py = my;
+        switch (rot) {
+        case 1: px = my; py = -mx; break;
+        case 2: px = -mx; py = -my; break;
+        case 3: px = -my; py = mx; break;
+        default: break;
+        }
+        const wchar_t* card = nullptr;
+        if (!DrawSourceRaw(kind, s, in, cv, cw, ch, slotZoom, px, py, cursor, &card)) return false;
+        if (card) {
+            DrawCardAt(dst, ox, oy, tw, th, card);
             return true;
         }
-        const RECT* rp = kind == 3 ? in.screen2 : in.screen;
-        if (!rp) return false;
-        const RECT& r = *rp;
+        GdiFlush();
+        ConvertInto(cv, dst, ox, oy, tw, th, rot, mirror);
+        return true;
+    }
+
+    // Draws the source into the canvas (cw x ch): crop, centre zoom, fit / fill, then slot scale and pan.
+    bool DrawSourceRaw(int kind, const Settings& s, const Inputs& in, Surface& cv, int cw, int ch, double slotZoom,
+                       double panX, double panY, bool cursor, const wchar_t** card) {
+        const SrcFrame& fr = s.fr[kind];
+        const double zoom = kZoom[std::clamp(fr.zoom, 0, kZoomCount - 1)];
         HDC srcDC = screenDC;
+        double sx = 0, sy = 0, sw = 0, sh = 0;
         int ox = 0, oy = 0;  // source DC origin in screen coordinates
-        if (kind == 0 && s.srcMode == 1 && s.winCapture == 1) {
-            if (!GrabWindow(s.srcWindow)) return false;
-            srcDC = winSurf.dc;
-            ox = winRect.left;
-            oy = winRect.top;
+        const bool image = kind == KIND_CAM || kind == KIND_MEDIA || kind == KIND_PHONE;
+        if (image) {
+            const CamImage* img = kind == KIND_CAM ? in.cam : kind == KIND_MEDIA ? in.media : in.phone;
+            Surface& surf = kind == KIND_CAM ? camSurf : kind == KIND_MEDIA ? mediaSurf : phoneSurf;
+            bool& fresh = kind == KIND_CAM ? camFresh : kind == KIND_MEDIA ? mediaFresh : phoneFresh;
+            if (!img || !Upload(surf, fresh, *img)) {
+                const wchar_t* msg = kind == KIND_CAM ? in.camMsg : kind == KIND_MEDIA ? in.mediaMsg : in.phoneMsg;
+                *card = msg ? msg : L"Нет картинки";
+                return true;
+            }
+            srcDC = surf.dc;
+            sw = img->w;
+            sh = img->h;
+        } else {
+            const RECT* rp = kind == KIND_SCREEN2 ? in.screen2 : in.screen;
+            if (!rp) return false;
+            const RECT& r = *rp;
+            if (kind == KIND_SCREEN && s.srcMode == 1 && s.winCapture == 1) {
+                if (!GrabWindow(s.srcWindow)) return false;
+                srcDC = winSurf.dc;
+                ox = winRect.left;
+                oy = winRect.top;
+            }
+            sx = r.left - ox;
+            sy = r.top - oy;
+            sw = r.right - r.left;
+            sh = r.bottom - r.top;
         }
-        FitRect f = ComputeFit(r.left - ox, r.top - oy, r.right - r.left, r.bottom - r.top, zoom, fit, dw, dh);
+        // crop the edges (% of the source)
+        {
+            const double cl = fr.crop[0] / 100.0, ct = fr.crop[1] / 100.0, cr = fr.crop[2] / 100.0, cb = fr.crop[3] / 100.0;
+            const double nw = (std::max)(1.0, sw * (1.0 - cl - cr)), nh = (std::max)(1.0, sh * (1.0 - ct - cb));
+            sx += sw * cl;
+            sy += sh * ct;
+            sw = nw;
+            sh = nh;
+        }
+        FitRect f = ComputeFit(sx, sy, sw, sh, zoom, fr.fit, cw, ch);
+        if (std::fabs(slotZoom - 1.0) > 1e-6 || std::fabs(panX) > 0.5 || std::fabs(panY) > 0.5) {
+            double dx = f.dx, dy = f.dy, dw = f.dw, dh = f.dh;
+            double ssx = f.sx, ssy = f.sy, ssw = f.sw, ssh = f.sh;
+            const double ccx = cw / 2.0, ccy = ch / 2.0;
+            dx = ccx + (dx - ccx) * slotZoom + panX;
+            dy = ccy + (dy - ccy) * slotZoom + panY;
+            dw *= slotZoom;
+            dh *= slotZoom;
+            const double kx = ssw / dw, ky = ssh / dh;
+            if (dx < 0) { const double c = -dx; ssx += c * kx; ssw -= c * kx; dw -= c; dx = 0; }
+            if (dy < 0) { const double c = -dy; ssy += c * ky; ssh -= c * ky; dh -= c; dy = 0; }
+            if (dx + dw > cw) { const double c = dx + dw - cw; ssw -= c * kx; dw -= c; }
+            if (dy + dh > ch) { const double c = dy + dh - ch; ssh -= c * ky; dh -= c; }
+            if (dw < 1 || dh < 1 || ssw < 0.5 || ssh < 0.5) return true;  // moved out of its half: nothing to draw
+            f.dx = static_cast<int>(std::lround(dx));
+            f.dy = static_cast<int>(std::lround(dy));
+            f.dw = (std::max)(1, static_cast<int>(std::lround(dw)));
+            f.dh = (std::max)(1, static_cast<int>(std::lround(dh)));
+            f.sx = static_cast<int>(std::lround(ssx));
+            f.sy = static_cast<int>(std::lround(ssy));
+            f.sw = (std::max)(1, static_cast<int>(std::lround(ssw)));
+            f.sh = (std::max)(1, static_cast<int>(std::lround(ssh)));
+        }
         BOOL ok;
         if (f.dw == f.sw && f.dh == f.sh)
-            ok = BitBlt(dst, f.dx, f.dy, f.dw, f.dh, srcDC, f.sx, f.sy, SRCCOPY);
+            ok = BitBlt(cv.dc, f.dx, f.dy, f.dw, f.dh, srcDC, f.sx, f.sy, SRCCOPY);
         else
-            ok = StretchBlt(dst, f.dx, f.dy, f.dw, f.dh, srcDC, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
-        if (!ok) return false;
-        if (cursor && dst == canvas.dc) DrawCursor(f, ox, oy);
+            ok = StretchBlt(cv.dc, f.dx, f.dy, f.dw, f.dh, srcDC, f.sx, f.sy, f.sw, f.sh, SRCCOPY);
+        if (!ok) return image;  // a failed screen grab is reported; a failed image blit just shows black
+        if (cursor && !image) DrawCursor(cv, f, ox, oy);
         return true;
+    }
+
+    void DrawCardAt(Surface& dst, int ox, int oy, int tw, int th, const wchar_t* text) {
+        if (tw < 1 || th < 1) return;
+        POINT old{};
+        SetViewportOrgEx(dst.dc, ox, oy, &old);
+        const int saved = SaveDC(dst.dc);
+        IntersectClipRect(dst.dc, 0, 0, tw, th);
+        DrawCard(dst.dc, tw, th, text);
+        RestoreDC(dst.dc, saved);
+        SetViewportOrgEx(dst.dc, old.x, old.y, nullptr);
+        GdiFlush();
+    }
+
+    void DrawDivider(const Settings& s, const RECT& a) {
+        const int dv = (std::max)(1, H / 540);
+        GdiFlush();
+        if (!s.sideVertical) {
+            const int x0 = a.right;
+            for (int y = 0; y < H; ++y)
+                for (int x = (std::max)(0, x0 - dv); x < (std::min)(W, x0 + dv); ++x) {
+                    uint8_t* d = out.bits + (static_cast<size_t>(y) * W + x) * 4;
+                    d[0] = d[1] = d[2] = 40;
+                }
+        } else {
+            const int y0 = a.bottom;
+            for (int y = (std::max)(0, y0 - dv); y < (std::min)(H, y0 + dv); ++y) {
+                uint8_t* d = out.bits + static_cast<size_t>(y) * W * 4;
+                for (int x = 0; x < W; ++x, d += 4) d[0] = d[1] = d[2] = 40;
+            }
+        }
     }
 
     // Window straight from its own surface: works when it is covered or moved off screen
@@ -2284,10 +2625,12 @@ private:
         return PrintWindow(hwnd, winSurf.dc, 2 /* PW_RENDERFULLCONTENT */) != FALSE;
     }
 
-    // canvas (BGRA) -> out (BGRA, columns 0..TW-1 of W x H) with clockwise rotation and horizontal mirror
-    void Convert(int rot, bool mirror, int TW) {
-        const int CW = canvas.w, CH = canvas.h;
-        for (int y = 0; y < H; ++y) {
+    // canvas (BGRA) -> dst (BGRA) rectangle (ox, oy, TW x TH) with clockwise rotation and horizontal mirror
+    static void ConvertInto(const Surface& cv, Surface& dst, int ox, int oy, int TW, int TH, int rot, bool mirror) {
+        const int CW = cv.w, CH = cv.h;
+        if (!cv.bits || !dst.bits) return;
+        for (int y = 0; y < TH; ++y) {
+            if (oy + y < 0 || oy + y >= dst.h) continue;
             int cx = 0, cy = 0, ddx = 0, ddy = 0;
             switch (rot & 3) {
             case 0: cx = 0; cy = y; ddx = 1; ddy = 0; break;
@@ -2302,12 +2645,13 @@ private:
                 ddy = -ddy;
             }
             const ptrdiff_t step = static_cast<ptrdiff_t>(ddx) + static_cast<ptrdiff_t>(ddy) * CW;
-            const uint32_t* p = reinterpret_cast<const uint32_t*>(canvas.bits) + static_cast<ptrdiff_t>(cy) * CW + cx;
-            uint32_t* o = reinterpret_cast<uint32_t*>(out.bits) + static_cast<size_t>(y) * W;
+            const uint32_t* p = reinterpret_cast<const uint32_t*>(cv.bits) + static_cast<ptrdiff_t>(cy) * CW + cx;
+            uint32_t* o = reinterpret_cast<uint32_t*>(dst.bits) + static_cast<size_t>(oy + y) * dst.w + ox;
+            const int n = (std::min)(TW, dst.w - ox);
             if (step == 1) {
-                std::memcpy(o, p, static_cast<size_t>(TW) * 4);
+                std::memcpy(o, p, static_cast<size_t>(n) * 4);
             } else {
-                for (int x = 0; x < TW; ++x, p += step) o[x] = *p;
+                for (int x = 0; x < n; ++x, p += step) o[x] = *p;
             }
         }
     }
@@ -2356,35 +2700,14 @@ private:
         BlendMasked(solid.data(), w, h, m, x0, y0);
     }
 
-    // "Рядом": the second source fills the right half (webcam cropped to fill, others follow "fit")
-    void DrawSide(const Settings& s, const Inputs& in, int TW) {
-        const int pw = W - TW, ph = H;
-        if (pw < 8 || !pipSurf.Ensure(screenDC, pw, ph)) return;
-        pipSurf.Clear();
-        const int kind = std::clamp(s.pipSrc, 1, 5) - 1;
-        const int fit = (kind == 1 || kind == 4) ? 1 : s.fit;  // cameras fill their half
-        if (!DrawSource(kind, s, in, pipSurf.dc, pw, ph, 1.0, fit, false)) DrawCard(pipSurf.dc, pw, ph, L"Нет картинки");
-        GdiFlush();
-        for (int y = 0; y < ph; ++y)
-            std::memcpy(out.bits + (static_cast<size_t>(y) * W + TW) * 4, pipSurf.bits + static_cast<size_t>(y) * pw * 4,
-                        static_cast<size_t>(pw) * 4);
-        // thin divider
-        const int dv = (std::max)(1, H / 540);
-        for (int y = 0; y < H; ++y)
-            for (int x = (std::max)(0, TW - dv); x < (std::min)(W, TW + dv); ++x) {
-                uint8_t* d = out.bits + (static_cast<size_t>(y) * W + x) * 4;
-                d[0] = d[1] = d[2] = 40;
-            }
-    }
-
     void DrawPip(const Settings& s, const Inputs& in) {
         RECT r = PipRect(s, W, H);
         const int pw = r.right - r.left, ph = r.bottom - r.top;
         if (!pipSurf.Ensure(screenDC, pw, ph)) return;
         pipSurf.Clear();
         // pip kinds 1 screen 1, 2 webcam, 3 media, 4 screen 2, 5 phone -> source kinds 0..4
-        if (!DrawSource(std::clamp(s.pipSrc, 1, 5) - 1, s, in, pipSurf.dc, pw, ph, 1.0, 1, false))
-            DrawCard(pipSurf.dc, pw, ph, L"Нет картинки");
+        if (!RenderSource(std::clamp(s.pipSrc, 1, 5) - 1, s, in, canvas2, pipSurf, 0, 0, pw, ph, 1.0, 0, 0, false))
+            DrawCardAt(pipSurf, 0, 0, pw, ph, L"Нет картинки");
         GdiFlush();
         const int b = (std::max)(2, H / 360);
         const auto& bm = pipBorderMask.Get(pw + 2 * b, ph + 2 * b, s.pipShape);
@@ -2477,7 +2800,7 @@ private:
         SelectObject(out.dc, old);
     }
 
-    void DrawCursor(const FitRect& f, int ox, int oy) {
+    void DrawCursor(Surface& cv, const FitRect& f, int ox, int oy) {
         CURSORINFO ci{};
         ci.cbSize = sizeof(ci);
         if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
@@ -2497,17 +2820,17 @@ private:
         const int y = static_cast<int>(std::lround((ci.ptScreenPos.y - oy - static_cast<int>(ii.yHotspot) - f.sy) * scale)) + f.dy;
         const int sw = (std::max)(1, static_cast<int>(std::lround(cw * scale)));
         const int sh = (std::max)(1, static_cast<int>(std::lround(ch * scale)));
-        int saved = SaveDC(canvas.dc);
-        IntersectClipRect(canvas.dc, f.dx, f.dy, f.dx + f.dw, f.dy + f.dh);
-        DrawIconEx(canvas.dc, x, y, ci.hCursor, sw, sh, 0, nullptr, DI_NORMAL);
-        RestoreDC(canvas.dc, saved);
+        int saved = SaveDC(cv.dc);
+        IntersectClipRect(cv.dc, f.dx, f.dy, f.dx + f.dw, f.dy + f.dh);
+        DrawIconEx(cv.dc, x, y, ci.hCursor, sw, sh, 0, nullptr, DI_NORMAL);
+        RestoreDC(cv.dc, saved);
         if (ii.hbmColor) DeleteObject(ii.hbmColor);
         if (ii.hbmMask) DeleteObject(ii.hbmMask);
     }
 
     int W, H;
     HDC screenDC = nullptr;
-    Surface canvas, out, camSurf, mediaSurf, phoneSurf, pipSurf, winSurf;
+    Surface canvas, canvas2, out, camSurf, mediaSurf, phoneSurf, pipSurf, winSurf;
     RECT winRect{};
     bool camFresh = false, mediaFresh = false, phoneFresh = false;
     MaskCache frameMask, pipMask, pipBorderMask;
@@ -2523,6 +2846,7 @@ private:
 // Camera + sender thread
 // ---------------------------------------------------------------------------
 static scCamera          g_cam = nullptr;
+static int               g_camW = 0, g_camH = 0, g_camFps = 0;  // format the camera was created with
 static std::thread       g_sender;
 static std::atomic<bool> g_quit{false};
 static std::atomic<bool> g_resetCapture{false};   // recreate GDI objects (display change, resume)
@@ -2613,7 +2937,7 @@ static void SenderLoop(int W, int H) {
     int camW = 0, camH = 0, mediaW = 0, mediaH = 0, phoneW = 0, phoneH = 0;
     uint64_t camSeq = 0, mediaSeq = 0, phoneSeq = 0;
     std::wstring pauseKey;
-    int fails = 0, frames = 0;
+    int fails = 0, frames = 0, phoneShown = 0;
     ULONGLONG fpsT0 = GetTickCount64(), prevT = 0;
     std::vector<uint8_t> trFrom, blend;  // transition: old picture, mixed output
     std::wstring trKey;
@@ -2654,7 +2978,7 @@ static void SenderLoop(int W, int H) {
                     w = fs.w;
                     h = fs.h;
                     seq = q;
-                    if (which == 0) rnd->CamChanged(); else if (which == 1) rnd->MediaChanged(); else rnd->PhoneChanged();
+                    if (which == 0) rnd->CamChanged(); else if (which == 1) rnd->MediaChanged(); else { rnd->PhoneChanged(); ++phoneShown; }
                 }
                 if (buf.empty()) return nullptr;
                 img = CamImage{buf.data(), w, h};
@@ -2716,7 +3040,9 @@ static void SenderLoop(int W, int H) {
         ++frames;
         if (now - fpsT0 >= 1000) {
             g_fpsX10 = static_cast<int>(frames * 10000 / (now - fpsT0));
+            g_phoneCamFpsX10 = static_cast<int>(phoneShown * 10000 / (now - fpsT0));
             frames = 0;
+            phoneShown = 0;
             fpsT0 = now;
         }
 
@@ -2729,9 +3055,12 @@ static bool StartCamera() {
     if (!pCreate || g_cam) return g_cam != nullptr;
     Settings s = GetSettings();
     int W, H;
-    OutSize(s.quality, s.aspect, &W, &H);
+    OutSizeS(s, &W, &H);
     g_cam = pCreate(W, H, static_cast<float>(s.fps));
     if (!g_cam) return false;
+    g_camW = W;
+    g_camH = H;
+    g_camFps = s.fps;
     g_quit = false;
     g_sender = std::thread(SenderLoop, W, H);
     return true;
@@ -3031,20 +3360,18 @@ static COLORREF FrameColor() {
 // Points are pushed outward so the line lies in the part the shape cuts away: it never shows in the camera.
 static bool ScreenShapeOutline(const Settings& s, const RECT& src, std::vector<POINT>* pts, int idx) {
     int W, H;
-    OutSize(s.quality, s.aspect, &W, &H);
-    int shape, areaW, areaH, rot = 0, fit = 1;
-    bool mirror = false;
-    double zoom = 1.0;
+    OutSizeS(s, &W, &H);
+    int shape, areaW, areaH;
     const int mainKind = idx == 1 ? 3 : 0;
+    const SrcFrame& fr = s.fr[mainKind];
+    const int rot = fr.rot & 3, fit = fr.fit;
+    const bool mirror = fr.mirror;
+    const double zoom = kZoom[std::clamp(fr.zoom, 0, kZoomCount - 1)];
     if (s.layout == 2) return false;  // side by side: plain rectangle
     if (s.mainSrc == mainKind) {
         shape = s.frameShape;
         areaW = W;
         areaH = H;
-        rot = s.rotation & 3;
-        mirror = s.mirror;
-        zoom = kZoom[std::clamp(s.zoom, 0, kZoomCount - 1)];
-        fit = s.fit;
     } else if (SecondSrc(s) == mainKind + 1) {
         shape = s.pipShape;
         RECT r = PipRect(s, W, H);
@@ -3057,7 +3384,9 @@ static bool ScreenShapeOutline(const Settings& s, const RECT& src, std::vector<P
     const double sw = src.right - src.left, sh = src.bottom - src.top;
     if (sw < 8 || sh < 8) return false;
     const int cw = (rot & 1) ? areaH : areaW, ch = (rot & 1) ? areaW : areaH;
-    const FitRect f = ComputeFit(0, 0, sw, sh, zoom, fit, cw, ch);
+    const double cl = fr.crop[0] / 100.0, ct = fr.crop[1] / 100.0, cr = fr.crop[2] / 100.0, cb = fr.crop[3] / 100.0;
+    const FitRect f = ComputeFit(sw * cl, sh * ct, (std::max)(1.0, sw * (1 - cl - cr)), (std::max)(1.0, sh * (1 - ct - cb)),
+                                 zoom, fit, cw, ch);
     const double scx = static_cast<double>(f.sw) / f.dw, scy = static_cast<double>(f.sh) / f.dh;
     auto map = [&](double x, double y) {
         if (mirror) x = areaW - x;
@@ -3286,9 +3615,11 @@ static void UpdateOneFrame(int idx, const Settings& s) {
         // repaint when the colour or anything that shapes the outline changes
         static std::wstring lastLook[2];
         wchar_t look[240];
-        swprintf(look, 240, L"%u|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d", static_cast<unsigned>(FrameColor()),
-                 s.mainSrc, SecondSrc(s), s.frameShape, s.pipShape, s.fit, s.zoom, s.rotation, s.mirror ? 1 : 0,
-                 s.quality, s.aspect, s.pipX, s.pipY, s.pipW, s.layout, (ScreenNeeded(s) && Screen2Needed(s)) ? 1 : 0);
+        const SrcFrame& fa = s.fr[idx == 1 ? 3 : 0];
+        swprintf(look, 240, L"%u|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d,%d,%d,%d", static_cast<unsigned>(FrameColor()),
+                 s.mainSrc, SecondSrc(s), s.frameShape, s.pipShape, fa.fit, fa.zoom, fa.rot, fa.mirror ? 1 : 0,
+                 s.quality, EffAspect(s), s.pipX, s.pipY, s.pipW, s.layout, (ScreenNeeded(s) && Screen2Needed(s)) ? 1 : 0,
+                 fa.crop[0], fa.crop[1], fa.crop[2], fa.crop[3]);
         if (!IsWindowVisible(f) || !EqualRect(&cur, &w)) {
             SetWindowPos(f, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top,
                          SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -3351,6 +3682,21 @@ static bool PipPreviewRect(RECT* out) {
     return true;
 }
 
+// «Рядом» in the preview: 1 = the border between the halves, 2 / 3 = inside the first / second half
+static int g_sideDrag = 0;
+static int SideHit(int mx, int my) {
+    Settings s = GetSettings();
+    if (s.layout != 2 || g_pvScale <= 0 || g_pvW <= 0 || g_pvH <= 0) return 0;
+    RECT a, b;
+    SideRects(s, g_pvW, g_pvH, &a, &b);
+    const double fx = (mx - g_pvX) / g_pvScale, fy = (my - g_pvY) / g_pvScale;
+    if (fx < 0 || fy < 0 || fx >= g_pvW || fy >= g_pvH) return 0;
+    const double tol = 6 / g_pvScale;
+    if (!s.sideVertical ? std::fabs(fx - a.right) <= tol : std::fabs(fy - a.bottom) <= tol) return 1;
+    POINT p{static_cast<LONG>(fx), static_cast<LONG>(fy)};
+    return PtInRect(&a, p) ? 2 : 3;
+}
+
 static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_SETCURSOR: {
@@ -3363,12 +3709,54 @@ static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetCursor(LoadCursor(nullptr, cur));
             return TRUE;
         }
+        const int sh = g_sideDrag ? g_sideDrag : SideHit(pt.x, pt.y);
+        if (sh) {
+            const wchar_t* cur = sh == 1 ? (GetSettings().sideVertical ? IDC_SIZENS : IDC_SIZEWE) : IDC_SIZEALL;
+            SetCursor(LoadCursor(nullptr, cur));
+            return TRUE;
+        }
         break;
+    }
+    case WM_LBUTTONDBLCLK: {
+        const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
+        const int sh = SideHit(x, y);
+        if (sh) {
+            {
+                std::lock_guard<std::mutex> lk(g_setMx);
+                if (sh == 1) {
+                    g_set.sideSplit = 5000;  // double click on the border: back to 50 / 50
+                } else {
+                    const int i = sh - 2;    // double click inside a half: its picture back to the middle, 100%
+                    g_set.sideX[i] = g_set.sideY[i] = 0;
+                    g_set.sideZoom[i] = 10000;
+                }
+            }
+            OnPipDragged();
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        POINT pt{static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
+        ScreenToClient(hwnd, &pt);
+        const int sh = SideHit(pt.x, pt.y);
+        if (sh >= 2) {
+            const int i = sh - 2;
+            const double steps = static_cast<double>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA;
+            {
+                std::lock_guard<std::mutex> lk(g_setMx);
+                const double z = g_set.sideZoom[i] * std::pow(1.1, steps);
+                g_set.sideZoom[i] = std::clamp(static_cast<int>(std::lround(z)), 3000, 40000);
+            }
+            OnPipDragged();
+        }
+        return 0;
     }
     case WM_LBUTTONDOWN: {
         const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
+        SetFocus(hwnd);  // the wheel comes here
         g_pipDrag = PipHit(x, y);
-        if (g_pipDrag) {
+        g_sideDrag = g_pipDrag ? 0 : SideHit(x, y);
+        if (g_pipDrag || g_sideDrag) {
             g_pipDragStart = POINT{x, y};
             g_pipDragSet = GetSettings();
             SetCapture(hwnd);
@@ -3376,6 +3764,26 @@ static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE:
+        if (g_sideDrag && g_pvScale > 0) {
+            const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
+            const double dx = (x - g_pipDragStart.x) / g_pvScale, dy = (y - g_pipDragStart.y) / g_pvScale;
+            const Settings& base = g_pipDragSet;
+            RECT a, b;
+            SideRects(base, g_pvW, g_pvH, &a, &b);
+            std::lock_guard<std::mutex> lk(g_setMx);
+            if (g_sideDrag == 1) {
+                const double pos = base.sideVertical ? a.bottom + dy : a.right + dx;
+                const double full = base.sideVertical ? g_pvH : g_pvW;
+                g_set.sideSplit = std::clamp(static_cast<int>(pos * 10000 / full), 1000, 9000);
+            } else {
+                const int i = g_sideDrag - 2;
+                const RECT& r = i == 0 ? a : b;
+                const double rw = (std::max)(1L, r.right - r.left), rh = (std::max)(1L, r.bottom - r.top);
+                g_set.sideX[i] = std::clamp(base.sideX[i] + static_cast<int>(dx * 10000 / rw), -10000, 10000);
+                g_set.sideY[i] = std::clamp(base.sideY[i] + static_cast<int>(dy * 10000 / rh), -10000, 10000);
+            }
+            return 0;
+        }
         if (g_pipDrag && g_pvScale > 0) {
             const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
             const double dx = (x - g_pipDragStart.x) / g_pvScale, dy = (y - g_pipDragStart.y) / g_pvScale;
@@ -3406,8 +3814,9 @@ static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONUP:
     case WM_CAPTURECHANGED:
-        if (g_pipDrag) {
+        if (g_pipDrag || g_sideDrag) {
             g_pipDrag = 0;
+            g_sideDrag = 0;
             if (msg == WM_LBUTTONUP) ReleaseCapture();
             OnPipDragged();
         }
@@ -3447,6 +3856,24 @@ static LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetStretchBltMode(m, HALFTONE);
                 SetBrushOrgEx(m, 0, 0, nullptr);
                 StretchDIBits(m, dx, dy, dw, dh, 0, 0, g_prevW, g_prevH, g_prev.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+            }
+        }
+        {
+            Settings ss = GetSettings();
+            if (ss.layout == 2 && g_pvScale > 0) {  // grip in the middle of the border between the halves
+                RECT a, b;
+                SideRects(ss, g_pvW, g_pvH, &a, &b);
+                HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
+                RECT g;
+                if (!ss.sideVertical) {
+                    const int x = g_pvX + static_cast<int>(a.right * g_pvScale), y = g_pvY + static_cast<int>(g_pvH * g_pvScale / 2);
+                    g = RECT{x - 2, y - 12, x + 2, y + 12};
+                } else {
+                    const int y = g_pvY + static_cast<int>(a.bottom * g_pvScale), x = g_pvX + static_cast<int>(g_pvW * g_pvScale / 2);
+                    g = RECT{x - 12, y - 2, x + 12, y + 2};
+                }
+                FillRect(m, &g, white);
+                DeleteObject(white);
             }
         }
         RECT pr;
@@ -3608,27 +4035,30 @@ static std::wstring HotkeyListText() {
 // ---------------------------------------------------------------------------
 enum {
     IDC_TAB = 100,
-    // tab "Источники"
-    IDC_SRC_HDR, IDC_SRC_VALUE, IDC_SELECT, IDC_MONITOR, IDC_WINDOW,
+    // tab "Источники": one collapsible block per source
+    IDC_SEC_S1, IDC_SELECT, IDC_MONITOR, IDC_WINDOW, IDC_CURSOR,
     IDC_SEC_WIN, IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN,
-    IDC_SRC2_HDR, IDC_SRC2_VALUE, IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE,
-    IDC_SHOW_HDR, IDC_VIEW_LABEL, IDC_VIEW, IDC_LAYOUT_LABEL, IDC_LAYOUT, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP,
-    IDC_CAM_HDR, IDC_CAM_LABEL, IDC_CAMDEV, IDC_CAMMIRROR,
-    IDC_PHONE_HDR, IDC_PHONEMODE_LABEL, IDC_PHONE_MODE, IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, IDC_PHONEIP_LABEL, IDC_PHONE_IP, IDC_PHONE_CONN,
+    IDC_S2_ON, IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE,
+    IDC_SEC_CAM, IDC_CAM_LABEL, IDC_CAMDEV, IDC_CAMMIRROR,
+    IDC_SEC_PHONE, IDC_PHONEMODE_LABEL, IDC_PHONE_MODE, IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, IDC_PHONEIP_LABEL, IDC_PHONE_IP, IDC_PHONE_CONN,
     IDC_PHONE_BACK, IDC_PHONE_FRONT, IDC_PHONE_SCREEN, IDC_PHONERES_LABEL, IDC_PHONE_RES, IDC_PHONE_STATUS,
-    IDC_MEDIA_HDR, IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN, IDC_IMGSEC_LABEL,
+    IDC_PHONE_VERT, IDC_PHONE_VERT_HINT, IDC_PHONE_WIN,
+    IDC_SEC_MEDIA, IDC_MEDIA_LIST, IDC_MEDIA_ADD, IDC_MEDIA_DEL, IDC_MEDIA_UP, IDC_MEDIA_DOWN, IDC_IMGSEC_LABEL,
     IDC_IMGSEC, IDC_MEDIA_NEXT, IDC_MEDIA_NOW,
+    IDC_SRC_HINT,
     // tab "Кадр"
+    IDC_SHOW_HDR, IDC_VIEW_LABEL, IDC_VIEW, IDC_LAYOUT_LABEL, IDC_LAYOUT, IDC_PIPSRC_LABEL, IDC_PIPSRC, IDC_SWAP,
     IDC_PIP_HDR, IDC_PIP_LABEL, IDC_PIPCORNER, IDC_PIPSIZE, IDC_PIPSIZE_UD, IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE,
-    IDC_FRAME_HDR, IDC_FIT_LABEL, IDC_FIT, IDC_SHAPE_LABEL, IDC_FRAMESHAPE,
-    IDC_SEC_FRAME, IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM, IDC_MIRROR, IDC_CURSOR, IDC_SHAPECOLOR_LABEL,
-    IDC_SHAPECOLOR,
-    IDC_TEXT_HDR, IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE,
-    IDC_LOGO_HDR, IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE,
-    IDC_LOGO_NAME,
-    IDC_TRANS_HDR, IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR,
-    // tab "Настройки"
+    IDC_SIDE_HDR, IDC_SIDEDIR_LABEL, IDC_SIDEDIR, IDC_SIDESPLIT_LABEL, IDC_SIDESPLIT, IDC_SIDESPLIT_UD, IDC_SIDE_RESET,
+    IDC_SIDE_HINT,
+    IDC_FRAME_HDR, IDC_SHAPE_LABEL, IDC_FRAMESHAPE, IDC_SHAPECOLOR_LABEL, IDC_SHAPECOLOR,
     IDC_FMT_HDR, IDC_Q_LABEL, IDC_QUALITY, IDC_A_LABEL, IDC_ASPECT, IDC_FPS_LABEL, IDC_FPS,
+    IDC_SEC_TEXT, IDC_TEXT_LABEL, IDC_TEXT, IDC_TEXTON, IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE,
+    IDC_SEC_LOGO, IDC_LOGO_LABEL, IDC_LOGO_PICK, IDC_LOGO_CLEAR, IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE,
+    IDC_LOGO_NAME,
+    IDC_SEC_TRANS, IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR,
+    // tab "Настройки"
+    IDC_SEC_SRCSET, IDC_SRCON_PHONE, IDC_SRCON_SCREEN2, IDC_SRCON_CAM, IDC_SRCON_MEDIA, IDC_SRCON_HINT,
     IDC_PAUSE_HDR, IDC_PAUSE_LABEL, IDC_PAUSE, IDC_PAUSETEXT_LABEL, IDC_PAUSETEXT, IDC_PAUSE_IMG,
     IDC_BEH_HDR, IDC_KEEPCAM, IDC_IDLEFRAME, IDC_AUTOSTART, IDC_AUTOSTREAM,
     IDC_HK_HDR, IDC_HK_EDIT, IDC_SEC_KEYS, IDC_HK_LIST,
@@ -3638,10 +4068,16 @@ enum {
     IDC_PREV_LABEL, IDC_FPS_VALUE, IDC_PREVIEW, IDC_START, IDC_PAUSEBTN, IDC_STATUS,
     IDC_SCENE_HDR, IDC_SCENE1, IDC_SCENE2, IDC_SCENE3, IDC_SCENE4,
     IDC_PROF_LABEL, IDC_PROFILE, IDC_PROF_LOAD, IDC_PROF_SAVE, IDC_PROF_DEL, IDC_PROF_HINT,
-    IDC_LAST_ID
+    // per-source frame settings: IDC_FR_BASE + kind * FR_STRIDE + FR_*
+    IDC_FR_BASE,
+    IDC_LAST_ID = IDC_FR_BASE + 5 * 16
 };
-static_assert(IDC_LAST_ID < 300, "control ids must stay below the tray ids");
-enum { ID_TRAY_OPEN = 300, ID_TRAY_TOGGLE, ID_TRAY_PAUSE, ID_TRAY_EXIT };
+enum { FR_HDR = 0, FR_ROT_L, FR_ROT, FR_ZOOM_L, FR_ZOOM, FR_FIT_L, FR_FIT, FR_CROP_L, FR_CROP0, FR_CROP1, FR_CROP2,
+       FR_CROP3, FR_MIRROR, FR_RESET, FR_STRIDE = 16 };
+static int FrId(int kind, int off) { return IDC_FR_BASE + kind * FR_STRIDE + off; }
+static bool IsFrId(int id) { return id >= IDC_FR_BASE && id < IDC_LAST_ID; }
+static_assert(IDC_LAST_ID < 900, "control ids must stay below the tray ids");
+enum { ID_TRAY_OPEN = 900, ID_TRAY_TOGGLE, ID_TRAY_PAUSE, ID_TRAY_EXIT };
 
 static const UINT WM_TRAY = WM_APP + 1;
 static const UINT_PTR kTimerStatus = 1, kTimerPreview = 2, kTimerFollow = 3;
@@ -3670,15 +4106,31 @@ static int g_scroll[kPages] = {};  // vertical scroll offset, px
 static HWND g_ctl[IDC_LAST_ID + 1] = {};
 
 // collapsible sections (bit per section, saved as UiExpanded)
-enum { SEC_WIN = 1, SEC_FRAME = 2, SEC_KEYS = 4 };
+enum {
+    SEC_WIN = 1, SEC_KEYS = 4,  // 2 was «Кадр → Дополнительно» (v0.7-0.9)
+    SEC_S1 = 8, SEC_CAM = 16, SEC_MEDIA = 32, SEC_PHONE = 64, SEC_TEXT = 128, SEC_LOGO = 256, SEC_TRANS = 512,
+    SEC_SRCSET = 1024,
+    SEC_ALL = SEC_WIN | SEC_KEYS | SEC_S1 | SEC_CAM | SEC_MEDIA | SEC_PHONE | SEC_TEXT | SEC_LOGO | SEC_TRANS | SEC_SRCSET
+};
 static int g_expanded = 0;
 
+// bold block titles (source blocks are buttons that open / close, Экран 2 is a check box)
 static bool IsHeaderId(int id) {
     switch (id) {
-    case IDC_SRC_HDR: case IDC_SRC2_HDR: case IDC_SHOW_HDR: case IDC_CAM_HDR: case IDC_MEDIA_HDR: case IDC_PHONE_HDR:
-    case IDC_PIP_HDR: case IDC_FRAME_HDR: case IDC_TEXT_HDR: case IDC_LOGO_HDR: case IDC_TRANS_HDR:
+    case IDC_SHOW_HDR: case IDC_PIP_HDR: case IDC_SIDE_HDR: case IDC_FRAME_HDR:
     case IDC_FMT_HDR: case IDC_PAUSE_HDR: case IDC_BEH_HDR: case IDC_HK_HDR: case IDC_FILE_HDR:
     case IDC_CAMSYS_HDR: case IDC_SCENE_HDR:
+    case IDC_SEC_S1: case IDC_S2_ON: case IDC_SEC_CAM: case IDC_SEC_PHONE: case IDC_SEC_MEDIA:
+    case IDC_SEC_TEXT: case IDC_SEC_LOGO: case IDC_SEC_TRANS: case IDC_SEC_SRCSET:
+        return true;
+    }
+    return false;
+}
+static bool IsHintId(int id) {
+    if (IsFrId(id) && (id - IDC_FR_BASE) % FR_STRIDE == FR_HDR) return true;
+    switch (id) {
+    case IDC_MEDIA_NOW: case IDC_LOGO_NAME: case IDC_PHONE_STATUS: case IDC_PHONE_VERT_HINT: case IDC_SIDE_HINT:
+    case IDC_SRC_HINT: case IDC_SRCON_HINT:
         return true;
     }
     return false;
@@ -3716,25 +4168,73 @@ static void SetSectionText(int id, bool open, const wchar_t* title) {
     SetTextIfChanged(Ctl(id), t);
 }
 
+static std::wstring SourceStateText(int kind);  // short state for a source block title
+
+// Title of a collapsible block: name and, for sources, a short state
+static std::wstring SecTitle(int id) {
+    switch (id) {
+    case IDC_SEC_S1: return L"Экран 1 — " + SourceStateText(KIND_SCREEN);
+    case IDC_SEC_CAM: return L"Веб-камера — " + SourceStateText(KIND_CAM);
+    case IDC_SEC_PHONE: return L"Телефон — " + SourceStateText(KIND_PHONE);
+    case IDC_SEC_MEDIA: return L"Медиафайлы — " + SourceStateText(KIND_MEDIA);
+    case IDC_SEC_WIN: return L"Дополнительно: захват окна";
+    case IDC_SEC_TEXT: return L"Надпись";
+    case IDC_SEC_LOGO: return L"Логотип";
+    case IDC_SEC_TRANS: return L"Переходы";
+    case IDC_SEC_SRCSET: return L"Источники";
+    case IDC_SEC_KEYS: return L"Список горячих клавиш";
+    }
+    return L"";
+}
+static int SecBit(int id) {
+    switch (id) {
+    case IDC_SEC_S1: return SEC_S1;
+    case IDC_SEC_CAM: return SEC_CAM;
+    case IDC_SEC_PHONE: return SEC_PHONE;
+    case IDC_SEC_MEDIA: return SEC_MEDIA;
+    case IDC_SEC_WIN: return SEC_WIN;
+    case IDC_SEC_TEXT: return SEC_TEXT;
+    case IDC_SEC_LOGO: return SEC_LOGO;
+    case IDC_SEC_TRANS: return SEC_TRANS;
+    case IDC_SEC_SRCSET: return SEC_SRCSET;
+    case IDC_SEC_KEYS: return SEC_KEYS;
+    }
+    return 0;
+}
+static void UpdateSectionTitles() {
+    static const int ids[] = {IDC_SEC_S1, IDC_SEC_CAM, IDC_SEC_PHONE, IDC_SEC_MEDIA};
+    for (int id : ids) SetSectionText(id, (g_expanded & SecBit(id)) != 0, SecTitle(id).c_str());
+}
+
+// Repaint a window and every control on it now (no grey squares after moving / showing controls)
+static void RedrawAll(HWND h) {
+    if (h) RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
+}
+
 // One tab page laid out top to bottom; collapsed sections hide their controls and the rest moves up.
+// Every control of the page that is not placed is hidden.
 static void LayoutPage(int p) {
     HWND page = g_pageWnd[p];
     if (!page) return;
     RECT pc;
     GetClientRect(page, &pc);
     const int W = MulDiv(pc.right, 96, static_cast<int>(g_dpi));  // page width in 96-dpi units
-    struct Pl { int id, x, y, w, h; bool vis; };
+    struct Pl { int id, x, y, w, h; };
     std::vector<Pl> pl;
     const int pad = 14, lw = 148, cx = pad + lw + 6;
     const int fw = (std::max)(120, W - 2 * pad), cw = (std::max)(80, W - cx - pad);
     int y = 8;
-    auto P = [&](int id, int x, int yy, int w, int h, bool vis = true) { pl.push_back({id, x, yy, w, h, vis}); };
+    const Settings st = GetSettings();
+    auto P = [&](int id, int x, int yy, int w, int h) { pl.push_back({id, x, yy, w, h}); };
     auto hdr = [&](int id) { y += 6; P(id, pad, y, fw, 20); y += 26; };
     auto row1 = [&](int lab, int ctl, int h = 200) { P(lab, pad, y + 4, lw, 20); P(ctl, cx, y, cw, h); y += 32; };
-    auto row2 = [&](int lab, int a, int b, int bw = 76) {
+    auto row2 = [&](int lab, int a, int b, int bw = 76, bool bIsButton = false) {
         P(lab, pad, y + 4, lw, 20);
         P(a, cx, y, cw - bw - 6, 200);
-        P(b, cx + cw - bw, y, bw, 200);
+        if (bIsButton)
+            P(b, cx + cw - bw, y - 1, bw, 26);
+        else
+            P(b, cx + cw - bw, y, bw, 200);
         y += 32;
     };
     auto chk = [&](int id) { P(id, pad, y, fw, 22); y += 26; };
@@ -3751,31 +4251,100 @@ static void LayoutPage(int p) {
         y += 34;
     };
     auto full = [&](int id, int h) { P(id, pad, y, fw, h); y += h + 6; };
-    auto hide = [&](std::initializer_list<int> ids) {
-        for (int id : ids) P(id, 0, 0, 10, 10, false);
-    };
-    auto sec = [&](int id, int bit, const wchar_t* title) {
+    auto sec = [&](int id) {
+        const int bit = SecBit(id);
         const bool open = (g_expanded & bit) != 0;
-        SetSectionText(id, open, title);
-        P(id, pad, y, fw, 26);
-        y += 32;
+        SetSectionText(id, open, SecTitle(id).c_str());
+        y += 4;
+        P(id, pad, y, fw, 28);
+        y += 34;
         return open;
     };
-
-    if (p == 0) {  // Источники
-        hdr(IDC_SRC_HDR);
-        full(IDC_SRC_VALUE, 20);
-        btns({IDC_SELECT, IDC_MONITOR, IDC_WINDOW});
-        if (sec(IDC_SEC_WIN, SEC_WIN, L"Дополнительно: захват окна")) {
-            row1(IDC_WCAP_LABEL, IDC_WINCAP);
-            P(IDC_HIDEWIN, cx, y, cw, 28);
-            y += 34;
-        } else {
-            hide({IDC_WCAP_LABEL, IDC_WINCAP, IDC_HIDEWIN});
+    auto frameRows = [&](int kind) {  // the source's own frame settings
+        P(FrId(kind, FR_HDR), pad, y + 2, fw, 20);
+        y += 24;
+        row1(FrId(kind, FR_ROT_L), FrId(kind, FR_ROT));
+        row1(FrId(kind, FR_ZOOM_L), FrId(kind, FR_ZOOM));
+        row1(FrId(kind, FR_FIT_L), FrId(kind, FR_FIT));
+        P(FrId(kind, FR_CROP_L), pad, y + 4, lw, 20);
+        {
+            const int ew = (cw - 3 * 6) / 4;
+            for (int e = 0; e < 4; ++e) P(FrId(kind, FR_CROP0 + e), cx + e * (ew + 6), y, ew, 24);
         }
-        hdr(IDC_SRC2_HDR);
-        full(IDC_SRC2_VALUE, 20);
-        btns({IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE});
+        y += 32;
+        if (kind != KIND_CAM) P(FrId(kind, FR_MIRROR), pad, y + 2, (std::max)(60, fw - 150), 22);
+        P(FrId(kind, FR_RESET), pad + fw - 140, y, 140, 26);
+        y += 34;
+    };
+
+    if (p == 0) {  // Источники: one block per switched-on source
+        if (sec(IDC_SEC_S1)) {
+            btns({IDC_SELECT, IDC_MONITOR, IDC_WINDOW});
+            chk(IDC_CURSOR);
+            frameRows(KIND_SCREEN);
+            if (sec(IDC_SEC_WIN)) {
+                row1(IDC_WCAP_LABEL, IDC_WINCAP);
+                P(IDC_HIDEWIN, cx, y, cw, 28);
+                y += 34;
+            }
+        }
+        y += 4;
+        P(IDC_S2_ON, pad, y, fw, 24);  // check box = Экран 2 on / off; on shows its settings
+        y += 30;
+        if (st.srcOn[KIND_SCREEN2]) {
+            btns({IDC_SELECT2, IDC_MONITOR2, IDC_SCR_TOGGLE});
+            frameRows(KIND_SCREEN2);
+        }
+        if (st.srcOn[KIND_CAM] && sec(IDC_SEC_CAM)) {
+            row1(IDC_CAM_LABEL, IDC_CAMDEV, 240);
+            chk(IDC_CAMMIRROR);
+            frameRows(KIND_CAM);
+        }
+        if (st.srcOn[KIND_PHONE] && sec(IDC_SEC_PHONE)) {
+            const bool phoneUsb = st.phoneConn == 1;
+            P(IDC_PHONEMODE_LABEL, pad, y + 4, lw, 20);
+            if (phoneUsb) {  // USB: no IP row, «Подключить» sits next to the mode
+                P(IDC_PHONE_MODE, cx, y, cw - 110 - 6, 200);
+                P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
+            } else {
+                P(IDC_PHONE_MODE, cx, y, cw, 200);
+            }
+            y += 32;
+            row2(IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, 76, true);  // «Найти»: a normal button height
+            if (!phoneUsb) {
+                P(IDC_PHONEIP_LABEL, pad, y + 4, lw, 20);
+                P(IDC_PHONE_IP, cx, y, cw - 110 - 6, 24);
+                P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
+                y += 32;
+            }
+            btns({IDC_PHONE_BACK, IDC_PHONE_FRONT, IDC_PHONE_SCREEN});
+            row1(IDC_PHONERES_LABEL, IDC_PHONE_RES);
+            chk(IDC_PHONE_VERT);
+            full(IDC_PHONE_VERT_HINT, 34);
+            P(IDC_PHONE_WIN, pad, y, 200, 28);
+            y += 34;
+            full(IDC_PHONE_STATUS, 72);
+            frameRows(KIND_PHONE);
+        }
+        if (st.srcOn[KIND_MEDIA] && sec(IDC_SEC_MEDIA)) {
+            full(IDC_MEDIA_LIST, 104);
+            {
+                const int bw = (fw - 3 * 6 - 2 * 44) / 2;
+                P(IDC_MEDIA_ADD, pad, y, bw, 28);
+                P(IDC_MEDIA_DEL, pad + bw + 6, y, bw, 28);
+                P(IDC_MEDIA_UP, pad + 2 * (bw + 6), y, 44, 28);
+                P(IDC_MEDIA_DOWN, pad + fw - 44, y, 44, 28);
+                y += 34;
+            }
+            row1(IDC_IMGSEC_LABEL, IDC_IMGSEC);
+            P(IDC_MEDIA_NEXT, pad, y, 180, 28);
+            P(IDC_MEDIA_NOW, pad + 188, y + 5, fw - 188, 20);
+            y += 34;
+            frameRows(KIND_MEDIA);
+        }
+        y += 6;
+        full(IDC_SRC_HINT, 36);
+    } else if (p == 1) {  // Кадр: what is shown and how, the camera format, overlays
         hdr(IDC_SHOW_HDR);
         row1(IDC_VIEW_LABEL, IDC_VIEW);
         row1(IDC_LAYOUT_LABEL, IDC_LAYOUT);
@@ -3783,46 +4352,6 @@ static void LayoutPage(int p) {
         P(IDC_PIPSRC, cx, y, cw - 46, 200);
         P(IDC_SWAP, cx + cw - 40, y - 1, 40, 26);
         y += 32;
-        hdr(IDC_CAM_HDR);
-        row1(IDC_CAM_LABEL, IDC_CAMDEV, 240);
-        chk(IDC_CAMMIRROR);
-        hdr(IDC_PHONE_HDR);
-        const bool phoneUsb = GetSettings().phoneConn == 1;
-        P(IDC_PHONEMODE_LABEL, pad, y + 4, lw, 20);
-        if (phoneUsb) {  // USB: no IP row, «Подключить» sits next to the mode
-            P(IDC_PHONE_MODE, cx, y, cw - 110 - 6, 200);
-            P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
-        } else {
-            P(IDC_PHONE_MODE, cx, y, cw, 200);
-        }
-        y += 32;
-        row2(IDC_PHONE_LABEL, IDC_PHONE_LIST, IDC_PHONE_FIND, 76);
-        if (phoneUsb) {
-            hide({IDC_PHONEIP_LABEL, IDC_PHONE_IP});
-        } else {
-            P(IDC_PHONEIP_LABEL, pad, y + 4, lw, 20);
-            P(IDC_PHONE_IP, cx, y, cw - 110 - 6, 24);
-            P(IDC_PHONE_CONN, cx + cw - 110, y - 1, 110, 26);
-            y += 32;
-        }
-        btns({IDC_PHONE_BACK, IDC_PHONE_FRONT, IDC_PHONE_SCREEN});
-        row1(IDC_PHONERES_LABEL, IDC_PHONE_RES);
-        full(IDC_PHONE_STATUS, 72);
-        hdr(IDC_MEDIA_HDR);
-        full(IDC_MEDIA_LIST, 104);
-        {
-            const int bw = (fw - 3 * 6 - 2 * 44) / 2;
-            P(IDC_MEDIA_ADD, pad, y, bw, 28);
-            P(IDC_MEDIA_DEL, pad + bw + 6, y, bw, 28);
-            P(IDC_MEDIA_UP, pad + 2 * (bw + 6), y, 44, 28);
-            P(IDC_MEDIA_DOWN, pad + fw - 44, y, 44, 28);
-            y += 34;
-        }
-        row1(IDC_IMGSEC_LABEL, IDC_IMGSEC);
-        P(IDC_MEDIA_NEXT, pad, y, 180, 28);
-        P(IDC_MEDIA_NOW, pad + 188, y + 5, fw - 188, 20);
-        y += 34;
-    } else if (p == 1) {  // Кадр
         hdr(IDC_PIP_HDR);
         P(IDC_PIP_LABEL, pad, y + 4, lw, 20);
         P(IDC_PIPCORNER, cx, y, cw - 84, 200);
@@ -3830,39 +4359,45 @@ static void LayoutPage(int p) {
         P(IDC_PIPSIZE_UD, cx + cw - 22, y, 22, 24);
         y += 32;
         row1(IDC_PIPSHAPE_LABEL, IDC_PIPSHAPE);
-        hdr(IDC_FRAME_HDR);
-        row1(IDC_FIT_LABEL, IDC_FIT);
-        row1(IDC_SHAPE_LABEL, IDC_FRAMESHAPE);
-        if (sec(IDC_SEC_FRAME, SEC_FRAME, L"Дополнительно: поворот, зум, зеркало, курсор, фон")) {
-            row1(IDC_ROT_LABEL, IDC_ROT);
-            row1(IDC_ZOOM_LABEL, IDC_ZOOM);
-            row1(IDC_SHAPECOLOR_LABEL, IDC_SHAPECOLOR);
-            chk(IDC_MIRROR);
-            chk(IDC_CURSOR);
-        } else {
-            hide({IDC_ROT_LABEL, IDC_ROT, IDC_ZOOM_LABEL, IDC_ZOOM, IDC_SHAPECOLOR_LABEL, IDC_SHAPECOLOR, IDC_MIRROR,
-                  IDC_CURSOR});
-        }
-        hdr(IDC_TEXT_HDR);
-        P(IDC_TEXT_LABEL, pad, y + 4, lw, 20);
-        P(IDC_TEXT, cx, y, cw, 24);
+        hdr(IDC_SIDE_HDR);
+        row1(IDC_SIDEDIR_LABEL, IDC_SIDEDIR);
+        P(IDC_SIDESPLIT_LABEL, pad, y + 4, lw, 20);
+        P(IDC_SIDESPLIT, cx, y, 56, 24);
+        P(IDC_SIDESPLIT_UD, cx + 56, y, 22, 24);
+        P(IDC_SIDE_RESET, cx + 90, y - 1, (std::max)(60, cw - 90), 26);
         y += 32;
-        chk(IDC_TEXTON);
-        row2(IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE, 96);
-        hdr(IDC_LOGO_HDR);
-        P(IDC_LOGO_LABEL, pad, y + 5, lw, 20);
-        P(IDC_LOGO_PICK, cx, y, cw - 96 - 6, 28);
-        P(IDC_LOGO_CLEAR, cx + cw - 96, y, 96, 28);
-        y += 34;
-        row2(IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE, 96);
-        full(IDC_LOGO_NAME, 20);
-        hdr(IDC_TRANS_HDR);
-        row2(IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR, 96);
-    } else {  // Настройки
+        full(IDC_SIDE_HINT, 52);
+        hdr(IDC_FRAME_HDR);
+        row1(IDC_SHAPE_LABEL, IDC_FRAMESHAPE);
+        row1(IDC_SHAPECOLOR_LABEL, IDC_SHAPECOLOR);
         hdr(IDC_FMT_HDR);
         row1(IDC_Q_LABEL, IDC_QUALITY);
         row1(IDC_A_LABEL, IDC_ASPECT);
         row1(IDC_FPS_LABEL, IDC_FPS);
+        if (sec(IDC_SEC_TEXT)) {
+            P(IDC_TEXT_LABEL, pad, y + 4, lw, 20);
+            P(IDC_TEXT, cx, y, cw, 24);
+            y += 32;
+            chk(IDC_TEXTON);
+            row2(IDC_TPOS_LABEL, IDC_TEXTPOS, IDC_TEXTSIZE, 96);
+        }
+        if (sec(IDC_SEC_LOGO)) {
+            P(IDC_LOGO_LABEL, pad, y + 5, lw, 20);
+            P(IDC_LOGO_PICK, cx, y, cw - 96 - 6, 28);
+            P(IDC_LOGO_CLEAR, cx + cw - 96, y, 96, 28);
+            y += 34;
+            row2(IDC_LPOS_LABEL, IDC_LOGOCORNER, IDC_LOGOSIZE, 96);
+            full(IDC_LOGO_NAME, 20);
+        }
+        if (sec(IDC_SEC_TRANS)) row2(IDC_TRANS_LABEL, IDC_TRANS, IDC_TRANSDUR, 96);
+    } else {  // Настройки
+        if (sec(IDC_SEC_SRCSET)) {
+            chk(IDC_SRCON_PHONE);
+            chk(IDC_SRCON_SCREEN2);
+            chk(IDC_SRCON_CAM);
+            chk(IDC_SRCON_MEDIA);
+            full(IDC_SRCON_HINT, 36);
+        }
         hdr(IDC_PAUSE_HDR);
         row1(IDC_PAUSE_LABEL, IDC_PAUSE);
         P(IDC_PAUSETEXT_LABEL, pad, y + 4, lw, 20);
@@ -3878,11 +4413,7 @@ static void LayoutPage(int p) {
         hdr(IDC_HK_HDR);
         P(IDC_HK_EDIT, pad, y, 240, 28);
         y += 34;
-        if (sec(IDC_SEC_KEYS, SEC_KEYS, L"Список горячих клавиш")) {
-            full(IDC_HK_LIST, 190);
-        } else {
-            hide({IDC_HK_LIST});
-        }
+        if (sec(IDC_SEC_KEYS)) full(IDC_HK_LIST, 190);
         hdr(IDC_FILE_HDR);
         btns({IDC_JSON_EXPORT, IDC_JSON_IMPORT});
         hdr(IDC_CAMSYS_HDR);
@@ -3890,7 +4421,7 @@ static void LayoutPage(int p) {
     }
     y += 8;
 
-    // scroll range, then place everything shifted by the scroll offset
+    // scroll range, then place everything shifted by the scroll offset; the rest of the page's controls are hidden
     const int content = S(y), view = pc.bottom;
     g_scroll[p] = std::clamp(g_scroll[p], 0, (std::max)(0, content - view));
     SCROLLINFO si{};
@@ -3901,18 +4432,33 @@ static void LayoutPage(int p) {
     si.nPage = static_cast<UINT>((std::max)(1, view));
     si.nPos = g_scroll[p];
     SetScrollInfo(page, SB_VERT, &si, TRUE);
-    HDWP dw = BeginDeferWindowPos(static_cast<int>(pl.size()));
+    std::vector<bool> placed(IDC_LAST_ID + 1, false);
+    for (const Pl& it : pl) placed[it.id] = true;
+    std::vector<HWND> hideList;
+    for (int id = IDC_TAB + 1; id < IDC_LAST_ID; ++id) {
+        HWND h = g_ctl[id];
+        if (h && !placed[id] && GetParent(h) == page && (GetWindowLongPtrW(h, GWL_STYLE) & WS_VISIBLE))
+            hideList.push_back(h);
+    }
+    HDWP dw = BeginDeferWindowPos(static_cast<int>(pl.size() + hideList.size()));
     for (const Pl& it : pl) {
         HWND h = Ctl(it.id);
         if (!h) continue;
-        const UINT fl = SWP_NOZORDER | SWP_NOACTIVATE | (it.vis ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+        const UINT fl = SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW;
         if (dw)
             dw = DeferWindowPos(dw, h, nullptr, S(it.x), S(it.y) - g_scroll[p], S(it.w), S(it.h), fl);
         else
             SetWindowPos(h, nullptr, S(it.x), S(it.y) - g_scroll[p], S(it.w), S(it.h), fl);
     }
+    for (HWND h : hideList) {
+        const UINT fl = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_HIDEWINDOW;
+        if (dw)
+            dw = DeferWindowPos(dw, h, nullptr, 0, 0, 0, 0, fl);
+        else
+            SetWindowPos(h, nullptr, 0, 0, 0, 0, fl);
+    }
     if (dw) EndDeferWindowPos(dw);
-    InvalidateRect(page, nullptr, TRUE);
+    RedrawAll(page);
 }
 
 static void LayoutPages() {
@@ -3963,13 +4509,17 @@ static void Layout() {
                          SWP_NOACTIVATE);
     SetWindowPos(Ctl(IDC_TAB), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     LayoutPages();
-    InvalidateRect(g_main, nullptr, TRUE);
+    RedrawAll(g_main);
 }
 
 static void ShowPage(int page) {
     g_page = std::clamp(page, 0, kPages - 1);
     for (int p = 0; p < kPages; ++p)
-        if (g_pageWnd[p]) ShowWindow(g_pageWnd[p], p == g_page ? SW_SHOW : SW_HIDE);
+        if (g_pageWnd[p] && p != g_page) ShowWindow(g_pageWnd[p], SW_HIDE);
+    if (g_pageWnd[g_page]) {
+        ShowWindow(g_pageWnd[g_page], SW_SHOW);
+        LayoutPage(g_page);  // places and repaints every control of the page
+    }
 }
 
 static void ToggleSection(int bit) {
@@ -3994,8 +4544,7 @@ static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_CTLCOLORSTATIC) {
             if (IsHeaderId(id))
                 SetTextColor(dc, kHdrText);
-            else if (id == IDC_MEDIA_NOW || id == IDC_LOGO_NAME || id == IDC_SRC_VALUE || id == IDC_SRC2_VALUE ||
-                     id == IDC_PHONE_STATUS)
+            else if (IsHintId(id))
                 SetTextColor(dc, kHintText);
         }
         return reinterpret_cast<LRESULT>(g_brPage);
@@ -4127,6 +4676,51 @@ static void FillMediaList() {
     if (sel >= 0 && sel < static_cast<int>(s.media.size())) SendMessageW(h, LB_SETCURSEL, sel, 0);
 }
 
+// --- main / second source lists show only the switched-on sources
+static std::vector<int> g_viewKinds, g_secondKinds;  // combo index -> source kind
+static const wchar_t* KindTitle(int kind) {
+    static const wchar_t* n[kSrcKinds] = {L"Экран 1", L"Веб-камера", L"Медиафайлы", L"Экран 2", L"Телефон"};
+    return n[std::clamp(kind, 0, kSrcKinds - 1)];
+}
+static void FillSourceCombos() {
+    const bool was = g_syncing;
+    g_syncing = true;
+    Settings s = GetSettings();
+    static const int order[kSrcKinds] = {KIND_SCREEN, KIND_SCREEN2, KIND_CAM, KIND_PHONE, KIND_MEDIA};
+    g_viewKinds.clear();
+    for (int k : order)
+        if (SrcOn(s, k)) g_viewKinds.push_back(k);
+    g_secondKinds = g_viewKinds;
+    for (int pass = 0; pass < 2; ++pass) {
+        const int id = pass == 0 ? IDC_VIEW : IDC_PIPSRC;
+        const std::vector<int>& kinds = pass == 0 ? g_viewKinds : g_secondKinds;
+        const int cur = pass == 0 ? s.mainSrc : std::clamp(s.pipSrc, 1, 5) - 1;
+        HWND h = Ctl(id);
+        SendMessageW(h, CB_RESETCONTENT, 0, 0);
+        int sel = -1;
+        for (size_t i = 0; i < kinds.size(); ++i) {
+            SendMessageW(h, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(KindTitle(kinds[i])));
+            if (kinds[i] == cur) sel = static_cast<int>(i);
+        }
+        SendMessageW(h, CB_SETCURSEL, sel, 0);
+    }
+    g_syncing = was;
+}
+
+static void SyncFrameControls(const Settings& s, int kind) {
+    const SrcFrame& f = s.fr[kind];
+    ComboSet(FrId(kind, FR_ROT), f.rot);
+    ComboSet(FrId(kind, FR_ZOOM), f.zoom);
+    ComboSet(FrId(kind, FR_FIT), f.fit);
+    for (int e = 0; e < 4; ++e) {
+        // keep what is being typed (an empty box = 0)
+        wchar_t cur[16] = {};
+        GetWindowTextW(Ctl(FrId(kind, FR_CROP0 + e)), cur, 16);
+        if (_wtoi(cur) != f.crop[e] || cur[0] == 0) SetTextIfChanged(Ctl(FrId(kind, FR_CROP0 + e)), std::to_wstring(f.crop[e]));
+    }
+    CheckSet(FrId(kind, FR_MIRROR), f.mirror);
+}
+
 // settings -> controls (after hotkeys, scenes, startup)
 static void SyncControls() {
     g_syncing = true;
@@ -4134,17 +4728,22 @@ static void SyncControls() {
     ComboSet(IDC_QUALITY, s.quality);
     ComboSet(IDC_ASPECT, s.aspect);
     ComboSet(IDC_FPS, s.fps == 60 ? 1 : 0);
-    ComboSet(IDC_FIT, s.fit);
-    ComboSet(IDC_ROT, s.rotation);
-    ComboSet(IDC_ZOOM, s.zoom);
     ComboSet(IDC_FRAMESHAPE, s.frameShape);
     ComboSet(IDC_SHAPECOLOR, s.shapeColor);
-    CheckSet(IDC_MIRROR, s.mirror);
     CheckSet(IDC_CURSOR, s.cursor);
     ComboSet(IDC_WINCAP, s.winCapture);
-    ComboSet(IDC_VIEW, s.mainSrc);
+    for (int k = 0; k < kSrcKinds; ++k) SyncFrameControls(s, k);
+    FillSourceCombos();
+    g_syncing = true;
     ComboSet(IDC_LAYOUT, s.layout);
-    ComboSet(IDC_PIPSRC, std::clamp(s.pipSrc, 1, 5) - 1);
+    ComboSet(IDC_SIDEDIR, s.sideVertical ? 1 : 0);
+    SendMessageW(Ctl(IDC_SIDESPLIT_UD), UDM_SETPOS32, 0, std::clamp((s.sideSplit + 50) / 100, 10, 90));
+    CheckSet(IDC_PHONE_VERT, s.phoneVertical);
+    CheckSet(IDC_SRCON_PHONE, s.srcOn[KIND_PHONE]);
+    CheckSet(IDC_SRCON_SCREEN2, s.srcOn[KIND_SCREEN2]);
+    CheckSet(IDC_SRCON_CAM, s.srcOn[KIND_CAM]);
+    CheckSet(IDC_SRCON_MEDIA, s.srcOn[KIND_MEDIA]);
+    CheckSet(IDC_S2_ON, s.srcOn[KIND_SCREEN2]);
     CheckSet(IDC_KEEPCAM, s.keepCamOn);
     SetTextIfChanged(Ctl(IDC_PHONE_IP), s.phoneIp);
     ComboSet(IDC_PHONE_RES, s.phoneRes);
@@ -4183,24 +4782,60 @@ static const wchar_t* SrcKindName(int mainKind) {
     }
 }
 
+static std::wstring RegionText(const RECT& r) {
+    wchar_t buf[128];
+    swprintf(buf, 128, L"область %d × %d (x %d, y %d)", static_cast<int>(r.right - r.left), static_cast<int>(r.bottom - r.top),
+             static_cast<int>(r.left), static_cast<int>(r.top));
+    return buf;
+}
+
+// Short state of a source for its block title
+static std::wstring SourceStateText(int kind) {
+    Settings s = GetSettings();
+    std::wstring t;
+    switch (kind) {
+    case KIND_SCREEN:
+        if (s.srcMode == 1)
+            t = L"окно «" + s.srcTitle + L"»";
+        else if (s.hasRegion)
+            t = RegionText(s.region);
+        else
+            t = L"не выбран";
+        break;
+    case KIND_SCREEN2: t = RegionText(s.region2); break;
+    case KIND_CAM:
+        t = s.camLink.empty() ? std::wstring(L"не выбрана") : (s.camName.empty() ? std::wstring(L"камера") : s.camName);
+        if (!s.camLink.empty() && g_web.status == 2) t += L", включена";
+        else if (!s.camLink.empty() && g_web.status == 3) t += L", недоступна";
+        break;
+    case KIND_PHONE: {
+        const int st = g_phone.status;
+        std::wstring name;
+        {
+            std::lock_guard<std::mutex> lk(g_phoneMx);
+            name = g_phoneName;
+        }
+        if (st == 2) t = L"подключён" + (name.empty() ? std::wstring() : L" (" + name + L")");
+        else if (st == 1) t = L"подключаюсь…";
+        else if (st == 3) t = L"нет связи";
+        else t = s.phoneConn == 1 ? L"USB, не подключён" : L"Wi-Fi, не подключён";
+        break;
+    }
+    case KIND_MEDIA:
+        t = s.media.empty() ? std::wstring(L"список пуст") : L"файлов: " + std::to_wstring(s.media.size());
+        break;
+    }
+    if (s.mainSrc == kind) t += L" · главный";
+    else if (SecondSrc(s) == kind + 1) t += s.layout == 2 ? L" · рядом" : L" · в окошке";
+    return t;
+}
+
 static void UpdateSourceLabel() {
     if (!g_main) return;
     Settings s = GetSettings();
-    wchar_t buf[256];
-    if (s.srcMode == 1) {
-        swprintf(buf, 256, L"окно «%ls»", s.srcTitle.c_str());
-    } else if (s.hasRegion) {
-        swprintf(buf, 256, L"область %d × %d  (x %d, y %d)", static_cast<int>(s.region.right - s.region.left),
-                 static_cast<int>(s.region.bottom - s.region.top), static_cast<int>(s.region.left),
-                 static_cast<int>(s.region.top));
-    } else {
-        wcscpy(buf, L"не выбран");
-    }
-    SetTextIfChanged(Ctl(IDC_SRC_VALUE), buf);
-    swprintf(buf, 256, L"область %d × %d  (x %d, y %d)%ls", static_cast<int>(s.region2.right - s.region2.left),
-             static_cast<int>(s.region2.bottom - s.region2.top), static_cast<int>(s.region2.left),
-             static_cast<int>(s.region2.top), s.mainSrc == 3 ? L" — сейчас главный" : SecondSrc(s) == 4 ? L" — второй" : L"");
-    SetTextIfChanged(Ctl(IDC_SRC2_VALUE), buf);
+    UpdateSectionTitles();
+    SetTextIfChanged(Ctl(IDC_S2_ON), s.srcOn[KIND_SCREEN2] ? L"Экран 2 — " + SourceStateText(KIND_SCREEN2)
+                                                           : std::wstring(L"Экран 2 (выключен — поставьте галочку)"));
     std::wstring now;
     {
         std::lock_guard<std::mutex> lk(g_mediaNameMx);
@@ -4274,8 +4909,37 @@ static void FillPhoneCombo() {
     g_syncing = was;
 }
 
+// ", приём 29.8 к/с, показ 29.5 к/с." — received from the phone, and shown (camera while streaming, else phone window)
+static std::wstring PhoneFpsText() {
+    Settings s = GetSettings();
+    double shown;
+    if (g_streaming && !g_paused && PhoneNeeded(s))
+        shown = g_phoneCamFpsX10 / 10.0;
+    else if (g_phoneWinOpen)
+        shown = g_phoneWinFpsX10 / 10.0;
+    else
+        shown = g_phoneDecFpsX10 / 10.0;
+    wchar_t b[96];
+    swprintf(b, 96, L", приём %.1f к/с, показ %.1f к/с.", g_phoneFpsX10 / 10.0, shown);
+    return b;
+}
+
+static std::wstring PhoneStatusText();
 static void UpdatePhoneUi() {
     if (!g_main) return;
+    SetTextIfChanged(Ctl(IDC_PHONE_STATUS), PhoneStatusText());
+    Settings s = GetSettings();
+    const bool usb = s.phoneConn == 1;
+    SetTextIfChanged(Ctl(IDC_PHONE_CONN), PhoneWanted(s) ? L"Отключить" : L"Подключить");
+    SetTextIfChanged(Ctl(IDC_PHONE_FIND), (usb ? g_usbListing.load() : g_phoneSearching.load()) ? L"Ищу…" : L"Найти");
+    SetTextIfChanged(Ctl(IDC_PHONE_LABEL), usb ? L"Телефоны по USB:" : L"Найденные телефоны:");
+    static const wchar_t* names[3] = {L"Задняя камера", L"Передняя камера", L"Экран телефона"};
+    for (int i = 0; i < 3; ++i)
+        SetTextIfChanged(Ctl(IDC_PHONE_BACK + i), (s.phoneSrc == i ? L"● " : L"") + std::wstring(names[i]));
+}
+
+// The phone connection status sentence (main window and «Окно телефона»)
+static std::wstring PhoneStatusText() {
     Settings s = GetSettings();
     std::wstring st, name, err;
     {
@@ -4301,9 +4965,7 @@ static void UpdatePhoneUi() {
             if (st == L"need_consent") {
                 t += L". Подтвердите запись экрана на телефоне.";
             } else {
-                wchar_t b[64];
-                swprintf(b, 64, L", %.1f кадров/с.", g_phoneFpsX10 / 10.0);
-                t += b;
+                t += PhoneFpsText();
             }
         } else if (status == 1) {
             t = L"Подключаюсь по USB…";
@@ -4325,9 +4987,7 @@ static void UpdatePhoneUi() {
         if (st == L"need_consent") {
             t += L". Подтвердите запись экрана на телефоне.";
         } else {
-            wchar_t b[64];
-            swprintf(b, 64, L", %.1f кадров/с.", g_phoneFpsX10 / 10.0);
-            t += b;
+            t += PhoneFpsText();
         }
     } else if (status == 1) {
         t = L"Подключаюсь к " + s.phoneIp + L"…";
@@ -4343,13 +5003,7 @@ static void UpdatePhoneUi() {
         t = L"Не подключено. WVC подключится сам, когда «Телефон» выбран источником и идёт трансляция; или нажмите "
             L"«Подключить».";
     }
-    SetTextIfChanged(Ctl(IDC_PHONE_STATUS), t);
-    SetTextIfChanged(Ctl(IDC_PHONE_CONN), PhoneWanted(s) ? L"Отключить" : L"Подключить");
-    SetTextIfChanged(Ctl(IDC_PHONE_FIND), (usb ? g_usbListing.load() : g_phoneSearching.load()) ? L"Ищу…" : L"Найти");
-    SetTextIfChanged(Ctl(IDC_PHONE_LABEL), usb ? L"Телефоны по USB:" : L"Найденные телефоны:");
-    static const wchar_t* names[3] = {L"Задняя камера", L"Передняя камера", L"Экран телефона"};
-    for (int i = 0; i < 3; ++i)
-        SetTextIfChanged(Ctl(IDC_PHONE_BACK + i), (s.phoneSrc == i ? L"● " : L"") + std::wstring(names[i]));
+    return t;
 }
 
 static void UpdateStatus() {
@@ -4552,11 +5206,105 @@ static void ToggleHideWindow() {
     g_note = L"Окно спрятано за край экрана и продолжает работать. Вернуть — той же кнопкой.";
     UpdateStatus();
 }
-static void RestartCameraForFormat() {
+static void RestartCameraForFormat(const wchar_t* note = nullptr) {
     StopCamera();
     if (!StartCamera()) MessageBoxW(g_main, L"Не удалось перезапустить камеру.", L"WVC", MB_ICONERROR);
-    g_note = L"Формат изменён: переподключите камеру в Zoom/Telegram (выключите и включите видео).";
+    g_note = note ? note : L"Формат изменён: переподключите камеру в Zoom/Telegram (выключите и включите видео).";
     UpdateStatus();
+}
+
+// The camera follows the format in use: quality, aspect (9:16 while the phone is the main source with
+// «Вертикальная камера для телефона»), FPS. Called after changes and on the 100 ms timer.
+static void CheckCameraFormat() {
+    if (!g_cam) return;
+    Settings s = GetSettings();
+    int W, H;
+    OutSizeS(s, &W, &H);
+    if (W == g_camW && H == g_camH && s.fps == g_camFps) return;
+    const bool toVertical = EffAspect(s) == 3 && s.aspect != 3;
+    const bool fromVertical = g_camH > g_camW && s.aspect != 3 && !toVertical;
+    RestartCameraForFormat(toVertical ? L"Телефон — главный источник: камера переключена на 9:16 (вертикально). В "
+                                        L"Zoom/Telegram может понадобиться выключить и включить видео."
+                           : fromVertical ? L"Камера вернулась к обычному формату. В Zoom/Telegram может понадобиться "
+                                            L"выключить и включить видео."
+                                          : nullptr);
+}
+
+// A switched-off source cannot be shown: the main source falls back to Экран 1, the second one is hidden.
+static std::wstring EnforceSources(Settings& s) {
+    std::wstring note;
+    if (!SrcOn(s, s.mainSrc)) {
+        note = L"Источник «" + std::wstring(KindTitle(s.mainSrc)) + L"» выключен в «Настройки → Источники»: показываю Экран 1.";
+        s.mainSrc = KIND_SCREEN;
+    }
+    if (s.layout != 0 && !SrcOn(s, std::clamp(s.pipSrc, 1, 5) - 1)) {
+        if (!note.empty()) note += L" ";
+        note += L"Второй источник «" + std::wstring(KindTitle(std::clamp(s.pipSrc, 1, 5) - 1)) + L"» выключен: показываю только главный.";
+        s.layout = 0;
+    }
+    return note;
+}
+
+static int KindSecBit(int kind) {
+    switch (kind) {
+    case KIND_CAM: return SEC_CAM;
+    case KIND_PHONE: return SEC_PHONE;
+    case KIND_MEDIA: return SEC_MEDIA;
+    default: return 0;
+    }
+}
+
+static void FillPhoneCombo();
+static void SyncSources();
+// «Настройки → Источники» check boxes (and the Экран 2 check box on «Источники»)
+static void SetSourceOn(int kind, bool on) {
+    if (kind <= 0 || kind >= kSrcKinds) return;
+    std::wstring note;
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.srcOn[kind] = on;
+        note = EnforceSources(g_set);
+    }
+    SaveSettings();
+    if (on && KindSecBit(kind)) {  // a source just switched on: show its settings
+        g_expanded |= KindSecBit(kind);
+        IniSetInt(kMainSec, L"UiExpanded", g_expanded);
+    }
+    ++g_transGen;
+    SyncControls();
+    if (kind == KIND_PHONE) FillPhoneCombo();
+    LayoutPage(0);
+    SyncSources();
+    UpdateFrame();
+    CheckCameraFormat();
+    g_note = note;
+    UpdateStatus();
+}
+
+static void ResetSourceFrame(int kind) {
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        SrcFrame& f = g_set.fr[std::clamp(kind, 0, kSrcKinds - 1)];
+        f.rot = 0;
+        f.zoom = 0;
+        for (int& c : f.crop) c = 0;
+    }
+    SaveSettings();
+    SyncControls();
+    UpdateFrame();
+}
+
+static void ResetSide() {
+    {
+        std::lock_guard<std::mutex> lk(g_setMx);
+        g_set.sideSplit = 5000;
+        for (int i = 0; i < 2; ++i) {
+            g_set.sideX[i] = g_set.sideY[i] = 0;
+            g_set.sideZoom[i] = 10000;
+        }
+    }
+    SaveSettings();
+    SyncControls();
 }
 
 static void SetRegionSource(const RECT& r) {
@@ -4771,6 +5519,10 @@ static void LoadProfile(const std::wstring& name) {
         }
     }
     {
+        const std::wstring off = EnforceSources(s);  // the scene shows a source that is switched off now
+        if (!off.empty()) note = note.empty() ? off : note + L" " + off;
+    }
+    {
         std::lock_guard<std::mutex> lk(g_setMx);
         g_set = s;
     }
@@ -4781,8 +5533,10 @@ static void LoadProfile(const std::wstring& name) {
     IniSetStr(kMainSec, L"LastScene", name);
     SaveSettings();
     SyncControls();
+    LayoutPages();
     SyncSources();
     UpdateFrame();
+    CheckCameraFormat();
     g_note = note.empty() ? L"Сцена «" + name + L"» загружена." : note;
     UpdateStatus();
 }
@@ -5316,6 +6070,7 @@ static void OnPipDragged() {
     SaveSettings();
     g_syncing = true;
     SendMessageW(Ctl(IDC_PIPSIZE_UD), UDM_SETPOS32, 0, std::clamp((GetSettings().pipW + 50) / 100, 5, 90));
+    SendMessageW(Ctl(IDC_SIDESPLIT_UD), UDM_SETPOS32, 0, std::clamp((GetSettings().sideSplit + 50) / 100, 10, 90));
     g_syncing = false;
     UpdateFrame();
 }
@@ -5390,10 +6145,12 @@ static void ReloadAllSettings() {
         s.srcWindow = FindWindowByTitle(s.srcTitle);
         if (!s.srcWindow) s.srcMode = 0;
     }
+    const std::wstring off = EnforceSources(s);
     {
         std::lock_guard<std::mutex> lk(g_setMx);
         g_set = s;
     }
+    if (!off.empty()) g_note = off;
     LoadHotkeys();
     RegisterHotkeys(g_main);
     SetTextIfChanged(Ctl(IDC_HK_LIST), HotkeyListText());
@@ -5402,7 +6159,10 @@ static void ReloadAllSettings() {
     g_mediaIndex = 0;
     g_pauseDirty = true;
     SyncControls();
-    if (old.quality != s.quality || old.aspect != s.aspect || old.fps != s.fps) RestartCameraForFormat();
+    FillPhoneCombo();
+    LayoutPages();
+    (void)old;
+    CheckCameraFormat();
     SyncSources();
     UpdateFrame();
     UpdateStatus();
@@ -5436,20 +6196,33 @@ static void DoImportJson() {
     UpdateStatus();
 }
 
+static void HotkeyOffNote(int kind) {
+    g_note = L"Источник «" + std::wstring(KindTitle(kind)) + L"» выключен в «Настройки → Источники»: клавиша не действует.";
+    UpdateStatus();
+}
+
 static void OnHotkey(int action) {
+    const Settings cur = GetSettings();
     switch (action) {
     case HA_TOGGLE: ToggleStreaming(); return;
     case HA_SELECT: DoSelectRegion(); return;
     case HA_MONITOR: NextMonitor(); return;
     case HA_CURSOR: SetCursorOption(!GetSettings().cursor); return;
     case HA_SWAP: SwapLayers(); return;
-    case HA_MEDIA_NEXT: MediaNext(); return;
+    case HA_MEDIA_NEXT:
+        if (!SrcOn(cur, KIND_MEDIA)) return HotkeyOffNote(KIND_MEDIA);
+        MediaNext();
+        return;
     case HA_HIDE_WINDOW: ToggleHideWindow(); return;
     case HA_PAUSE: TogglePause(); return;
-    case HA_SCREEN12: ToggleScreens(); return;
+    case HA_SCREEN12:
+        if (!SrcOn(cur, KIND_SCREEN2)) return HotkeyOffNote(KIND_SCREEN2);
+        ToggleScreens();
+        return;
     case HA_SCREEN_CAM:
     case HA_PIP:
     case HA_TEXT: {
+        if (action == HA_SCREEN_CAM && !SrcOn(cur, KIND_CAM)) return HotkeyOffNote(KIND_CAM);
         {
             std::lock_guard<std::mutex> lk(g_setMx);
             if (action == HA_SCREEN_CAM) g_set.mainSrc = g_set.mainSrc == 1 ? 0 : 1;
@@ -5457,11 +6230,21 @@ static void OnHotkey(int action) {
                 if (g_set.layout != 0) {
                     g_set.layout = 0;
                 } else {
-                    g_set.layout = 1;
-                    if (std::clamp(g_set.pipSrc, 1, 5) == g_set.mainSrc + 1) g_set.pipSrc = g_set.mainSrc == 1 ? 1 : 2;
+                    int k2 = std::clamp(g_set.pipSrc, 1, 5) - 1;
+                    if (k2 == g_set.mainSrc || !SrcOn(g_set, k2)) {  // pick another switched-on source
+                        static const int order[kSrcKinds] = {KIND_CAM, KIND_SCREEN, KIND_PHONE, KIND_SCREEN2, KIND_MEDIA};
+                        k2 = -1;
+                        for (int k : order)
+                            if (k2 < 0 && k != g_set.mainSrc && SrcOn(g_set, k)) k2 = k;
+                    }
+                    if (k2 >= 0) {
+                        g_set.layout = 1;
+                        g_set.pipSrc = k2 + 1;
+                    }
                 }
             }
             if (action == HA_TEXT) g_set.textOn = !g_set.textOn;
+            EnforceSources(g_set);
         }
         AfterLayersChanged();
         return;
@@ -5501,10 +6284,340 @@ static void DoInstall(bool install) {
     UpdateStatus();
 }
 
+// ---------------------------------------------------------------------------
+// «Окно телефона»: the live phone picture and its settings in a window of its own. It keeps the phone connected
+// (also while the camera is stopped) and does not change what the camera shows; the phone settings are shared.
+// ---------------------------------------------------------------------------
+enum { PW_BACK = 701, PW_FRONT, PW_SCREEN, PW_RES_L, PW_RES, PW_ROT_L, PW_ROT, PW_MIRROR, PW_FIT, PW_STATUS };
+static HWND g_phoneWin = nullptr;
+static bool g_pwSyncing = false;
+static uint64_t g_pwSeq = 0;
+static int g_pwFrames = 0;
+static ULONGLONG g_pwT0 = 0;
+static std::vector<uint8_t> g_pwSrc, g_pwImg;  // latest phone frame (BGRA), and it turned / cut for the window
+static int g_pwSrcW = 0, g_pwSrcH = 0, g_pwImgW = 0, g_pwImgH = 0;
+static const UINT_PTR kPwTimerFrame = 1, kPwTimerStatus = 2;
+
+static int PwToolbarH() { return S(4 + 30 + 32 + 44 + 4); }
+
+static void PhoneWinSync() {
+    if (!g_phoneWin) return;
+    g_pwSyncing = true;
+    Settings s = GetSettings();
+    static const wchar_t* names[3] = {L"Задняя камера", L"Передняя камера", L"Экран"};
+    for (int i = 0; i < 3; ++i)
+        SetTextIfChanged(GetDlgItem(g_phoneWin, PW_BACK + i), (s.phoneSrc == i ? L"● " : L"") + std::wstring(names[i]));
+    SendDlgItemMessageW(g_phoneWin, PW_RES, CB_SETCURSEL, s.phoneRes, 0);
+    SendDlgItemMessageW(g_phoneWin, PW_ROT, CB_SETCURSEL, s.fr[KIND_PHONE].rot, 0);
+    SendDlgItemMessageW(g_phoneWin, PW_FIT, CB_SETCURSEL, s.fr[KIND_PHONE].fit, 0);
+    SendDlgItemMessageW(g_phoneWin, PW_MIRROR, BM_SETCHECK, s.fr[KIND_PHONE].mirror ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetTextIfChanged(GetDlgItem(g_phoneWin, PW_STATUS), PhoneStatusText());
+    g_pwSyncing = false;
+}
+
+static void PhoneWinLayout(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int w = rc.right, pad = S(6), gap = S(6);
+    const int bw = (w - 2 * pad - 2 * gap) / 3;
+    for (int i = 0; i < 3; ++i)
+        SetWindowPos(GetDlgItem(hwnd, PW_BACK + i), nullptr, pad + i * (bw + gap), S(4), bw, S(28), SWP_NOZORDER);
+    int y = S(4 + 32);
+    const int lw = S(70), cw = (std::max)(S(60), (w - 2 * pad - 2 * lw - 3 * gap) / 2);
+    SetWindowPos(GetDlgItem(hwnd, PW_RES_L), nullptr, pad, y + S(4), lw, S(20), SWP_NOZORDER);
+    SetWindowPos(GetDlgItem(hwnd, PW_RES), nullptr, pad + lw, y, cw, S(200), SWP_NOZORDER);
+    SetWindowPos(GetDlgItem(hwnd, PW_ROT_L), nullptr, pad + lw + cw + gap, y + S(4), lw, S(20), SWP_NOZORDER);
+    SetWindowPos(GetDlgItem(hwnd, PW_ROT), nullptr, pad + 2 * lw + cw + gap, y, cw, S(200), SWP_NOZORDER);
+    y += S(30);
+    SetWindowPos(GetDlgItem(hwnd, PW_MIRROR), nullptr, pad, y + S(2), S(110), S(22), SWP_NOZORDER);
+    SetWindowPos(GetDlgItem(hwnd, PW_FIT), nullptr, pad + S(116), y, (std::max)(S(80), w - 2 * pad - S(116)), S(200),
+                 SWP_NOZORDER);
+    y += S(30);
+    SetWindowPos(GetDlgItem(hwnd, PW_STATUS), nullptr, pad, y, w - 2 * pad, S(40), SWP_NOZORDER);
+    RedrawAll(hwnd);
+}
+
+// Copy the newest phone frame and turn / mirror / crop it with the phone's frame settings
+static bool PhoneWinTakeFrame() {
+    const uint64_t q = g_phone.seq;
+    if (q == g_pwSeq && !g_pwImg.empty()) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_phone.mx);
+        if (g_phone.buf.empty() || g_phone.status != 2) {
+            g_pwImg.clear();
+            g_pwSeq = q;
+            return true;
+        }
+        g_pwSrc = g_phone.buf;
+        g_pwSrcW = g_phone.w;
+        g_pwSrcH = g_phone.h;
+    }
+    if (q != g_pwSeq) ++g_pwFrames;
+    g_pwSeq = q;
+    const SrcFrame f = GetSettings().fr[KIND_PHONE];
+    const int sw = g_pwSrcW, sh = g_pwSrcH;
+    if (sw < 2 || sh < 2 || g_pwSrc.size() < static_cast<size_t>(sw) * sh * 4) {
+        g_pwImg.clear();
+        return true;
+    }
+    // crop, then centre zoom
+    double x0 = sw * f.crop[0] / 100.0, y0 = sh * f.crop[1] / 100.0;
+    double cw = (std::max)(2.0, sw * (1.0 - (f.crop[0] + f.crop[2]) / 100.0));
+    double ch = (std::max)(2.0, sh * (1.0 - (f.crop[1] + f.crop[3]) / 100.0));
+    const double z = kZoom[std::clamp(f.zoom, 0, kZoomCount - 1)];
+    x0 += (cw - cw / z) / 2;
+    y0 += (ch - ch / z) / 2;
+    cw /= z;
+    ch /= z;
+    const int ix = std::clamp(static_cast<int>(x0), 0, sw - 1), iy = std::clamp(static_cast<int>(y0), 0, sh - 1);
+    const int iw = std::clamp(static_cast<int>(cw), 1, sw - ix), ih = std::clamp(static_cast<int>(ch), 1, sh - iy);
+    const int rot = f.rot & 3;
+    const int ow = (rot & 1) ? ih : iw, oh = (rot & 1) ? iw : ih;
+    g_pwImg.resize(static_cast<size_t>(ow) * oh * 4);
+    const uint32_t* sp = reinterpret_cast<const uint32_t*>(g_pwSrc.data());
+    uint32_t* dp = reinterpret_cast<uint32_t*>(g_pwImg.data());
+    for (int oy = 0; oy < oh; ++oy) {
+        uint32_t* row = dp + static_cast<size_t>(oy) * ow;
+        for (int ox = 0; ox < ow; ++ox) {
+            int x, y;
+            switch (rot) {
+            case 1: x = oy; y = ih - 1 - ox; break;
+            case 2: x = iw - 1 - ox; y = ih - 1 - oy; break;
+            case 3: x = iw - 1 - oy; y = ox; break;
+            default: x = ox; y = oy; break;
+            }
+            row[f.mirror ? ow - 1 - ox : ox] = sp[static_cast<size_t>(iy + y) * sw + ix + x];
+        }
+    }
+    g_pwImgW = ow;
+    g_pwImgH = oh;
+    return true;
+}
+
+static void PhoneWinPaint(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const int top = PwToolbarH();
+    RECT area{0, top, rc.right, rc.bottom};
+    const int aw = area.right - area.left, ah = area.bottom - area.top;
+    if (aw > 0 && ah > 0) {
+        HDC m = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, aw, ah);
+        HGDIOBJ old = SelectObject(m, bmp);
+        RECT ar{0, 0, aw, ah};
+        HBRUSH bg = CreateSolidBrush(RGB(20, 20, 20));
+        FillRect(m, &ar, bg);
+        DeleteObject(bg);
+        if (!g_pwImg.empty() && g_pwImgW > 0 && g_pwImgH > 0) {
+            const int fit = GetSettings().fr[KIND_PHONE].fit;
+            // the whole picture is drawn; «fill» just makes it larger than the area (the DC clips it)
+            const double sc = fit == 1 ? (std::max)(static_cast<double>(aw) / g_pwImgW, static_cast<double>(ah) / g_pwImgH)
+                                       : (std::min)(static_cast<double>(aw) / g_pwImgW, static_cast<double>(ah) / g_pwImgH);
+            const int dw = (std::max)(1, static_cast<int>(g_pwImgW * sc)), dh = (std::max)(1, static_cast<int>(g_pwImgH * sc));
+            const int dx = (aw - dw) / 2, dy = (ah - dh) / 2;
+            BITMAPINFO bi{};
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = g_pwImgW;
+            bi.bmiHeader.biHeight = -g_pwImgH;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            SetStretchBltMode(m, HALFTONE);
+            SetBrushOrgEx(m, 0, 0, nullptr);
+            StretchDIBits(m, dx, dy, dw, dh, 0, 0, g_pwImgW, g_pwImgH, g_pwImg.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        } else {
+            SetBkMode(m, TRANSPARENT);
+            SetTextColor(m, RGB(220, 220, 220));
+            HGDIOBJ of = SelectObject(m, g_font);
+            const wchar_t* msg = g_phone.status == 2 ? L"Телефон подключён, жду картинку…"
+                                 : g_phone.status == 1 ? L"Подключаюсь к телефону…"
+                                                       : L"Телефон не подключён — подробности выше";
+            DrawTextW(m, msg, -1, &ar, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(m, of);
+        }
+        BitBlt(dc, 0, top, aw, ah, m, 0, 0, SRCCOPY);
+        SelectObject(m, old);
+        DeleteObject(bmp);
+        DeleteDC(m);
+    }
+    EndPaint(hwnd, &ps);
+}
+
+static void SavePhoneWinPos(HWND hwnd) {
+    WINDOWPLACEMENT wpl{};
+    wpl.length = sizeof(wpl);
+    if (!GetWindowPlacement(hwnd, &wpl)) return;
+    const RECT& r = wpl.rcNormalPosition;
+    IniSetInt(kMainSec, L"PhoneWinX", r.left);
+    IniSetInt(kMainSec, L"PhoneWinY", r.top);
+    IniSetInt(kMainSec, L"PhoneWinW", r.right - r.left);
+    IniSetInt(kMainSec, L"PhoneWinH", r.bottom - r.top);
+}
+
+static LRESULT CALLBACK PhoneWinProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        auto mk = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id) {
+            HWND h = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, hwnd,
+                                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
+            SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), FALSE);
+            return h;
+        };
+        mk(L"BUTTON", L"Задняя камера", WS_TABSTOP | BS_PUSHBUTTON, PW_BACK);
+        mk(L"BUTTON", L"Передняя камера", WS_TABSTOP | BS_PUSHBUTTON, PW_FRONT);
+        mk(L"BUTTON", L"Экран", WS_TABSTOP | BS_PUSHBUTTON, PW_SCREEN);
+        mk(L"STATIC", L"Качество:", 0, PW_RES_L);
+        HWND c = mk(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, PW_RES);
+        SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"720p"));
+        SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"1080p"));
+        mk(L"STATIC", L"Поворот:", 0, PW_ROT_L);
+        c = mk(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, PW_ROT);
+        for (const wchar_t* s : {L"Без поворота", L"90° по часовой", L"180°", L"90° против часовой"})
+            SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+        mk(L"BUTTON", L"Зеркально", WS_TABSTOP | BS_AUTOCHECKBOX, PW_MIRROR);
+        c = mk(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, PW_FIT);
+        SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Вписать целиком (с полями)"));
+        SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Заполнить (обрезать края)"));
+        mk(L"STATIC", L"", 0, PW_STATUS);
+        g_pwSeq = 0;
+        g_pwImg.clear();
+        g_pwFrames = 0;
+        g_pwT0 = GetTickCount64();
+        SetTimer(hwnd, kPwTimerFrame, 30, nullptr);
+        SetTimer(hwnd, kPwTimerStatus, 500, nullptr);
+        return 0;
+    }
+    case WM_SIZE:
+        PhoneWinLayout(hwnd);
+        return 0;
+    case WM_EXITSIZEMOVE:
+        SavePhoneWinPos(hwnd);
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        rc.bottom = PwToolbarH();  // the picture area paints itself
+        FillRect(reinterpret_cast<HDC>(wp), &rc, GetSysColorBrush(COLOR_BTNFACE));
+        return 1;
+    }
+    case WM_PAINT:
+        PhoneWinPaint(hwnd);
+        return 0;
+    case WM_TIMER:
+        if (wp == kPwTimerFrame) {
+            if (PhoneWinTakeFrame()) {
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                rc.top = PwToolbarH();
+                InvalidateRect(hwnd, &rc, FALSE);
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now - g_pwT0 >= 1000) {
+                g_phoneWinFpsX10 = static_cast<int>(g_pwFrames * 10000 / (now - g_pwT0));
+                g_pwFrames = 0;
+                g_pwT0 = now;
+            }
+        } else if (wp == kPwTimerStatus) {
+            PhoneWinSync();
+        }
+        return 0;
+    case WM_COMMAND: {
+        const int id = LOWORD(wp), code = HIWORD(wp);
+        if (g_pwSyncing) return 0;
+        if (id >= PW_BACK && id <= PW_SCREEN) {
+            SetPhoneSource(id - PW_BACK);
+        } else if (id == PW_RES && code == CBN_SELCHANGE) {
+            const int sel = static_cast<int>(SendDlgItemMessageW(hwnd, PW_RES, CB_GETCURSEL, 0, 0));
+            {
+                std::lock_guard<std::mutex> lk(g_setMx);
+                g_set.phoneRes = sel == 1 ? 1 : 0;
+            }
+            SaveSettings();
+            PhoneSendRes(GetSettings().phoneRes);
+        } else if ((id == PW_ROT || id == PW_FIT) && code == CBN_SELCHANGE) {
+            const int sel = static_cast<int>(SendDlgItemMessageW(hwnd, id, CB_GETCURSEL, 0, 0));
+            {
+                std::lock_guard<std::mutex> lk(g_setMx);
+                if (id == PW_ROT) g_set.fr[KIND_PHONE].rot = sel & 3;
+                else g_set.fr[KIND_PHONE].fit = sel == 1 ? 1 : 0;
+            }
+            SaveSettings();
+            g_pwImg.clear();
+        } else if (id == PW_MIRROR && code == BN_CLICKED) {
+            {
+                std::lock_guard<std::mutex> lk(g_setMx);
+                g_set.fr[KIND_PHONE].mirror =
+                    SendDlgItemMessageW(hwnd, PW_MIRROR, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            }
+            SaveSettings();
+            g_pwImg.clear();
+        } else {
+            return 0;
+        }
+        SyncControls();  // the same settings in the main window
+        UpdateStatus();
+        UpdateFrame();
+        PhoneWinSync();
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        SavePhoneWinPos(hwnd);
+        KillTimer(hwnd, kPwTimerFrame);
+        KillTimer(hwnd, kPwTimerStatus);
+        g_phoneWin = nullptr;
+        g_phoneWinOpen = false;
+        g_phoneWinFpsX10 = 0;
+        g_pwImg.clear();
+        g_pwSrc.clear();
+        SyncSources();
+        UpdateStatus();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void OpenPhoneWindow() {
+    if (g_phoneWin) {
+        ShowWindow(g_phoneWin, SW_RESTORE);
+        SetForegroundWindow(g_phoneWin);
+        return;
+    }
+    int x = IniInt(kMainSec, L"PhoneWinX", CW_USEDEFAULT), y = IniInt(kMainSec, L"PhoneWinY", CW_USEDEFAULT);
+    int w = IniInt(kMainSec, L"PhoneWinW", 0), h = IniInt(kMainSec, L"PhoneWinH", 0);
+    if (w < 200 || h < 200) {
+        w = S(440);
+        h = S(760);
+        x = CW_USEDEFAULT;
+        y = CW_USEDEFAULT;
+    } else {
+        RECT r{x, y, x + w, y + h}, vs = VirtualScreen(), inter;
+        if (!IntersectRect(&inter, &r, &vs)) {  // saved on a monitor that is gone
+            x = CW_USEDEFAULT;
+            y = CW_USEDEFAULT;
+        }
+    }
+    g_phoneWin = CreateWindowExW(0, L"WVCPhoneWin", L"WVC — окно телефона", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y,
+                                 w, h, nullptr, nullptr, g_hInst, nullptr);
+    if (!g_phoneWin) return;
+    g_phoneWinOpen = true;
+    if (g_phoneUser == -1) g_phoneUser = 0;  // opening the window connects again after «Отключить»
+    PhoneWinLayout(g_phoneWin);
+    PhoneWinSync();
+    ShowWindow(g_phoneWin, SW_SHOW);
+    SyncSources();
+    UpdateStatus();
+}
+
 static void ShowMain() {
     ShowWindow(g_main, SW_SHOW);
     ShowWindow(g_main, SW_RESTORE);
     SetForegroundWindow(g_main);
+    RedrawAll(g_main);
 }
 
 static HWND g_mkParent = nullptr;  // parent for the controls being created
@@ -5536,40 +6649,50 @@ static void CreateControls(HWND hwnd) {
     }
     for (int p = 0; p < kPages; ++p)
         g_pageWnd[p] = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCPage", L"",
-                                       WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN, 0, 0, 10, 10, hwnd,
+                                       WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 10, 10, hwnd,
                                        nullptr, g_hInst, nullptr);
     auto shapes = {L"Прямоугольник", L"Скруглённый", L"Круг", L"Шестиугольник", L"Восьмиугольник"};
-    auto kinds = {L"Экран 1", L"Веб-камера", L"Медиафайлы", L"Экран 2", L"Телефон"};
+    // the source's own frame settings (one set per source block)
+    auto frameControls = [&](int kind) {
+        Mk(L"STATIC", L"Кадр этого источника (поворот, зеркало, увеличение, обрезка):", SS_ENDELLIPSIS, FrId(kind, FR_HDR));
+        Mk(L"STATIC", L"Поворот:", 0, FrId(kind, FR_ROT_L));
+        AddCombo(FrId(kind, FR_ROT), {L"Без поворота", L"90° по часовой", L"180°", L"90° против часовой"});
+        Mk(L"STATIC", L"Увеличение (центр):", 0, FrId(kind, FR_ZOOM_L));
+        AddCombo(FrId(kind, FR_ZOOM), {L"100%", L"125%", L"150%", L"200%", L"300%", L"400%"});
+        Mk(L"STATIC", L"Если пропорции другие:", 0, FrId(kind, FR_FIT_L));
+        AddCombo(FrId(kind, FR_FIT), {L"Вписать целиком (с полями)", L"Заполнить (обрезать края)"});
+        Mk(L"STATIC", L"Обрезать края, %:", 0, FrId(kind, FR_CROP_L));
+        for (int e = 0; e < 4; ++e) {
+            HWND ce = Mk(L"EDIT", L"0", WS_TABSTOP | ES_NUMBER | ES_CENTER, FrId(kind, FR_CROP0 + e), WS_EX_CLIENTEDGE);
+            SendMessageW(ce, EM_LIMITTEXT, 2, 0);
+        }
+        Mk(L"BUTTON", L"Зеркально", chk, FrId(kind, FR_MIRROR));
+        Mk(L"BUTTON", L"Сбросить кадр", btn, FrId(kind, FR_RESET));
+    };
 
     // ---- tab "Источники"
     g_mkParent = g_pageWnd[0];
-    Mk(L"STATIC", L"Экран 1", 0, IDC_SRC_HDR);
-    Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_SRC_VALUE);
+    Mk(L"BUTTON", L"▸  Экран 1", btn | BS_LEFT, IDC_SEC_S1);
     Mk(L"BUTTON", L"Область…", btn, IDC_SELECT);
     Mk(L"BUTTON", L"Монитор ▾", btn, IDC_MONITOR);
     Mk(L"BUTTON", L"Окно ▾", btn, IDC_WINDOW);
+    Mk(L"BUTTON", L"Показывать курсор", chk, IDC_CURSOR);
+    frameControls(KIND_SCREEN);
     Mk(L"BUTTON", L"▸  Дополнительно", btn | BS_LEFT, IDC_SEC_WIN);
     Mk(L"STATIC", L"Окно захватывать:", 0, IDC_WCAP_LABEL);
     AddCombo(IDC_WINCAP, {L"С экрана (как видно)", L"Из самого окна"});
     Mk(L"BUTTON", L"Спрятать окно за экран", btn, IDC_HIDEWIN);
-    Mk(L"STATIC", L"Экран 2", 0, IDC_SRC2_HDR);
-    Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_SRC2_VALUE);
+    Mk(L"BUTTON", L"Экран 2", chk, IDC_S2_ON);
     Mk(L"BUTTON", L"Выбрать область 2", btn, IDC_SELECT2);
     Mk(L"BUTTON", L"Монитор ▾", btn, IDC_MONITOR2);
     Mk(L"BUTTON", L"Экран 1 ⇄ 2", btn, IDC_SCR_TOGGLE);
-    Mk(L"STATIC", L"Что показывать", 0, IDC_SHOW_HDR);
-    Mk(L"STATIC", L"Главный источник:", 0, IDC_VIEW_LABEL);
-    AddCombo(IDC_VIEW, kinds);
-    Mk(L"STATIC", L"Раскладка:", 0, IDC_LAYOUT_LABEL);
-    AddCombo(IDC_LAYOUT, {L"Только главный", L"Окошко поверх", L"Рядом (пополам)"});
-    Mk(L"STATIC", L"Второй источник:", 0, IDC_PIPSRC_LABEL);
-    AddCombo(IDC_PIPSRC, kinds);
-    Mk(L"BUTTON", L"⇄", btn, IDC_SWAP);
-    Mk(L"STATIC", L"Веб-камера", 0, IDC_CAM_HDR);
+    frameControls(KIND_SCREEN2);
+    Mk(L"BUTTON", L"▸  Веб-камера", btn | BS_LEFT, IDC_SEC_CAM);
     Mk(L"STATIC", L"Устройство:", 0, IDC_CAM_LABEL);
     AddCombo(IDC_CAMDEV, {});
     Mk(L"BUTTON", L"Зеркалить веб-камеру (как в зеркале)", chk, IDC_CAMMIRROR);
-    Mk(L"STATIC", L"Телефон (приложение WVC Phone)", 0, IDC_PHONE_HDR);
+    frameControls(KIND_CAM);
+    Mk(L"BUTTON", L"▸  Телефон", btn | BS_LEFT, IDC_SEC_PHONE);
     Mk(L"STATIC", L"Подключение:", 0, IDC_PHONEMODE_LABEL);
     AddCombo(IDC_PHONE_MODE, {L"Wi-Fi", L"USB-кабель"});
     Mk(L"STATIC", L"Найденные телефоны:", 0, IDC_PHONE_LABEL);
@@ -5586,8 +6709,15 @@ static void CreateControls(HWND hwnd) {
     Mk(L"BUTTON", L"Экран телефона", btn, IDC_PHONE_SCREEN);
     Mk(L"STATIC", L"Качество с телефона:", 0, IDC_PHONERES_LABEL);
     AddCombo(IDC_PHONE_RES, {L"720p (быстрее)", L"1080p (чётче)"});
+    Mk(L"BUTTON", L"Вертикальная камера для телефона (9:16)", chk, IDC_PHONE_VERT);
+    Mk(L"STATIC",
+       L"Когда телефон — главный источник, камера WVC становится вертикальной. После переключения в Zoom/Telegram "
+       L"может понадобиться выключить и включить видео.",
+       0, IDC_PHONE_VERT_HINT);
+    Mk(L"BUTTON", L"Окно телефона…", btn, IDC_PHONE_WIN);
     Mk(L"STATIC", L"", 0, IDC_PHONE_STATUS);
-    Mk(L"STATIC", L"Медиафайлы", 0, IDC_MEDIA_HDR);
+    frameControls(KIND_PHONE);
+    Mk(L"BUTTON", L"▸  Медиафайлы", btn | BS_LEFT, IDC_SEC_MEDIA);
     Mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, IDC_MEDIA_LIST, WS_EX_CLIENTEDGE);
     Mk(L"BUTTON", L"Добавить…", btn, IDC_MEDIA_ADD);
     Mk(L"BUTTON", L"Убрать", btn, IDC_MEDIA_DEL);
@@ -5597,9 +6727,20 @@ static void CreateControls(HWND hwnd) {
     AddCombo(IDC_IMGSEC, {L"3 секунды", L"5 секунд", L"10 секунд", L"30 секунд", L"1 минуту"});
     Mk(L"BUTTON", L"⏭  Следующий файл", btn, IDC_MEDIA_NEXT);
     Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_MEDIA_NOW);
+    frameControls(KIND_MEDIA);
+    Mk(L"STATIC", L"Телефон, Экран 2, веб-камера и медиафайлы включаются и выключаются в «Настройки → Источники».", 0,
+       IDC_SRC_HINT);
 
     // ---- tab "Кадр"
     g_mkParent = g_pageWnd[1];
+    Mk(L"STATIC", L"Что показывать", 0, IDC_SHOW_HDR);
+    Mk(L"STATIC", L"Главный источник:", 0, IDC_VIEW_LABEL);
+    AddCombo(IDC_VIEW, {});
+    Mk(L"STATIC", L"Раскладка:", 0, IDC_LAYOUT_LABEL);
+    AddCombo(IDC_LAYOUT, {L"Только главный", L"Окошко поверх", L"Рядом"});
+    Mk(L"STATIC", L"Второй источник:", 0, IDC_PIPSRC_LABEL);
+    AddCombo(IDC_PIPSRC, {});
+    Mk(L"BUTTON", L"⇄", btn, IDC_SWAP);
     Mk(L"STATIC", L"Окошко (второй источник поверх)", 0, IDC_PIP_HDR);
     Mk(L"STATIC", L"Угол и ширина, %:", 0, IDC_PIP_LABEL);
     AddCombo(IDC_PIPCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
@@ -5612,21 +6753,35 @@ static void CreateControls(HWND hwnd) {
     }
     Mk(L"STATIC", L"Форма окошка:", 0, IDC_PIPSHAPE_LABEL);
     AddCombo(IDC_PIPSHAPE, shapes);
-    Mk(L"STATIC", L"Кадр", 0, IDC_FRAME_HDR);
-    Mk(L"STATIC", L"Если пропорции другие:", 0, IDC_FIT_LABEL);
-    AddCombo(IDC_FIT, {L"Вписать с полями", L"Обрезать по краям"});
+    Mk(L"STATIC", L"Рядом (два источника)", 0, IDC_SIDE_HDR);
+    Mk(L"STATIC", L"Как делить кадр:", 0, IDC_SIDEDIR_LABEL);
+    AddCombo(IDC_SIDEDIR, {L"Слева и справа", L"Сверху и снизу"});
+    Mk(L"STATIC", L"Первая часть, %:", 0, IDC_SIDESPLIT_LABEL);
+    Mk(L"EDIT", L"50", WS_TABSTOP | ES_NUMBER | ES_CENTER, IDC_SIDESPLIT, WS_EX_CLIENTEDGE);
+    {
+        HWND ud = Mk(UPDOWN_CLASSW, L"", UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS | UDS_HOTTRACK,
+                     IDC_SIDESPLIT_UD);
+        SendMessageW(ud, UDM_SETBUDDY, reinterpret_cast<WPARAM>(Ctl(IDC_SIDESPLIT)), 0);
+        SendMessageW(ud, UDM_SETRANGE32, 10, 90);
+    }
+    Mk(L"BUTTON", L"Сбросить: 50/50, по центру", btn, IDC_SIDE_RESET);
+    Mk(L"STATIC",
+       L"В предпросмотре: тяните границу между частями; тяните картинку внутри части, чтобы сдвинуть; колесо мыши — "
+       L"крупнее / мельче. Двойной щелчок: по границе — 50/50, внутри части — сбросить её.",
+       0, IDC_SIDE_HINT);
+    Mk(L"STATIC", L"Весь кадр", 0, IDC_FRAME_HDR);
     Mk(L"STATIC", L"Форма кадра:", 0, IDC_SHAPE_LABEL);
     AddCombo(IDC_FRAMESHAPE, shapes);
-    Mk(L"BUTTON", L"▸  Дополнительно", btn | BS_LEFT, IDC_SEC_FRAME);
-    Mk(L"STATIC", L"Поворот:", 0, IDC_ROT_LABEL);
-    AddCombo(IDC_ROT, {L"Без поворота", L"90° по часовой", L"180°", L"90° против часовой"});
-    Mk(L"STATIC", L"Увеличение (центр):", 0, IDC_ZOOM_LABEL);
-    AddCombo(IDC_ZOOM, {L"100%", L"125%", L"150%", L"200%", L"300%", L"400%"});
-    Mk(L"BUTTON", L"Зеркально (весь главный источник)", chk, IDC_MIRROR);
-    Mk(L"BUTTON", L"Показывать курсор", chk, IDC_CURSOR);
     Mk(L"STATIC", L"Фон вне формы:", 0, IDC_SHAPECOLOR_LABEL);
     AddCombo(IDC_SHAPECOLOR, {L"Чёрный", L"Белый", L"Зелёный", L"Серый"});
-    Mk(L"STATIC", L"Надпись", 0, IDC_TEXT_HDR);
+    Mk(L"STATIC", L"Формат камеры", 0, IDC_FMT_HDR);
+    Mk(L"STATIC", L"Качество:", 0, IDC_Q_LABEL);
+    AddCombo(IDC_QUALITY, {L"720p", L"1080p"});
+    Mk(L"STATIC", L"Соотношение сторон:", 0, IDC_A_LABEL);
+    AddCombo(IDC_ASPECT, {L"16:9 (обычное)", L"4:3", L"1:1 (квадрат)", L"9:16 (вертикальное)"});
+    Mk(L"STATIC", L"Частота кадров:", 0, IDC_FPS_LABEL);
+    AddCombo(IDC_FPS, {L"30 кадров/с", L"60 кадров/с"});
+    Mk(L"BUTTON", L"▸  Надпись", btn | BS_LEFT, IDC_SEC_TEXT);
     Mk(L"STATIC", L"Текст:", 0, IDC_TEXT_LABEL);
     HWND ed = Mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_TEXT, WS_EX_CLIENTEDGE);
     SendMessageW(ed, EM_LIMITTEXT, 120, 0);
@@ -5635,7 +6790,7 @@ static void CreateControls(HWND hwnd) {
     AddCombo(IDC_TEXTPOS, {L"Слева вверху", L"По центру вверху", L"Справа вверху", L"Слева внизу", L"По центру внизу",
                            L"Справа внизу"});
     AddCombo(IDC_TEXTSIZE, {L"Мелкий", L"Средний", L"Крупный"});
-    Mk(L"STATIC", L"Логотип", 0, IDC_LOGO_HDR);
+    Mk(L"BUTTON", L"▸  Логотип", btn | BS_LEFT, IDC_SEC_LOGO);
     Mk(L"STATIC", L"Картинка (PNG):", 0, IDC_LOGO_LABEL);
     Mk(L"BUTTON", L"Выбрать…", btn, IDC_LOGO_PICK);
     Mk(L"BUTTON", L"Убрать", btn, IDC_LOGO_CLEAR);
@@ -5643,20 +6798,20 @@ static void CreateControls(HWND hwnd) {
     AddCombo(IDC_LOGOCORNER, {L"Справа внизу", L"Слева внизу", L"Справа вверху", L"Слева вверху"});
     AddCombo(IDC_LOGOSIZE, {L"10%", L"15%", L"20%", L"30%"});
     Mk(L"STATIC", L"", SS_ENDELLIPSIS, IDC_LOGO_NAME);
-    Mk(L"STATIC", L"Переходы", 0, IDC_TRANS_HDR);
+    Mk(L"BUTTON", L"▸  Переходы", btn | BS_LEFT, IDC_SEC_TRANS);
     Mk(L"STATIC", L"Плавный переход:", 0, IDC_TRANS_LABEL);
     AddCombo(IDC_TRANS, {L"Без перехода", L"Растворение", L"Через чёрный", L"Шторка", L"Сдвиг"});
     AddCombo(IDC_TRANSDUR, {L"0,3 с", L"0,5 с", L"1 с"});
 
     // ---- tab "Настройки"
     g_mkParent = g_pageWnd[2];
-    Mk(L"STATIC", L"Формат камеры", 0, IDC_FMT_HDR);
-    Mk(L"STATIC", L"Качество:", 0, IDC_Q_LABEL);
-    AddCombo(IDC_QUALITY, {L"720p", L"1080p"});
-    Mk(L"STATIC", L"Соотношение сторон:", 0, IDC_A_LABEL);
-    AddCombo(IDC_ASPECT, {L"16:9 (обычное)", L"4:3", L"1:1 (квадрат)", L"9:16 (вертикальное)"});
-    Mk(L"STATIC", L"Частота кадров:", 0, IDC_FPS_LABEL);
-    AddCombo(IDC_FPS, {L"30 кадров/с", L"60 кадров/с"});
+    Mk(L"BUTTON", L"▸  Источники", btn | BS_LEFT, IDC_SEC_SRCSET);
+    Mk(L"BUTTON", L"Телефон (приложение WVC Phone)", chk, IDC_SRCON_PHONE);
+    Mk(L"BUTTON", L"Экран 2 (вторая область экрана)", chk, IDC_SRCON_SCREEN2);
+    Mk(L"BUTTON", L"Веб-камера", chk, IDC_SRCON_CAM);
+    Mk(L"BUTTON", L"Медиафайлы (картинки и видео)", chk, IDC_SRCON_MEDIA);
+    Mk(L"STATIC", L"Экран 1 включён всегда. Выключенные источники пропадают с вкладки «Источники» и из списков "
+                  L"главного и второго источника.", 0, IDC_SRCON_HINT);
     Mk(L"STATIC", L"Пауза и стоп", 0, IDC_PAUSE_HDR);
     Mk(L"STATIC", L"Показывать в камере:", 0, IDC_PAUSE_LABEL);
     AddCombo(IDC_PAUSE, {L"Последний кадр", L"Чёрный экран", L"Текст (ниже)", L"Свою картинку"});
@@ -5698,8 +6853,8 @@ static void CreateControls(HWND hwnd) {
     Mk(L"BUTTON", L"Сохранить…", btn, IDC_PROF_SAVE);
     Mk(L"BUTTON", L"Удалить", btn, IDC_PROF_DEL);
     Mk(L"STATIC",
-       L"Сцена запоминает обе области, окно, источники и раскладку, окошко, формы, надпись, логотип, медиафайлы и "
-       L"паузу. Формат, переходы и «держать веб-камеру» — общие для всех сцен. Кнопки 1–4 — первые четыре сцены.",
+       L"Сцена запоминает обе области, окно, источники и раскладку, кадр каждого источника, «Рядом», окошко, формы, "
+       L"надпись, логотип, медиафайлы и паузу. Формат, переходы, включённые источники и телефон — общие для всех сцен.",
        0, IDC_PROF_HINT);
 }
 // --- tooltips: what a control does + its hotkey (read live, so edited hotkeys show up at once)
@@ -5713,7 +6868,7 @@ static const TipDef kTips[] = {
     {IDC_PAUSEBTN, L"Пауза: в камере картинка паузы, всё остальное остаётся включённым. «Продолжить» — мгновенно.",
      HA_PAUSE},
     {IDC_PREVIEW, L"То, что видят другие. Окошко можно перетаскивать мышью, а за любой угол (белые квадратики) — "
-                  L"менять размер.", -1},
+                  L"менять размер. В раскладке «Рядом» тяните границу и картинки, колесо — масштаб.", -1},
     {IDC_SCENE1, L"Загрузить сцену 1 (первая в списке).", HA_PROFILE1},
     {IDC_SCENE2, L"Загрузить сцену 2 (вторая в списке).", HA_PROFILE2},
     {IDC_SCENE3, L"Загрузить сцену 3 (третья в списке).", HA_PROFILE3},
@@ -5736,7 +6891,29 @@ static const TipDef kTips[] = {
     {IDC_VIEW, L"Что показывать главным (большим) кадром. Клавиша меняет экран ↔ веб-камера.", HA_SCREEN_CAM},
     {IDC_LAYOUT, L"Только главный; второй источник окошком поверх; или оба рядом, каждый на половине кадра. "
                  L"Клавиша включает и выключает второй источник.", HA_PIP},
-    {IDC_PIPSRC, L"Второй источник — для окошка или для правой половины в раскладке «Рядом».", -1},
+    {IDC_PIPSRC, L"Второй источник — для окошка или для второй части в раскладке «Рядом».", -1},
+    {IDC_SIDEDIR, L"«Рядом»: делить кадр по вертикали (слева и справа) или по горизонтали (сверху и снизу).", -1},
+    {IDC_SIDESPLIT, L"«Рядом»: сколько процентов кадра занимает первая часть (главный источник). Ещё можно тянуть "
+                    L"границу в предпросмотре.", -1},
+    {IDC_SIDE_RESET, L"«Рядом»: граница посередине, обе картинки по центру и в 100%.", -1},
+    {IDC_SEC_S1, L"Показать или скрыть настройки Экрана 1.", -1},
+    {IDC_S2_ON, L"Включить Экран 2 — вторую область экрана — и показать её настройки. Снять галочку — выключить.", -1},
+    {IDC_SEC_CAM, L"Показать или скрыть настройки веб-камеры.", -1},
+    {IDC_SEC_PHONE, L"Показать или скрыть настройки телефона.", -1},
+    {IDC_SEC_MEDIA, L"Показать или скрыть список медиафайлов.", -1},
+    {IDC_SEC_TEXT, L"Показать или скрыть настройки надписи.", -1},
+    {IDC_SEC_LOGO, L"Показать или скрыть настройки логотипа.", -1},
+    {IDC_SEC_TRANS, L"Показать или скрыть настройки переходов.", -1},
+    {IDC_SEC_SRCSET, L"Какие источники включены.", -1},
+    {IDC_SRCON_PHONE, L"Телефон как источник (приложение WVC Phone по Wi-Fi или USB).", -1},
+    {IDC_SRCON_SCREEN2, L"Вторая область экрана: переключение «Экран 1 ⇄ 2» и второй источник.", -1},
+    {IDC_SRCON_CAM, L"Обычная веб-камера компьютера.", -1},
+    {IDC_SRCON_MEDIA, L"Картинки и видео из файлов.", -1},
+    {IDC_PHONE_VERT, L"Когда телефон — главный источник, камера WVC переключается на 9:16 (1080×1920 или 720×1280) — "
+                     L"для вертикального видео. Вернёте другой источник — вернётся обычный формат. Камера при этом "
+                     L"перезапускается: в Zoom/Telegram может понадобиться выключить и включить видео.", -1},
+    {IDC_PHONE_WIN, L"Отдельное окно с картинкой телефона и его настройками. Работает и без трансляции, на камеру WVC "
+                    L"не влияет.", -1},
     {IDC_SWAP, L"Поменять местами главный и второй источник.", HA_SWAP},
     {IDC_CAMDEV, L"Какая веб-камера используется (WVC Camera в списке не показывается).", -1},
     {IDC_CAMMIRROR, L"Отразить веб-камеру по горизонтали, как в зеркале.", -1},
@@ -5761,13 +6938,7 @@ static const TipDef kTips[] = {
                   L"Ещё можно тянуть за угол окошка в предпросмотре.", -1},
     {IDC_PIPSIZE_UD, L"Больше / меньше на 1%.", -1},
     {IDC_PIPSHAPE, L"Форма окошка. Круг и многоугольники — в квадрате.", -1},
-    {IDC_FIT, L"Как вписать картинку другой формы: с полями или обрезав края. В раскладке «Рядом» действует на обе "
-              L"половины (веб-камера справа всегда заполняет половину).", -1},
     {IDC_FRAMESHAPE, L"Форма всего кадра. Рамка на экране повторяет форму.", -1},
-    {IDC_SEC_FRAME, L"Показать или скрыть редкие настройки: поворот, увеличение, зеркало, курсор, фон формы.", -1},
-    {IDC_ROT, L"Повернуть главный источник.", -1},
-    {IDC_ZOOM, L"Увеличить центр главного источника.", -1},
-    {IDC_MIRROR, L"Отразить главный источник по горизонтали.", -1},
     {IDC_CURSOR, L"Показывать указатель мыши в кадре.", HA_CURSOR},
     {IDC_SHAPECOLOR, L"Цвет вокруг формы кадра или окошка.", -1},
     {IDC_TEXT, L"Текст надписи поверх кадра.", -1},
@@ -5806,8 +6977,11 @@ static void CreateTooltips(HWND hwnd) {
     if (!g_tips) return;
     SendMessageW(g_tips, TTM_SETMAXTIPWIDTH, 0, S(340));
     SendMessageW(g_tips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 15000);
-    for (const TipDef& t : kTips) {
-        HWND c = Ctl(t.id);
+    std::vector<int> ids;
+    for (const TipDef& t : kTips) ids.push_back(t.id);
+    for (int id = IDC_FR_BASE; id < IDC_LAST_ID; ++id) ids.push_back(id);
+    for (int id : ids) {
+        HWND c = Ctl(id);
         if (!c) continue;
         TTTOOLINFOW ti{};
         ti.cbSize = sizeof(ti);
@@ -5819,8 +6993,25 @@ static void CreateTooltips(HWND hwnd) {
     }
 }
 
+static const wchar_t* FrameTip(int off) {
+    switch (off) {
+    case FR_ROT: return L"Повернуть картинку этого источника (везде, где он показан).";
+    case FR_ZOOM: return L"Увеличить центр картинки этого источника.";
+    case FR_FIT: return L"Если пропорции не совпадают: «Вписать» — видно всё, по краям чёрные поля; «Заполнить» — без "
+                        L"полей, края обрезаются.";
+    case FR_CROP0: return L"Обрезать слева, % ширины источника.";
+    case FR_CROP1: return L"Обрезать сверху, % высоты источника.";
+    case FR_CROP2: return L"Обрезать справа, % ширины источника.";
+    case FR_CROP3: return L"Обрезать снизу, % высоты источника.";
+    case FR_MIRROR: return L"Отразить картинку этого источника по горизонтали.";
+    case FR_RESET: return L"Вернуть кадр этого источника: без поворота, обрезки и увеличения.";
+    }
+    return L"";
+}
+
 static const wchar_t* TooltipText(HWND ctl) {
     const int id = GetDlgCtrlID(ctl);
+    if (IsFrId(id)) return FrameTip((id - IDC_FR_BASE) % FR_STRIDE);
     for (const TipDef& t : kTips) {
         if (t.id != id) continue;
         g_tipText = t.text;
@@ -5853,7 +7044,31 @@ static void OnControlChanged(int id) {
     int W, H;
     {
         Settings cur = GetSettings();
-        OutSize(cur.quality, cur.aspect, &W, &H);
+        OutSizeS(cur, &W, &H);
+    }
+    if (IsFrId(id)) {  // the frame settings of one source
+        const int kind = (id - IDC_FR_BASE) / FR_STRIDE, off = (id - IDC_FR_BASE) % FR_STRIDE;
+        {
+            std::lock_guard<std::mutex> lk(g_setMx);
+            SrcFrame& f = g_set.fr[kind];
+            const int sel = (std::max)(0, static_cast<int>(SendMessageW(Ctl(id), CB_GETCURSEL, 0, 0)));
+            switch (off) {
+            case FR_ROT: f.rot = sel & 3; break;
+            case FR_ZOOM: f.zoom = (std::min)(sel, kZoomCount - 1); break;
+            case FR_FIT: f.fit = sel == 1 ? 1 : 0; break;
+            case FR_MIRROR: f.mirror = CheckGet(id); break;
+            case FR_CROP0: case FR_CROP1: case FR_CROP2: case FR_CROP3: {
+                wchar_t buf[16] = {};
+                GetWindowTextW(Ctl(id), buf, 16);
+                f.crop[off - FR_CROP0] = std::clamp(_wtoi(buf), 0, 45);
+                break;
+            }
+            default: return;
+            }
+        }
+        SaveSettings();
+        UpdateFrame();
+        return;
     }
     {
         std::lock_guard<std::mutex> lk(g_setMx);
@@ -5868,21 +7083,29 @@ static void OnControlChanged(int id) {
             s.fps = f;
             break;
         }
-        case IDC_FIT: s.fit = sel == 1 ? 1 : 0; break;
-        case IDC_ROT: s.rotation = sel & 3; break;
-        case IDC_ZOOM: s.zoom = (std::min)(sel, kZoomCount - 1); break;
         case IDC_FRAMESHAPE: s.frameShape = (std::min)(sel, kShapeCount - 1); break;
         case IDC_SHAPECOLOR: s.shapeColor = (std::min)(sel, 3); break;
-        case IDC_MIRROR: s.mirror = CheckGet(id); break;
         case IDC_CURSOR: s.cursor = CheckGet(id); break;
         case IDC_WINCAP: s.winCapture = sel == 1 ? 1 : 0; break;
-        case IDC_VIEW: s.mainSrc = (std::min)(sel, 4); layers = true; break;
+        case IDC_VIEW:
+            if (sel < static_cast<int>(g_viewKinds.size())) s.mainSrc = g_viewKinds[sel];
+            layers = true;
+            break;
         case IDC_LAYOUT: s.layout = (std::min)(sel, 2); layers = true; break;
         case IDC_PIPSRC:
-            s.pipSrc = std::clamp(sel + 1, 1, 5);
+            if (sel < static_cast<int>(g_secondKinds.size())) s.pipSrc = g_secondKinds[sel] + 1;
             if (s.layout == 0) s.layout = 1;  // picking a second source = show it
             layers = true;
             break;
+        case IDC_SIDEDIR: s.sideVertical = sel == 1; break;
+        case IDC_SIDESPLIT: {
+            BOOL ok = FALSE;
+            const int pct = static_cast<int>(GetDlgItemInt(GetParent(Ctl(IDC_SIDESPLIT)), IDC_SIDESPLIT, &ok, FALSE));
+            if (!ok || pct < 10 || pct > 90) break;  // still typing
+            s.sideSplit = pct * 100;
+            break;
+        }
+        case IDC_PHONE_VERT: s.phoneVertical = CheckGet(id); layers = true; break;
         case IDC_KEEPCAM: s.keepCamOn = CheckGet(id); layers = true; break;
         case IDC_PHONE_RES: s.phoneRes = (std::min)(sel, 1); phoneRes = true; break;
         case IDC_PHONE_MODE: phoneMode = (std::min)(sel, 1) != s.phoneConn; s.phoneConn = (std::min)(sel, 1); break;
@@ -5944,6 +7167,7 @@ static void OnControlChanged(int id) {
     }
     SaveSettings();
     if (format) RestartCameraForFormat();
+    if (id == IDC_PHONE_VERT || id == IDC_VIEW || id == IDC_LAYOUT) CheckCameraFormat();
     if (phoneRes) PhoneSendRes(GetSettings().phoneRes);
     if (phoneMode) {
         g_phoneNote.clear();
@@ -5982,7 +7206,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_dpi = GetDpiForWindow(hwnd);
         RegisterHotkeys(hwnd);
         MakeFont();
-        g_expanded = IniInt(kMainSec, L"UiExpanded", 0) & (SEC_WIN | SEC_FRAME | SEC_KEYS);
+        g_expanded = IniInt(kMainSec, L"UiExpanded", 0) & SEC_ALL;
+        if (IniInt(kMainSec, L"UiVer", 0) < 10) {  // v0.10 blocks start open
+            g_expanded |= SEC_S1 | SEC_CAM | SEC_MEDIA | SEC_PHONE | SEC_TEXT | SEC_LOGO | SEC_TRANS | SEC_SRCSET;
+            IniSetInt(kMainSec, L"UiExpanded", g_expanded);
+            IniSetInt(kMainSec, L"UiVer", 10);
+        }
         CreateControls(hwnd);
         ResizeForDpi(hwnd);
         Layout();
@@ -6041,6 +7270,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT pr;
         if (g_pageWnd[g_page] && GetWindowRect(g_pageWnd[g_page], &pr) && PtInRect(&pr, pt))
             return SendMessageW(g_pageWnd[g_page], WM_MOUSEWHEEL, wp, lp);
+        if (g_preview && GetWindowRect(g_preview, &pr) && PtInRect(&pr, pt))
+            return SendMessageW(g_preview, WM_MOUSEWHEEL, wp, lp);
         break;
     }
     case WM_NOTIFY: {
@@ -6070,6 +7301,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) InvalidateRect(g_preview, nullptr, FALSE);
         } else if (wp == kTimerFollow) {
             SyncSources();
+            CheckCameraFormat();  // 9:16 while the phone is the main source (vertical mode), back otherwise
             UpdateFrame();  // follows a moving window, picks up colour / shape changes
         }
         return 0;
@@ -6151,7 +7383,16 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
-        if (wp == SIZE_MINIMIZED) ShowWindow(hwnd, SW_HIDE);  // live in the tray
+        if (wp == SIZE_MINIMIZED)
+            ShowWindow(hwnd, SW_HIDE);  // live in the tray
+        else
+            RedrawAll(hwnd);            // back from the tray / minimised: repaint every control
+        return 0;
+    case WM_SHOWWINDOW:
+        if (wp) PostMessageW(hwnd, WM_APP + 20, 0, 0);  // repaint once it is really shown
+        break;
+    case WM_APP + 20:
+        RedrawAll(hwnd);
         return 0;
     case WM_TRAY:
         if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
@@ -6182,9 +7423,31 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_SELECT2: DoSelectRegionN(1); break;
         case IDC_MONITOR2: ShowMonitorMenu(1); break;
         case IDC_SCR_TOGGLE: ToggleScreens(); break;
-        case IDC_SEC_WIN: ToggleSection(SEC_WIN); break;
-        case IDC_SEC_FRAME: ToggleSection(SEC_FRAME); break;
-        case IDC_SEC_KEYS: ToggleSection(SEC_KEYS); break;
+        case IDC_SEC_WIN:
+        case IDC_SEC_KEYS:
+        case IDC_SEC_S1:
+        case IDC_SEC_CAM:
+        case IDC_SEC_PHONE:
+        case IDC_SEC_MEDIA:
+        case IDC_SEC_TEXT:
+        case IDC_SEC_LOGO:
+        case IDC_SEC_TRANS:
+        case IDC_SEC_SRCSET: ToggleSection(SecBit(id)); break;
+        case IDC_S2_ON:
+        case IDC_SRCON_SCREEN2:
+            if (code == BN_CLICKED && !g_syncing) SetSourceOn(KIND_SCREEN2, CheckGet(id));
+            break;
+        case IDC_SRCON_PHONE:
+            if (code == BN_CLICKED && !g_syncing) SetSourceOn(KIND_PHONE, CheckGet(id));
+            break;
+        case IDC_SRCON_CAM:
+            if (code == BN_CLICKED && !g_syncing) SetSourceOn(KIND_CAM, CheckGet(id));
+            break;
+        case IDC_SRCON_MEDIA:
+            if (code == BN_CLICKED && !g_syncing) SetSourceOn(KIND_MEDIA, CheckGet(id));
+            break;
+        case IDC_PHONE_WIN: OpenPhoneWindow(); break;
+        case IDC_SIDE_RESET: ResetSide(); break;
         case IDC_SCENE1:
         case IDC_SCENE2:
         case IDC_SCENE3:
@@ -6296,7 +7559,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (code == EN_CHANGE) OnControlChanged(id);
             break;
         case IDC_KEEPCAM:
-        case IDC_MIRROR:
+        case IDC_PHONE_VERT:
         case IDC_CURSOR:
         case IDC_CAMMIRROR:
         case IDC_TEXTON:
@@ -6304,12 +7567,26 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (code == BN_CLICKED) OnControlChanged(id);
             break;
         case IDC_PIPSIZE:
+        case IDC_SIDESPLIT:
             if (code == EN_CHANGE) OnControlChanged(id);
             break;
         case ID_TRAY_PAUSE:
         case IDC_PAUSEBTN: TogglePause(); break;
         default:
-            if (code == CBN_SELCHANGE) OnControlChanged(id);
+            if (IsFrId(id)) {
+                const int off = (id - IDC_FR_BASE) % FR_STRIDE;
+                if (off == FR_RESET) {
+                    if (code == BN_CLICKED) ResetSourceFrame((id - IDC_FR_BASE) / FR_STRIDE);
+                } else if (off == FR_MIRROR) {
+                    if (code == BN_CLICKED) OnControlChanged(id);
+                } else if (off >= FR_CROP0 && off <= FR_CROP3) {
+                    if (code == EN_CHANGE) OnControlChanged(id);
+                } else if (code == CBN_SELCHANGE) {
+                    OnControlChanged(id);
+                }
+            } else if (code == CBN_SELCHANGE) {
+                OnControlChanged(id);
+            }
             break;
         }
         return 0;
@@ -6318,6 +7595,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        if (g_phoneWin) DestroyWindow(g_phoneWin);
         g_phoneNotify = nullptr;
         RestoreHiddenWindow();
         UnregisterHotkeys(hwnd);
@@ -6369,6 +7647,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
             s.srcWindow = FindWindowByTitle(s.srcTitle);
             if (!s.srcWindow) s.srcMode = 0;
         }
+        g_note = EnforceSources(s);
         std::lock_guard<std::mutex> lk(g_setMx);
         g_set = s;
     }
@@ -6411,6 +7690,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     }
 
     WNDCLASSW pc{};
+    pc.style = CS_DBLCLKS;
     pc.lpfnWndProc = PreviewProc;
     pc.hInstance = hInst;
     pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -6438,6 +7718,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     pg.lpszClassName = L"WVCPage";
     RegisterClassW(&pg);
 
+    WNDCLASSW pwc{};
+    pwc.lpfnWndProc = PhoneWinProc;
+    pwc.hInstance = hInst;
+    pwc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pwc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    pwc.hbrBackground = nullptr;  // the toolbar background is painted in WM_ERASEBKGND
+    pwc.lpszClassName = L"WVCPhoneWin";
+    RegisterClassW(&pwc);
+
     WNDCLASSW wc{};
     wc.lpfnWndProc = MainProc;
     wc.hInstance = hInst;
@@ -6447,8 +7736,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     wc.lpszClassName = L"WVCMain";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC 0.9 — виртуальная камера",
-                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
+    HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC 0.10 — виртуальная камера",
+                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                 940, 660, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
     const bool tray = cmdLine && wcsstr(cmdLine, L"--tray");

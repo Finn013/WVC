@@ -11,8 +11,8 @@ android {
         applicationId = "com.wvc.phone"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.9"
+        versionCode = 3
+        versionName = "0.10"
     }
 
     signingConfigs {
@@ -47,4 +47,5 @@ dependencies {
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
+    implementation("androidx.annotation:annotation-experimental:1.4.1")
 }

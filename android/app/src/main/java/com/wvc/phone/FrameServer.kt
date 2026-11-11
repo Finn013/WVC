@@ -15,7 +15,8 @@ import java.net.Socket
  * TCP server for WVC (port 47800) + UDP discovery (port 47801). See docs/PHONE-PROTOCOL.md.
  * One client at a time: a new connection replaces the old one.
  * Listens on all interfaces, loopback included: over a USB cable WVC comes through `adb forward` from 127.0.0.1.
- * Frames are never queued: while one frame is being sent, new ones are dropped (latency first).
+ * One-frame queue: a frame waits while the previous one is being sent; a newer frame replaces it (latency first).
+ * JPEG quality adapts: when frames have to be replaced often (slow Wi-Fi), the encoders are asked for less.
  */
 class FrameServer(private val listener: Listener, private val deviceName: String) {
 
@@ -46,6 +47,12 @@ class FrameServer(private val listener: Listener, private val deviceName: String
     private val pendingTexts = ArrayList<String>()
     private var sending = false
 
+    // adaptive JPEG quality (guarded by lock)
+    private var produced = 0
+    private var dropped = 0
+    private var qualityOffset = 0  // 0 .. -35
+    private var qualityCheckedAt = 0L
+
     @Volatile private var writeStartedAt = 0L
     @Volatile var framesSent = 0
         private set
@@ -71,12 +78,32 @@ class FrameServer(private val listener: Listener, private val deviceName: String
         }
     }
 
-    /** true when a frame would be sent right away (encode only then) */
-    fun wantsFrame(): Boolean = synchronized(lock) { client != null && pendingFrame == null && !sending }
+    /** true when a frame would not have to wait behind another one (it may be encoded while one is sent) */
+    fun wantsFrame(): Boolean = synchronized(lock) { client != null && pendingFrame == null }
+
+    fun hasClient(): Boolean = synchronized(lock) { client != null }
+
+    /** JPEG quality to use now: [base] lowered while the network cannot keep up, raised back when it can. */
+    fun jpegQuality(base: Int): Int = synchronized(lock) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - qualityCheckedAt >= 1000) {
+            if (produced >= 5) {
+                val ratio = dropped.toDouble() / produced
+                if (ratio > 0.25) qualityOffset = maxOf(-35, qualityOffset - 10)
+                else if (ratio < 0.05) qualityOffset = minOf(0, qualityOffset + 5)
+            }
+            produced = 0
+            dropped = 0
+            qualityCheckedAt = now
+        }
+        (base + qualityOffset).coerceIn(40, 95)
+    }
 
     fun sendFrame(jpeg: ByteArray, len: Int, width: Int, height: Int, rotation: Int) {
         synchronized(lock) {
             if (client == null) return
+            produced++
+            if (pendingFrame != null) dropped++  // the network is behind: the older frame is replaced
             pendingFrame = jpeg
             pendingLen = len
             pendingW = width
@@ -129,6 +156,7 @@ class FrameServer(private val listener: Listener, private val deviceName: String
                     closeClientLocked()  // the newest WVC wins
                     client = s
                     out = stream
+                    qualityOffset = 0
                     lock.notifyAll()
                 }
                 val addr = s.inetAddress?.hostAddress ?: "?"
