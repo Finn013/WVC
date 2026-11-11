@@ -148,7 +148,7 @@ class FrameServer(private val listener: Listener, private val deviceName: String
             }
         } catch (_: Exception) {
         }
-        var wasCurrent = false
+        val wasCurrent: Boolean
         synchronized(lock) {
             wasCurrent = client === s
             if (wasCurrent) closeClientLocked()
@@ -158,14 +158,14 @@ class FrameServer(private val listener: Listener, private val deviceName: String
 
     private fun sendLoop() {
         while (running) {
-            var stream: OutputStream? = null
-            var frame: ByteArray? = null
-            var len = 0
-            var w = 0
-            var h = 0
-            var rot = 0
-            var texts: List<String> = emptyList()
-            var sock: Socket? = null
+            val stream: OutputStream?
+            val frame: ByteArray?
+            val len: Int
+            val w: Int
+            val h: Int
+            val rot: Int
+            val texts: List<String>
+            val sock: Socket?
             synchronized(lock) {
                 while (running && (client == null || (pendingFrame == null && pendingTexts.isEmpty()))) {
                     try { lock.wait(1000) } catch (_: InterruptedException) {}
@@ -206,7 +206,7 @@ class FrameServer(private val listener: Listener, private val deviceName: String
                     if (f != null) framesSent++
                 }
             } catch (e: Exception) {
-                var wasCurrent = false
+                val wasCurrent: Boolean
                 synchronized(lock) {
                     wasCurrent = client === sock
                     if (wasCurrent) closeClientLocked()
