@@ -1075,7 +1075,7 @@ struct OutputStage {
     std::wstring maskKey;
     std::vector<uint8_t> mask;
     std::wstring bgKey;
-    Surface bg, small;
+    Surface bg, smallS;
     std::vector<uint8_t> blurPx;
 
     // applies the shape inside V on the canvas (in place); returns V
@@ -1098,13 +1098,13 @@ struct OutputStage {
         const uint8_t* bgp = nullptr;
         if (o.bgMode == 1) {
             const int sw = (std::max)(4, vw / 8), sh = (std::max)(4, vh / 8);
-            if (small.Ensure(ref, sw, sh) && bg.Ensure(ref, vw, vh)) {
-                StretchBlt(small.dc, 0, 0, sw, sh, canvas.dc, V.left, V.top, vw, vh, SRCCOPY);
+            if (smallS.Ensure(ref, sw, sh) && bg.Ensure(ref, vw, vh)) {
+                StretchBlt(smallS.dc, 0, 0, sw, sh, canvas.dc, V.left, V.top, vw, vh, SRCCOPY);
                 GdiFlush();
-                blurPx.assign(small.bits, small.bits + static_cast<size_t>(sw) * sh * 4);
+                blurPx.assign(smallS.bits, smallS.bits + static_cast<size_t>(sw) * sh * 4);
                 BoxBlur(blurPx, sw, sh, 3);
-                std::memcpy(small.bits, blurPx.data(), blurPx.size());
-                StretchBlt(bg.dc, 0, 0, vw, vh, small.dc, 0, 0, sw, sh, SRCCOPY);
+                std::memcpy(smallS.bits, blurPx.data(), blurPx.size());
+                StretchBlt(bg.dc, 0, 0, vw, vh, smallS.dc, 0, 0, sw, sh, SRCCOPY);
                 GdiFlush();
                 bgp = bg.bits;
             }
