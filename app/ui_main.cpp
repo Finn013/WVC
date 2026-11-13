@@ -2998,7 +2998,8 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
                 InvalidateRect(C(IDC_PROGRAM), nullptr, FALSE);
                 static int k = 0;
-                if (g_editNext || ++k % 3 == 0) InvalidateRect(C(IDC_NEXTPV), nullptr, FALSE);
+                if (!g_docks.vis[DOCK_NEXT] || g_docks.coll[DOCK_NEXT]) g_pubNext.wantW = 0;  // panel closed: not drawn
+                else if (g_editNext || ++k % 3 == 0) InvalidateRect(C(IDC_NEXTPV), nullptr, FALSE);
             } else {
                 g_pubProgram.wantW = 0;
                 g_pubNext.wantW = 0;

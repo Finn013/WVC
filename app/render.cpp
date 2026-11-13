@@ -558,7 +558,7 @@ struct InSurf {
     int w = 0, h = 0;
 };
 
-inline uint8_t Mul255(int a, int b) { return static_cast<uint8_t>((a * b + 127) / 255); }
+[[maybe_unused]] inline uint8_t Mul255(int a, int b) { return static_cast<uint8_t>((a * b + 127) / 255); }
 }  // namespace
 
 class Renderer {
@@ -1032,7 +1032,6 @@ private:
                 dp[2] = static_cast<uint8_t>((std::min)(255, sp[2] + dp[2] * ia / 255));
             }
         }
-        (void)Mul255;
     }
 };
 
