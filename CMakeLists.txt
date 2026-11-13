@@ -43,7 +43,7 @@ target_link_libraries(softcamcore PUBLIC baseclasses)
 target_compile_definitions(softcamcore PRIVATE NDEBUG)
 
 # --- camera DLL: WVCCam.dll (x64) / WVCCam32.dll (x86) ---
-add_library(wvccam SHARED ${SC}/softcam/softcam.cpp ${SC}/softcam/softcam.def)
+add_library(wvccam SHARED ${SC}/softcam/softcam.cpp ${SC}/softcam/softcam.def ${SC}/softcam/softcam.rc)
 target_include_directories(wvccam PRIVATE ${SC}/softcam)
 target_compile_definitions(wvccam PRIVATE NDEBUG)
 target_link_libraries(wvccam PRIVATE softcamcore baseclasses strmiids winmm ole32 oleaut32 uuid user32 gdi32 advapi32)
@@ -56,8 +56,9 @@ endif()
 # --- the app (64-bit only) ---
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_executable(WVC WIN32 app/ui_main.cpp app/ui_props.cpp app/ui_settings.cpp app/model.cpp app/render.cpp
-        app/inputs.cpp app/h264.cpp app/util.cpp app/app.rc app/app.manifest)
+        app/inputs.cpp app/h264.cpp app/util.cpp app/transition.cpp app/log.cpp app/update.cpp app/undo.cpp app/docks.cpp
+        app/app.rc app/app.manifest)
     target_compile_definitions(WVC PRIVATE NOMINMAX)
-    target_link_libraries(WVC PRIVATE user32 gdi32 shell32 advapi32 comctl32 ole32 dwmapi comdlg32 windowscodecs uxtheme mfplat mf mfreadwrite mfuuid ws2_32 iphlpapi msimg32)
+    target_link_libraries(WVC PRIVATE user32 gdi32 shell32 advapi32 comctl32 ole32 dwmapi comdlg32 windowscodecs uxtheme mfplat mf mfreadwrite mfuuid ws2_32 iphlpapi msimg32 winhttp strmiids)
     add_dependencies(WVC wvccam)
 endif()

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <mutex> // lock_guard
+#include <cstring>
 
 
 namespace softcam {
@@ -258,6 +259,47 @@ void FrameBuffer::transferToDIB(void* image_bits, uint64_t* out_frame_counter)
         }
         *out_frame_counter = frame->m_frame_counter;
     }
+}
+
+void FrameBuffer::transferToDIBScaled(void* image_bits, int dw, int dh, uint64_t* out_frame_counter)
+{
+    const int dstride = (dw * 3 + 3) & ~3;
+    std::uint8_t* dest = (std::uint8_t*)image_bits;
+    std::memset(dest, 0, (std::size_t)dstride * (std::size_t)dh);
+    if (!m_shmem || dw <= 0 || dh <= 0)
+    {
+        *out_frame_counter = 0;
+        return;
+    }
+    std::lock_guard<NamedMutex> lock(m_mutex);
+    auto frame = header();
+    const int sw = frame->m_width, sh = frame->m_height;
+    // fit
+    int fw = dw, fh = (int)((long long)dw * sh / (sw ? sw : 1));
+    if (fh > dh)
+    {
+        fh = dh;
+        fw = (int)((long long)dh * sw / (sh ? sh : 1));
+    }
+    if (fw < 1) fw = 1;
+    if (fh < 1) fh = 1;
+    const int ox = (dw - fw) / 2, oy = (dh - fh) / 2;
+    const std::uint8_t* image = frame->imageData();
+    for (int y = 0; y < fh; y++)
+    {
+        const int sy = (int)((long long)y * sh / fh);              // top-down source row
+        std::uint8_t* d = dest + (std::size_t)dstride * (std::size_t)(dh - 1 - (oy + y)) + (std::size_t)ox * 3;
+        const std::uint8_t* srow = image + (std::size_t)3 * sw * sy;
+        for (int x = 0; x < fw; x++)
+        {
+            const std::uint8_t* s = srow + (std::size_t)3 * ((long long)x * sw / fw);
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+            d += 3;
+        }
+    }
+    *out_frame_counter = frame->m_frame_counter;
 }
 
 bool FrameBuffer::waitForNewFrame(uint64_t frame_counter, float time_out)

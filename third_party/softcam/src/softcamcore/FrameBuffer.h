@@ -38,6 +38,8 @@ class FrameBuffer
     void            deactivate();
     void            write(const void* image_bits);
     void            transferToDIB(void* image_bits, uint64_t* out_frame_counter);
+    // WVC: the sender's picture fitted (keeping proportions, black bars) into a DIB of another size
+    void            transferToDIBScaled(void* image_bits, int dst_width, int dst_height, uint64_t* out_frame_counter);
     bool            waitForNewFrame(uint64_t frame_counter, float time_out = 0.5f);
 
     void            release();

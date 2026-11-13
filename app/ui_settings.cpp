@@ -10,7 +10,7 @@ const HotkeyDef kHotkeys[HA_COUNT] = {
     {L"Выделить область (выбранный источник «Экран»)", MOD_CONTROL | MOD_SHIFT, VK_F6},
     {L"Следующий монитор (для области / монитора)", MOD_CONTROL | MOD_SHIFT, VK_F7},
     {L"Курсор вкл/выкл (источники экрана)", MOD_CONTROL | MOD_SHIFT, VK_F8},
-    {L"Сейчас ⇄ Следующий (с переходом)", MOD_CONTROL | MOD_SHIFT, VK_F9},
+    {L"«Следующий» в эфир ⇅ (Сейчас ⇄ Следующий, с переходом)", MOD_CONTROL | MOD_SHIFT, VK_F9},
     {L"Показать/скрыть выбранный источник", MOD_CONTROL | MOD_SHIFT, VK_F10},
     {L"Текст вкл/выкл (все источники «Текст» сцены)", MOD_CONTROL | MOD_SHIFT, VK_F11},
     {L"Сцена 1", MOD_CONTROL | MOD_SHIFT, '1'},
@@ -301,6 +301,79 @@ void ReloadAfterImport() {
 }
 
 // ---------------------------------------------------------------------------
+// Placeholder for the camera DLL: a 24-bit BMP in %ProgramData%\\WVC (path in HKCU\\Software\\WVC\\Placeholder)
+// ---------------------------------------------------------------------------
+static std::wstring PlaceholderDir() {
+    wchar_t pd[MAX_PATH] = {};
+    std::wstring dir;
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, pd)) && pd[0]) dir = std::wstring(pd) + L"\\WVC";
+    if (!dir.empty() && (CreateDirectoryW(dir.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS)) return dir;
+    wchar_t buf[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) {
+        dir = std::wstring(buf) + L"\\WVC";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
+    }
+    return L"";
+}
+
+bool WritePlaceholder(const std::wstring& image) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\WVC", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+        return false;
+    bool ok = true;
+    if (image.empty()) {
+        RegDeleteValueW(k, L"Placeholder");
+    } else {
+        std::vector<uint8_t> px;
+        int w = 0, h = 0;
+        const std::wstring dir = PlaceholderDir();
+        ok = false;
+        if (!dir.empty() && LoadImageScaled(image, 1920, 1080, GUID_WICPixelFormat32bppBGR, px, &w, &h) && w > 0 && h > 0) {
+            const std::wstring path = dir + L"\\placeholder.bmp";
+            const int stride = (w * 3 + 3) & ~3;
+            BITMAPFILEHEADER fh{};
+            BITMAPINFOHEADER ih{};
+            ih.biSize = sizeof(ih);
+            ih.biWidth = w;
+            ih.biHeight = h;
+            ih.biPlanes = 1;
+            ih.biBitCount = 24;
+            ih.biCompression = BI_RGB;
+            ih.biSizeImage = static_cast<DWORD>(stride) * h;
+            fh.bfType = 0x4D42;
+            fh.bfOffBits = sizeof(fh) + sizeof(ih);
+            fh.bfSize = fh.bfOffBits + ih.biSizeImage;
+            std::vector<uint8_t> data(ih.biSizeImage, 0);
+            for (int y = 0; y < h; ++y) {
+                const uint8_t* s = px.data() + static_cast<size_t>(h - 1 - y) * w * 4;
+                uint8_t* d = data.data() + static_cast<size_t>(y) * stride;
+                for (int x = 0; x < w; ++x, s += 4, d += 3) {
+                    d[0] = s[0];
+                    d[1] = s[1];
+                    d[2] = s[2];
+                }
+            }
+            HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                DWORD wr = 0;
+                ok = WriteFile(f, &fh, sizeof(fh), &wr, nullptr) && WriteFile(f, &ih, sizeof(ih), &wr, nullptr) &&
+                     WriteFile(f, data.data(), static_cast<DWORD>(data.size()), &wr, nullptr);
+                CloseHandle(f);
+            }
+            if (ok)
+                RegSetValueExW(k, L"Placeholder", 0, REG_SZ, reinterpret_cast<const BYTE*>(path.c_str()),
+                               static_cast<DWORD>((path.size() + 1) * sizeof(wchar_t)));
+        }
+        if (!ok) RegDeleteValueW(k, L"Placeholder");
+        if (ok) LogMsg(L"Заставка камеры: " + image);
+        else LogErr(L"Не удалось сделать заставку из " + image);
+    }
+    RegCloseKey(k);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // The settings window
 // ---------------------------------------------------------------------------
 namespace {
@@ -312,6 +385,7 @@ enum {
     S_OCROP0_UD, S_OCROP1, S_OCROP1_UD, S_OCROP2, S_OCROP2_UD, S_OCROP3, S_OCROP3_UD, S_OBG, S_OCOLOR, S_OIMG, S_OIMG_BTN,
     S_HK0 = 400, S_HKCLR0 = 450, S_HKDEF = 499,
     S_PCONN = 500, S_PRES, S_PCODEC, S_PROT,
+    S_GLARE = 250, S_UPDCHECK, S_UPDNOW, S_PHOLDER, S_PHOLDER_BTN, S_PHOLDER_CLR, S_LOGWIN,
     S_KEEPCAM = 600, S_INSTALL, S_UNINSTALL, S_CAMSTATE, S_EXPORT, S_IMPORT, S_OPENDIR,
 };
 const int kPages = 5;
@@ -368,6 +442,9 @@ void SyncAll() {
     BSet(S_CLOSETRAY, p.closeToTray);
     BSet(S_IDLEFRAME, p.idleFrame);
     BSet(S_LIVE, p.liveWhenStopped);
+    BSet(S_GLARE, p.hideStartGlare);
+    BSet(S_UPDCHECK, p.checkUpdates);
+    TSet(S_PHOLDER, p.placeholder.empty() ? std::wstring(L"(по умолчанию: значок WVC и «WVC не запущен»)") : p.placeholder);
     CSet(S_PAUSEMODE, p.pauseMode);
     TSet(S_PAUSETEXT, p.pauseText);
     TSet(S_PAUSEIMG, p.pauseImage);
@@ -423,6 +500,8 @@ void ReadAll() {
     p.closeToTray = BGet(S_CLOSETRAY);
     p.idleFrame = BGet(S_IDLEFRAME);
     p.liveWhenStopped = BGet(S_LIVE);
+    p.hideStartGlare = BGet(S_GLARE);
+    p.checkUpdates = BGet(S_UPDCHECK);
     p.pauseMode = std::clamp(CGet(S_PAUSEMODE), 0, 3);
     p.pauseText = TGet(S_PAUSETEXT);
     p.pauseImage = TGet(S_PAUSEIMG);
@@ -478,7 +557,13 @@ bool Apply() {
         p.defPhoneRes = w.defPhoneRes;
         p.defPhoneCodec = w.defPhoneCodec;
         p.defAutoRotate = w.defAutoRotate;
+        p.hideStartGlare = w.hideStartGlare;
+        p.checkUpdates = w.checkUpdates;
+        p.placeholder = w.placeholder;
     });
+    if (!WritePlaceholder(w.placeholder))
+        MessageBoxW(s.dlg, L"Не удалось подготовить заставку из этой картинки — камера покажет заставку по умолчанию.", L"WVC",
+                    MB_ICONWARNING);
     g_pauseDirty = true;
     for (int i = 0; i < HA_COUNT; ++i) g_hk[i] = s.hk[i];
     SaveHotkeysToIni();
@@ -638,6 +723,20 @@ void OnSetCommand(int id, int code) {
         for (int i = 0; i < HA_COUNT; ++i)
             SendMessageW(Q(S_HK0 + i), HKM_SETHOTKEY, ToHotkeyCtl(HkPack(kHotkeys[i].defMods, kHotkeys[i].defVk)), 0);
         return;
+    case S_PHOLDER_BTN: {
+        std::wstring f;
+        if (PickFile(s.dlg, kImageFilter(), &f)) {
+            s.work.placeholder = f;
+            TSet(S_PHOLDER, f);
+        }
+        return;
+    }
+    case S_PHOLDER_CLR:
+        s.work.placeholder.clear();
+        TSet(S_PHOLDER, L"(по умолчанию: значок WVC и «WVC не запущен»)");
+        return;
+    case S_UPDNOW: CheckUpdates(true); return;
+    case S_LOGWIN: OpenLogWindow(); return;
     case S_INSTALL: DoInstall(true); SyncAll(); return;
     case S_UNINSTALL: DoInstall(false); SyncAll(); return;
     case S_EXPORT: DoExportJson(s.dlg); return;
@@ -727,6 +826,26 @@ void BuildPages(SetState& s, int formW, int formH, int formX) {
         keep(S_IDLEFRAME, f.Check(L"Зелёная рамка вокруг области, пока камера остановлена", S_IDLEFRAME));
         keep(S_LIVE, f.Check(L"Живой предпросмотр, пока камера остановлена (источники включены)", S_LIVE));
         f.Hint(L"Без живого предпросмотра веб-камера и телефон включаются только во время трансляции, как раньше.", 2);
+        keep(S_GLARE, f.Check(L"Скрывать засвет при старте веб-камеры и камеры телефона", S_GLARE));
+        f.Hint(L"Пока камера подстраивает экспозицию (до 2 с), показывается прошлый кадр или чёрный.", 1);
+        keep(S_UPDCHECK, f.Check(L"Проверять обновления при запуске", S_UPDCHECK));
+        {
+            const int y = f.y;
+            f.Make(L"BUTTON", L"Проверить обновления", WS_TABSTOP | BS_PUSHBUTTON, S_UPDNOW, f.cx, y, 190, 28);
+            f.Make(L"BUTTON", L"Журнал…", WS_TABSTOP | BS_PUSHBUTTON, S_LOGWIN, f.cx + 198, y, 110, 28);
+            f.y += 36;
+        }
+        f.Header(L"Заставка, когда WVC закрыт");
+        {
+            const int y = f.y;
+            keep(S_PHOLDER, f.Make(L"EDIT", L"", ES_READONLY | ES_AUTOHSCROLL, S_PHOLDER, f.lx, y, f.cx + f.cw - f.lx - 200, 24,
+                                   WS_EX_CLIENTEDGE));
+            f.Make(L"BUTTON", L"Выбрать…", WS_TABSTOP | BS_PUSHBUTTON, S_PHOLDER_BTN, f.cx + f.cw - 194, y, 90, 26);
+            f.Make(L"BUTTON", L"По умолчанию", WS_TABSTOP | BS_PUSHBUTTON, S_PHOLDER_CLR, f.cx + f.cw - 100, y, 100, 26);
+            f.y += 34;
+        }
+        f.Hint(L"Камера «WVC Camera» открывается в Zoom/Telegram/браузере, даже когда WVC не запущен, и показывает эту "
+               L"картинку. Запустите WVC — картинка сразу сменится на сцену.", 2);
         f.Header(L"Пауза и остановленная камера");
         keep(S_PAUSEMODE, f.Combo(L"Что показывать:", S_PAUSEMODE, {L"Последний кадр", L"Чёрный экран", L"Текст (ниже)", L"Картинку"}, 220));
         keep(S_PAUSETEXT, f.Row(L"Текст паузы:", L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, S_PAUSETEXT, 24, -1, WS_EX_CLIENTEDGE));
@@ -851,7 +970,7 @@ void OpenSettings(int page) {
         WNDCLASSW wc{};
         wc.hInstance = g_hInst;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        wc.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(1));
         wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
         wc.lpfnWndProc = SettingsProc;
         wc.lpszClassName = L"WVCSettings";

@@ -100,13 +100,27 @@ jobs:
           name: WVC-Phone
           path: dist
 
+      - uses: actions/checkout@v4
+        with:
+          path: src
+          sparse-checkout: app/common.h
+          sparse-checkout-cone-mode: false
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           ls -la dist
+          # only the newest commit of main may replace "latest" (an old, late run must not overwrite it)
+          HEAD_SHA=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          if [ "$HEAD_SHA" != "$GITHUB_SHA" ]; then
+            echo "main is at $HEAD_SHA, this run is for $GITHUB_SHA — not publishing"; exit 0
+          fi
+          VER=$(grep -oP '#define WVC_VERSION L"\K[0-9.]+' src/app/common.h)
+          echo "version $VER"
           gh release delete latest --yes --cleanup-tag || true
           gh release create latest dist/WVC.zip dist/WVC-Phone.apk --prerelease --target "$GITHUB_SHA" \
-            --title "WVC — сборка $GITHUB_RUN_NUMBER" \
-            --notes "Автоматическая сборка из коммита ${GITHUB_SHA::7}. WVC.zip — программа для Windows (с adb для телефона по USB), WVC-Phone.apk — приложение для Android (телефон как камера)."
+            --title "WVC $VER — сборка $GITHUB_RUN_NUMBER" \
+            --notes "version: $VER
+          Автоматическая сборка из коммита ${GITHUB_SHA::7}. WVC.zip — программа для Windows (с adb для телефона по USB), WVC-Phone.apk — приложение для Android (телефон как камера)."

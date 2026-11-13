@@ -36,6 +36,7 @@ public:
 private:
     CCritSec    m_critsec;
     FrameBuffer m_frame_buffer;
+    unsigned long m_last_open_try = 0;  // WVC: GetTickCount of the last attempt to find the sender
     const bool  m_valid;
     const int   m_width;
     const int   m_height;
@@ -89,7 +90,9 @@ private:
     const int   m_width;
     const int   m_height;
     uint64_t    m_frame_counter = 0;
-    std::unique_ptr<uint8_t[]>  m_screenshot;
+    std::unique_ptr<uint8_t[]>  m_screenshot;   // WVC: the placeholder frame (DIB), built when first needed
+    bool        m_placeholder_ready = false;
+    void        buildPlaceholder();
 
     CCritSec m_critsec;
     CRefTime m_sample_time;

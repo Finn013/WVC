@@ -225,6 +225,7 @@ static void ItemToIni(const Item& it, IniDoc* d, const std::wstring& sec) {
     case IT_WINDOW:
         d->Set(sec, L"WinTitle", it.winTitle);
         d->SetInt(sec, L"WinCapture", it.winCapture);
+        d->SetInt(sec, L"WinFrame", it.winFrame);
         d->SetInt(sec, L"Cursor", it.cursor);
         break;
     case IT_MONITOR:
@@ -289,6 +290,7 @@ static Item ItemFromIni(const IniDoc& d, const std::wstring& sec) {
     it.region = ReadRect(d, sec, L"Region", pr);
     it.winTitle = d.Str(sec, L"WinTitle");
     it.winCapture = std::clamp(d.Int(sec, L"WinCapture", 0), 0, 1);
+    it.winFrame = d.Int(sec, L"WinFrame", 1) != 0;
     it.monDevice = d.Str(sec, L"MonDevice");
     it.monRect = ReadRect(d, sec, L"Mon", pr);
     it.cursor = d.Int(sec, L"Cursor", 0) != 0;
@@ -337,6 +339,11 @@ void ProjectToIni(const Project& p, IniDoc* d) {
     d->Set(kMain, L"OutBgImage", o.bgImage);
     d->SetInt(kMain, L"Transition", p.transition);
     d->SetInt(kMain, L"TransitionMs", p.transMs);
+    d->SetInt(kMain, L"TransitionDir", p.transDir);
+    d->SetInt(kMain, L"TransitionEase", p.transEase);
+    d->SetInt(kMain, L"HideStartGlare", p.hideStartGlare);
+    d->SetInt(kMain, L"CheckUpdates", p.checkUpdates);
+    d->Set(kMain, L"Placeholder", p.placeholder);
     d->SetInt(kMain, L"PauseMode", p.pauseMode);
     d->Set(kMain, L"PauseText", p.pauseText);
     d->Set(kMain, L"PauseImage", p.pauseImage);
@@ -378,8 +385,13 @@ static void ProjectFromIni11(const IniDoc& d, Project* p) {
     o.bgMode = std::clamp(d.Int(kMain, L"OutBg", 0), 0, 2);
     o.bgColor = static_cast<COLORREF>(d.Int(kMain, L"OutBgColor", 0)) & 0xFFFFFF;
     o.bgImage = d.Str(kMain, L"OutBgImage");
-    p->transition = std::clamp(d.Int(kMain, L"Transition", 1), 0, 4);
-    p->transMs = std::clamp(d.Int(kMain, L"TransitionMs", 500), 50, 5000);
+    p->transition = std::clamp(d.Int(kMain, L"Transition", 1), 0, TR_COUNT - 1);
+    p->transMs = std::clamp(d.Int(kMain, L"TransitionMs", 500), 0, 5000);
+    p->transDir = std::clamp(d.Int(kMain, L"TransitionDir", 0), 0, 3);
+    p->transEase = std::clamp(d.Int(kMain, L"TransitionEase", 1), 0, 1);
+    p->hideStartGlare = d.Int(kMain, L"HideStartGlare", 1) != 0;
+    p->checkUpdates = d.Int(kMain, L"CheckUpdates", 0) != 0;
+    p->placeholder = d.Str(kMain, L"Placeholder");
     p->pauseMode = std::clamp(d.Int(kMain, L"PauseMode", 2), 0, 3);
     p->pauseText = d.Str(kMain, L"PauseText", L"Скоро вернусь");
     p->pauseImage = d.Str(kMain, L"PauseImage");

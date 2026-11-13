@@ -147,6 +147,62 @@ AM_MEDIA_TYPE* makeMediaType(int width, int height, float framerate)
     return amt;
 }
 
+// WVC: the format the camera offers while WVC is closed — the last one WVC used (HKCU\\Software\\WVC), else 1280x720@30
+DWORD readRegDword(const wchar_t* name, DWORD def)
+{
+    DWORD v = 0, size = sizeof(v), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WVC", name, RRF_RT_REG_DWORD, &type, &v, &size) == ERROR_SUCCESS)
+    {
+        return v;
+    }
+    return def;
+}
+
+int fallbackWidth()
+{
+    DWORD w = readRegDword(L"CamWidth", 1280);
+    DWORD h = readRegDword(L"CamHeight", 720);
+    if (w < 64 || w > 4096 || h < 64 || h > 4096 || w % 4 || h % 4) return 1280;
+    return (int)w;
+}
+
+int fallbackHeight()
+{
+    DWORD w = readRegDword(L"CamWidth", 1280);
+    DWORD h = readRegDword(L"CamHeight", 720);
+    if (w < 64 || w > 4096 || h < 64 || h > 4096 || w % 4 || h % 4) return 720;
+    return (int)h;
+}
+
+float fallbackFramerate()
+{
+    DWORD f = readRegDword(L"CamFps", 30);
+    if (f < 5 || f > 120) f = 30;
+    return (float)f;
+}
+
+const int s_module_anchor = 0;
+
+HMODULE thisModule()
+{
+    HMODULE m = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&s_module_anchor), &m);
+    return m;
+}
+
+std::wstring placeholderPath()
+{
+    wchar_t buf[1024] = {};
+    DWORD size = sizeof(buf), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WVC", L"Placeholder", RRF_RT_REG_SZ, &type, buf, &size) == ERROR_SUCCESS &&
+        buf[0])
+    {
+        return buf;
+    }
+    return L"";
+}
+
 } //namespace
 
 namespace softcam {
@@ -166,10 +222,11 @@ CUnknown * Softcam::CreateInstance(
 Softcam::Softcam(LPUNKNOWN lpunk, const GUID& clsid, HRESULT *phr) :
     CSource(NAME("WVC Camera"), lpunk, clsid),
     m_frame_buffer(FrameBuffer::open()),
-    m_valid(m_frame_buffer ? true : false),
-    m_width(m_frame_buffer.width()),
-    m_height(m_frame_buffer.height()),
-    m_framerate(m_frame_buffer.framerate())
+    // WVC: always valid — without WVC running the camera still opens and shows a placeholder
+    m_valid(true),
+    m_width(m_frame_buffer ? m_frame_buffer.width() : fallbackWidth()),
+    m_height(m_frame_buffer ? m_frame_buffer.height() : fallbackHeight()),
+    m_framerate(m_frame_buffer && m_frame_buffer.framerate() > 0.0f ? m_frame_buffer.framerate() : fallbackFramerate())
 {
     // This code is okay though it may look strange as the return value is ignored.
     // Calling the SoftcamStream constructor results in calling the CBaseOutputPin
@@ -339,11 +396,15 @@ FrameBuffer* Softcam::getFrameBuffer()
     CAutoLock lock(&m_critsec);
     if (!m_frame_buffer)
     {
+        // WVC: look for the sender at most 5 times a second; any size is fine (the picture is scaled)
+        const unsigned long now = GetTickCount();
+        if (now - m_last_open_try < 200)
+        {
+            return nullptr;
+        }
+        m_last_open_try = now;
         auto fb = FrameBuffer::open();
-        if (fb &&
-            fb.active() &&
-            fb.width() == m_width &&
-            fb.height() == m_height)
+        if (fb && fb.active())
         {
             m_frame_buffer = fb;
         }
@@ -404,6 +465,102 @@ STDMETHODIMP SoftcamStream::NonDelegatingQueryInterface(REFIID riid, __deref_out
 }
 
 
+// WVC: the frame shown while WVC is not running: a picture chosen in WVC (Настройки → Общие), or the WVC icon
+// with «WVC не запущен» on dark blue. Drawn once with GDI; never blocks (only a local file is read).
+void SoftcamStream::buildPlaceholder()
+{
+    const std::size_t size = calcDIBSize(m_width, m_height);
+    if (!m_screenshot)
+    {
+        m_screenshot.reset(new uint8_t[size]);
+    }
+    std::memset(m_screenshot.get(), 0, size);
+    m_placeholder_ready = true;
+
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = m_width;
+    bi.bmiHeader.biHeight = m_height;  // bottom-up, exactly the DirectShow DIB layout
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 24;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = dc ? CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (screen) ReleaseDC(nullptr, screen);
+    if (!bmp || !bits)
+    {
+        if (bmp) DeleteObject(bmp);
+        if (dc) DeleteDC(dc);
+        return;
+    }
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    RECT rc{0, 0, m_width, m_height};
+    HBRUSH bg = CreateSolidBrush(RGB(0x1a, 0x23, 0x40));
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    bool custom = false;
+    std::wstring path = placeholderPath();
+    if (!path.empty())
+    {
+        HBITMAP pic = (HBITMAP)LoadImageW(nullptr, path.c_str(), IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE | LR_CREATEDIBSECTION);
+        if (pic)
+        {
+            BITMAP bm{};
+            GetObject(pic, sizeof(bm), &bm);
+            HDC pdc = CreateCompatibleDC(dc);
+            HGDIOBJ op = SelectObject(pdc, pic);
+            if (bm.bmWidth > 0 && bm.bmHeight > 0)
+            {
+                double s = (std::min)((double)m_width / bm.bmWidth, (double)m_height / bm.bmHeight);
+                int w = (int)(bm.bmWidth * s), h = (int)(bm.bmHeight * s);
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, nullptr);
+                HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+                FillRect(dc, &rc, black);
+                StretchBlt(dc, (m_width - w) / 2, (m_height - h) / 2, w, h, pdc, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+                custom = true;
+            }
+            SelectObject(pdc, op);
+            DeleteDC(pdc);
+            DeleteObject(pic);
+        }
+    }
+    if (!custom)
+    {
+        const int icon = (std::max)(16, m_height / 4);
+        HICON hi = (HICON)LoadImageW(thisModule(), MAKEINTRESOURCEW(1), IMAGE_ICON, icon, icon, 0);
+        const int ty = m_height / 2 + m_height / 30;
+        if (hi)
+        {
+            DrawIconEx(dc, (m_width - icon) / 2, ty - icon - m_height / 40, hi, icon, icon, 0, nullptr, DI_NORMAL);
+            DestroyIcon(hi);
+        }
+        SetBkMode(dc, TRANSPARENT);
+        HFONT big = CreateFontW(-(std::max)(10, m_height / 13), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HFONT sm = CreateFontW(-(std::max)(8, m_height / 26), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ of = SelectObject(dc, big);
+        SetTextColor(dc, RGB(255, 255, 255));
+        RECT t1{0, ty, m_width, ty + m_height / 9};
+        DrawTextW(dc, L"WVC не запущен", -1, &t1, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(dc, sm);
+        SetTextColor(dc, RGB(170, 180, 205));
+        RECT t2{0, t1.bottom, m_width, t1.bottom + m_height / 14};
+        DrawTextW(dc, L"Запустите WVC", -1, &t2, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(dc, of);
+        DeleteObject(big);
+        DeleteObject(sm);
+    }
+    GdiFlush();
+    std::memcpy(m_screenshot.get(), bits, size);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+
 HRESULT SoftcamStream::FillBuffer(IMediaSample *pms)
 {
     CheckPointer(pms,E_POINTER);
@@ -411,43 +568,44 @@ HRESULT SoftcamStream::FillBuffer(IMediaSample *pms)
     BYTE *pData;
     pms->GetPointer(&pData);
     long lDataLen = pms->GetSize();
-    ZeroMemory(pData, (std::size_t)lDataLen);
+    const std::size_t size = calcDIBSize(m_width, m_height);
+    if (lDataLen <= 0 || (std::size_t)lDataLen < size)
     {
+        return E_FAIL;
+    }
+    {
+        bool sent = false;
         if (auto fb = getParent()->getFrameBuffer())
         {
             bool active = fb->waitForNewFrame(m_frame_counter);
-            fb->transferToDIB(pData, &m_frame_counter);
-
-            if (!active)
+            if (active)
             {
-                // The sender has deactivated this stream and stopped sending frames.
-                // We release this stream and will wait a new stream to be available.
+                if (fb->width() == m_width && fb->height() == m_height)
+                    fb->transferToDIB(pData, &m_frame_counter);
+                else
+                    fb->transferToDIBScaled(pData, m_width, m_height, &m_frame_counter);
+                sent = true;
+            }
+            else
+            {
+                // WVC closed or restarted its camera: show the placeholder until it is back
                 getParent()->releaseFrameBuffer();
-
-                // Save the last image for a placeholder.
-                const std::size_t size = calcDIBSize(m_width, m_height);
-                if (!m_screenshot)
-                {
-                    m_screenshot.reset(new uint8_t[size]);
-                }
-                {
-                    // Darken the image to indicate that the source is inactive.
-                    for (std::size_t i = 0; i < size; i++)
-                    {
-                        pData[i] /= 4;
-                    }
-                }
-                std::memcpy(m_screenshot.get(), pData, size);
+                m_frame_counter = 0;
             }
         }
-        else
+        if (!sent)
         {
-            // Waiting for a new stream.
-            m_frame_counter = 0;
-            Timer::sleep(0.100f);
-
-            const std::size_t size = calcDIBSize(m_width, m_height);
+            if (!m_placeholder_ready)
+            {
+                buildPlaceholder();
+            }
             std::memcpy(pData, m_screenshot.get(), size);
+            long ms = 0;
+            {
+                CAutoLock lock(&m_critsec);
+                ms = m_interval_time_msec;
+            }
+            Timer::sleep((float)(std::min)((std::max)(ms, 10L), 200L) / 1000.0f);
         }
 
         CAutoLock lock(&m_critsec);
@@ -456,7 +614,6 @@ HRESULT SoftcamStream::FillBuffer(IMediaSample *pms)
         pms->SetTime((REFERENCE_TIME*)&start,(REFERENCE_TIME*)&m_sample_time);
     }
     pms->SetSyncPoint(TRUE);
-    //LOG("-> NOERROR\n");
     return NOERROR;
 }
 
@@ -529,6 +686,7 @@ HRESULT SoftcamStream::DecideBufferSize(IMemAllocator *pAlloc,
 HRESULT SoftcamStream::OnThreadCreate()
 {
     CAutoLock lock(&m_critsec);
+    m_placeholder_ready = false;  // WVC: pick up a new placeholder picture each time the camera is opened
     m_sample_time = 0;
     float framerate = getParent()->framerate();
     if (framerate <= 0.0f)

@@ -17,10 +17,12 @@ namespace {
 enum {
     IDC_PROGRAM = 100, IDC_NEXTPV, IDC_NEXT_COMBO, IDC_SWAP, IDC_SCENES, IDC_SC_ADD, IDC_SC_DEL, IDC_SC_REN, IDC_SC_UP,
     IDC_SC_DOWN, IDC_SOURCES, IDC_SR_ADD, IDC_SR_DEL, IDC_SR_PROPS, IDC_SR_UP, IDC_SR_DOWN, IDC_TR_TYPE, IDC_TR_MS,
-    IDC_TR_SPIN, IDC_START, IDC_PAUSE, IDC_SETTINGS, IDC_EXIT, IDC_LAST
+    IDC_TR_SPIN, IDC_START, IDC_PAUSE, IDC_SETTINGS, IDC_EXIT, IDC_TR_DIR, IDC_TR_EASE, IDC_LAST
 };
 enum {
-    ID_TRAY_OPEN = 900, ID_TRAY_TOGGLE, ID_TRAY_PAUSE, ID_TRAY_SWAP, ID_TRAY_EXIT,
+    ID_TRAY_OPEN = 900, ID_TRAY_TOGGLE, ID_TRAY_PAUSE, ID_TRAY_SWAP, ID_TRAY_EXIT, ID_TRAY_SCENE0 = 920,  // .. 999
+    ID_MENU_SETTINGS = 1200, ID_MENU_EXPORT, ID_MENU_IMPORT, ID_MENU_EXIT, ID_MENU_UNDO, ID_MENU_REDO, ID_MENU_DOCK0,
+    ID_MENU_DOCKRESET = ID_MENU_DOCK0 + 8, ID_MENU_LOG, ID_MENU_UPDATES, ID_MENU_ABOUT, ID_MENU_EDITNEXT, ID_MENU_README,
     ID_M_PROPS = 1000, ID_M_RESET, ID_M_FIT, ID_M_STRETCH, ID_M_CENTER, ID_M_CENTERH, ID_M_CENTERV, ID_M_ROTCW,
     ID_M_ROTCCW, ID_M_ROT180, ID_M_FLIPH, ID_M_FLIPV, ID_M_TOP, ID_M_UP, ID_M_DOWN, ID_M_BOTTOM, ID_M_VIS, ID_M_LOCK,
     ID_M_RENAME, ID_M_DUP, ID_M_DEL, ID_M_OUTPUT, ID_M_SELECTREGION,
@@ -37,7 +39,14 @@ std::wstring g_note, g_statusText;
 ULONGLONG g_noteAt = 0;
 int g_selUid = 0;
 bool g_syncing = false;
-RECT g_dock[5] = {};  // next, scenes, sources, transitions, controls
+RECT g_dock[DOCK_COUNT] = {};  // by dock id (empty when hidden): next, scenes, sources, transitions, controls
+bool g_editNext = false;      // studio mode: the sources list and the mouse edit «Следующий»
+struct DockGeo {
+    RECT title{}, btnColl{}, btnClose{};
+    bool strip = false;  // collapsed while others are open: a narrow vertical strip
+};
+DockGeo g_dg[DOCK_COUNT];
+
 RECT g_statusRect{};
 int g_titleH = 22;
 
@@ -52,6 +61,34 @@ void SetTextIfChanged(HWND h, const std::wstring& text) {
 }  // namespace
 
 int UiSelected() { return g_selUid; }
+
+static int EditIdx(const Project& p) {
+    const int n = static_cast<int>(p.scenes.size());
+    if (n == 0) return -1;
+    const int cur = std::clamp(p.cur, 0, n - 1);
+    if (g_editNext && p.next >= 0 && p.next < n && p.next != cur) return p.next;
+    return cur;
+}
+
+Scene* UiEditScene(Project& p) {
+    const int i = EditIdx(p);
+    return i < 0 ? nullptr : &p.scenes[static_cast<size_t>(i)];
+}
+
+const Scene* UiEditSceneC(const Project& p) {
+    const int i = EditIdx(p);
+    return i < 0 ? nullptr : &p.scenes[static_cast<size_t>(i)];
+}
+
+static bool EditingNext(const Project& p) { return EditIdx(p) >= 0 && EditIdx(p) != std::clamp(p.cur, 0, (std::max)(0, static_cast<int>(p.scenes.size()) - 1)); }
+
+static void SetEditNext(bool on) {
+    if (g_editNext == on) return;
+    g_editNext = on;
+    g_editingNext = on;
+    g_selUid = 0;
+    UiRefresh();
+}
 
 void UiOutputSize(int* W, int* H) {
     if (g_camW > 0 && g_camH > 0) {
@@ -242,6 +279,7 @@ void SetProgramScene(int idx) {
 
 static void SwapNext() {
     bool ok = false;
+    LogMsg(L"Сейчас ⇄ Следующий");
     ProjEdit([&](Project& p) {
         const int n = static_cast<int>(p.scenes.size());
         if (p.next < 0 || p.next >= n || p.next == p.cur) return;
@@ -269,7 +307,7 @@ void ShowMain() {
 }
 
 static bool CurItemC(const Project& p, int uid, const Item** out) {
-    const Scene* sc = CurSceneC(p);
+    const Scene* sc = UiEditSceneC(p);
     if (!sc) return false;
     for (const auto& it : sc->items)
         if (it.uid == uid) {
@@ -413,8 +451,9 @@ static void ItemCommand(int uid, int cmd) {
         if (MessageBoxW(g_main, (L"Удалить источник «" + name + L"»?").c_str(), L"WVC", MB_YESNO | MB_ICONQUESTION) != IDYES)
             return;
         ProjEdit([&](Project& p) {
-            Scene* sc = CurScene(p);
-            if (!sc) return;
+            int si = -1;
+            if (!FindItem(p, uid, &si) || si < 0) return;
+            Scene* sc = &p.scenes[static_cast<size_t>(si)];
             sc->items.erase(std::remove_if(sc->items.begin(), sc->items.end(), [&](const Item& i) { return i.uid == uid; }),
                             sc->items.end());
             if (p.out.nativeUid == uid && !FindItem(p, uid)) p.out.native = false;
@@ -459,8 +498,9 @@ static void ItemCommand(int uid, int cmd) {
         return;
     }
     ProjEdit([&](Project& p) {
-        Scene* sc = CurScene(p);
-        if (!sc) return;
+        int si = -1;
+        if (!FindItem(p, uid, &si) || si < 0) return;
+        Scene* sc = &p.scenes[static_cast<size_t>(si)];
         auto& v = sc->items;
         int i = -1;
         for (size_t k = 0; k < v.size(); ++k)
@@ -553,7 +593,7 @@ static void ItemContextMenu(int uid, POINT pt) {
         if (p.scenes.size() > 1) {
             HMENU cp = CreatePopupMenu();
             for (size_t s = 0; s < p.scenes.size(); ++s)
-                if (static_cast<int>(s) != p.cur)
+                if (static_cast<int>(s) != EditIdx(p))
                     AppendMenuW(cp, MF_STRING, ID_COPY_BASE + static_cast<UINT>(s), p.scenes[s].name.c_str());
             AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(cp), L"Копировать в сцену");
         }
@@ -619,6 +659,7 @@ struct FrameWin {
     int uid = 0;
     bool tabBelow = false;
     bool movable = true;
+    bool thin = false;  // a captured window: a thin line, no label, clicks go through
     std::wstring label, look;
     std::vector<std::vector<POINT>> outline;  // screen coordinates
 };
@@ -638,13 +679,17 @@ COLORREF FrameColor() {
     return g_paused ? RGB(235, 170, 0) : RGB(230, 40, 40);
 }
 
+int FrameB(const FrameWin& f) { return f.thin ? (std::max)(2, g_fb / 2) : g_fb; }
+int FrameTab(const FrameWin& f) { return f.thin ? 0 : g_tabH; }
+
 void FrameRects(const FrameWin& f, int w, int h, RECT* border, RECT* hole, RECT* tab) {
-    const int top = f.tabBelow ? 0 : g_tabH;
-    const int bottom = f.tabBelow ? h - g_tabH : h;
+    const int fb = FrameB(f), tabH = FrameTab(f);
+    const int top = f.tabBelow ? 0 : tabH;
+    const int bottom = f.tabBelow ? h - tabH : h;
     *border = RECT{0, top, w, bottom};
-    *hole = RECT{g_fb, top + g_fb, w - g_fb, bottom - g_fb};
+    *hole = RECT{fb, top + fb, w - fb, bottom - fb};
     const int tw = (std::min)(g_tabW, w);
-    *tab = f.tabBelow ? RECT{0, h - g_tabH, tw, h} : RECT{0, 0, tw, g_tabH};
+    *tab = f.tabBelow ? RECT{0, h - tabH, tw, h} : RECT{0, 0, tw, tabH};
 }
 
 void RegionFromFrame(HWND hwnd) {
@@ -707,7 +752,7 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 FillRect(dc, &border, red);
                 FillRect(dc, &hole, key);
             }
-            FillRect(dc, &tab, red);
+            if (FrameTab(*f) > 0) FillRect(dc, &tab, red);
             DeleteObject(red);
             DeleteObject(key);
             HGDIOBJ old = g_frameFont ? SelectObject(dc, g_frameFont) : nullptr;
@@ -715,7 +760,7 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTextColor(dc, RGB(255, 255, 255));
             RECT tr = tab;
             InflateRect(&tr, -4, 0);
-            DrawTextW(dc, f->label.c_str(), -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            if (FrameTab(*f) > 0) DrawTextW(dc, f->label.c_str(), -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             if (old) SelectObject(dc, old);
         }
         EndPaint(hwnd, &ps);
@@ -814,30 +859,33 @@ void UpdateFrames() {
             if (it.type == IT_REGION) {
                 r = it.region;
                 if (r.right - r.left < 16 || r.bottom - r.top < 16) continue;
-            } else if (!WindowRectOf(it.hwnd, &r) || it.winCapture == 1) {
-                continue;  // straight from the window: nothing to mark on the screen
+            } else if (!it.winFrame || !WindowRectOf(it.hwnd, &r) || IsIconic(it.hwnd)) {
+                continue;  // «Окно»: the frame is optional (per source)
             }
             keep[it.uid] = true;
             FrameWin& f = g_frames[it.uid];
             f.uid = it.uid;
             f.movable = it.type == IT_REGION && !it.locked;
+            f.thin = it.type == IT_WINDOW;
             f.label = (f.movable ? L"✥ " : L"") + it.name;
             if (!f.hwnd) {
-                f.hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"WVCFrame", L"",
-                                         WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, g_hInst, nullptr);
+                const DWORD ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (f.thin ? WS_EX_TRANSPARENT : 0);
+                f.hwnd = CreateWindowExW(ex, L"WVCFrame", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, g_hInst, nullptr);
                 if (f.hwnd) SetLayeredWindowAttributes(f.hwnd, kKey, 255, LWA_COLORKEY);
             }
             if (!f.hwnd) continue;
+            const int fb = FrameB(f), tabH = FrameTab(f);
             MONITORINFO mi{};
             mi.cbSize = sizeof(mi);
             GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi);
-            f.tabBelow = (r.top - g_fb - g_tabH) < mi.rcMonitor.top;
-            RECT w{r.left - g_fb, r.top - g_fb, r.right + g_fb, r.bottom + g_fb};
+            f.tabBelow = (r.top - fb - tabH) < mi.rcMonitor.top;
+            RECT w{r.left - fb, r.top - fb, r.right + fb, r.bottom + fb};
             if (f.tabBelow)
-                w.bottom += g_tabH;
+                w.bottom += tabH;
             else
-                w.top -= g_tabH;
+                w.top -= tabH;
             ScreenOutline(it, r, W, H, &f.outline);
+            if (f.thin) f.outline.clear();
             wchar_t look[300];
             swprintf(look, 300, L"%u|%ls|%d|%.4f,%.4f,%.4f,%.4f|%d,%d,%d,%d|%d%d%d|%ls", static_cast<unsigned>(FrameColor()),
                      it.shape.Key().c_str(), it.fit, it.x, it.y, it.w, it.h, it.crop[0], it.crop[1], it.crop[2],
@@ -1033,7 +1081,14 @@ struct PvGeo {
     double scale = 0; // client px per output px
     int W = 0, H = 0;
 };
-PvGeo g_pv;
+PvGeo g_pvs[2];
+int g_pvWhich = 0;  // 0 «Сейчас», 1 «Следующий»: the same code draws and edits both
+PvGeo& PV() { return g_pvs[g_pvWhich]; }
+const Scene* PvScene(const Project& p) {
+    if (g_pvWhich == 0) return CurSceneC(p);
+    const int n = static_cast<int>(p.scenes.size());
+    return (p.next >= 0 && p.next < n && p.next != p.cur) ? &p.scenes[static_cast<size_t>(p.next)] : nullptr;
+}
 RECT g_emptyAdd{}, g_emptyJson{};
 bool g_empty = false;
 int g_hoverUid = 0;
@@ -1046,19 +1101,19 @@ struct Drag {
 } g_drag;
 
 POINT ToOut(int x, int y) {
-    if (g_pv.scale <= 0) return POINT{0, 0};
-    return POINT{static_cast<LONG>((x - g_pv.frame.left) / g_pv.scale), static_cast<LONG>((y - g_pv.frame.top) / g_pv.scale)};
+    if (PV().scale <= 0) return POINT{0, 0};
+    return POINT{static_cast<LONG>((x - PV().frame.left) / PV().scale), static_cast<LONG>((y - PV().frame.top) / PV().scale)};
 }
 
 RECT BoxClient(const Item& it) {
-    const RectD b = ItemBox(it, g_pv.W, g_pv.H);
-    return RECT{static_cast<LONG>(g_pv.frame.left + b.x0 * g_pv.scale), static_cast<LONG>(g_pv.frame.top + b.y0 * g_pv.scale),
-                static_cast<LONG>(g_pv.frame.left + b.x1 * g_pv.scale), static_cast<LONG>(g_pv.frame.top + b.y1 * g_pv.scale)};
+    const RectD b = ItemBox(it, PV().W, PV().H);
+    return RECT{static_cast<LONG>(PV().frame.left + b.x0 * PV().scale), static_cast<LONG>(PV().frame.top + b.y0 * PV().scale),
+                static_cast<LONG>(PV().frame.left + b.x1 * PV().scale), static_cast<LONG>(PV().frame.top + b.y1 * PV().scale)};
 }
 
 int HitItem(const Project& p, int x, int y) {
-    const Scene* sc = CurSceneC(p);
-    if (!sc || g_pv.scale <= 0) return 0;
+    const Scene* sc = PvScene(p);
+    if (!sc || PV().scale <= 0) return 0;
     for (auto it = sc->items.rbegin(); it != sc->items.rend(); ++it) {
         if (!it->visible) continue;
         RECT r = BoxClient(*it);
@@ -1092,16 +1147,16 @@ double Snap(double v, const std::vector<double>& targets, double thr, bool* snap
 }
 
 void DragTo(int mx, int my, bool shift, bool ctrl) {
-    if (!g_drag.mode || g_pv.scale <= 0) return;
-    const double W = g_pv.W, H = g_pv.H;
-    const double dx = (mx - g_drag.start.x) / g_pv.scale, dy = (my - g_drag.start.y) / g_pv.scale;
+    if (!g_drag.mode || PV().scale <= 0) return;
+    const double W = PV().W, H = PV().H;
+    const double dx = (mx - g_drag.start.x) / PV().scale, dy = (my - g_drag.start.y) / PV().scale;
     const Item& o = g_drag.orig;
     double L = o.x * W, T = o.y * H, R = (o.x + o.w) * W, B = (o.y + o.h) * H;
-    const double thr = S(8) / g_pv.scale;
+    const double thr = S(8) / PV().scale;
     std::vector<double> tx{0, W / 2, W}, ty{0, H / 2, H};
     if (!ctrl) {
         Project p = ProjSnapshot();
-        if (const Scene* sc = CurSceneC(p))
+        if (const Scene* sc = PvScene(p))
             for (const auto& it : sc->items)
                 if (it.visible && it.uid != o.uid) {
                     tx.push_back(it.x * W);
@@ -1245,16 +1300,27 @@ void DrawHandle(HDC dc, int x, int y, HBRUSH br) {
     FillRect(dc, &r, br);
 }
 
-void PaintProgram(HWND hwnd, HDC dc) {
+void PaintPreview(HWND hwnd, HDC dc) {
+    const int which = g_pvWhich;
     RECT rc;
     GetClientRect(hwnd, &rc);
     FillRect(dc, &rc, g_brList);
     Project p = ProjSnapshot();
-    const Scene* sc = CurSceneC(p);
+    const Scene* sc = PvScene(p);
     int W, H;
     UiOutputSize(&W, &H);
-    // header
-    const int hh = S(24);
+    Published& pub = which == 0 ? g_pubProgram : g_pubNext;
+    const bool editing = (which == 1) == EditingNext(p);
+    if (which == 1 && !sc) {
+        pub.wantW = 0;
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, kDarkDim);
+        DrawTextW(dc, L"Выберите сцену выше —\nона станет «Следующей»", -1, &rc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        return;
+    }
+    // header (only «Сейчас»)
+    const int hh = which == 0 ? S(24) : 0;
+    if (which == 0) {
     RECT hdr{0, 0, rc.right, hh};
     HBRUSH hb = CreateSolidBrush(kDarkPanel);
     FillRect(dc, &hdr, hb);
@@ -1283,25 +1349,30 @@ void PaintProgram(HWND hwnd, HDC dc) {
     RECT bt{rc.right / 2, 0, rc.right - S(8), hh};
     DrawTextW(dc, (badge + fmt).c_str(), -1, &bt, DT_VCENTER | DT_SINGLELINE | DT_RIGHT);
     SelectObject(dc, of);
+    }
     // frame area
-    RECT area{S(4), hh + S(4), rc.right - S(4), rc.bottom - S(4)};
+    const int pad = which == 0 ? S(4) : S(2);
+    RECT area{pad, hh + pad, rc.right - pad, rc.bottom - pad};
     const int aw = area.right - area.left, ah = area.bottom - area.top;
     const double s = (std::min)(static_cast<double>(aw) / W, static_cast<double>(ah) / H);
     const int fw = (std::max)(1, static_cast<int>(W * s)), fh = (std::max)(1, static_cast<int>(H * s));
     RECT fr{area.left + (aw - fw) / 2, area.top + (ah - fh) / 2, 0, 0};
     fr.right = fr.left + fw;
     fr.bottom = fr.top + fh;
-    g_pv.frame = fr;
-    g_pv.scale = s;
-    g_pv.W = W;
-    g_pv.H = H;
-    g_pubProgram.wantW = (g_streaming || p.liveWhenStopped) && g_uiVisible ? fw : 0;
-    g_pubProgram.wantH = fh;
+    PV().frame = fr;
+    PV().scale = s;
+    PV().W = W;
+    PV().H = H;
+    if (which == 0)
+        pub.wantW = (g_streaming || p.liveWhenStopped) && g_uiVisible ? fw : 0;
+    else
+        pub.wantW = g_uiVisible ? fw : 0;
+    pub.wantH = fh;
     HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
     FillRect(dc, &fr, black);
     DeleteObject(black);
-    if (g_pubProgram.wantW > 0) {
-        PaintPublished(dc, g_pubProgram, fr, nullptr);
+    if (pub.wantW > 0) {
+        PaintPublished(dc, pub, fr, nullptr);
     } else {
         SetTextColor(dc, kDarkDim);
         DrawTextW(dc, L"Камера остановлена. Предпросмотр включается в «Настройки → Общие».", -1, &fr,
@@ -1334,9 +1405,24 @@ void PaintProgram(HWND hwnd, HDC dc) {
         SelectObject(dc, op);
         DeleteObject(pen);
     }
+    // the scene being edited: a thin blue outline
+    if (editing && p.next >= 0 && p.next < static_cast<int>(p.scenes.size()) && p.next != p.cur) {
+        HPEN pen = CreatePen(PS_SOLID, (std::max)(2, S(2)), RGB(70, 140, 255));
+        HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, fr.left - 1, fr.top - 1, fr.right + 1, fr.bottom + 1);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+    }
+    if (which == 1 && sc && sc->items.empty()) {
+        SetTextColor(dc, kDarkDim);
+        DrawTextW(dc, L"Пусто: щёлкните здесь и добавьте источник (＋ в «Источниках»)", -1, &fr,
+                  DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        return;
+    }
     // empty scene: big buttons
-    g_empty = !sc || sc->items.empty();
-    if (g_empty) {
+    if (which == 0) g_empty = !sc || sc->items.empty();
+    if (which == 0 && g_empty) {
         const int bw = (std::min)(fw - S(40), S(340)), bh = S(52);
         const int cx = (fr.left + fr.right) / 2, cy = (fr.top + fr.bottom) / 2;
         g_emptyAdd = RECT{cx - bw / 2, cy - bh - S(8), cx + bw / 2, cy - S(8)};
@@ -1403,7 +1489,18 @@ void PaintProgram(HWND hwnd, HDC dc) {
     SelectObject(dc, obr);
 }
 
-LRESULT CALLBACK ProgramProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+LRESULT PreviewProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    const int which = g_pvWhich;
+    // a click in a preview makes its scene the one being edited (studio mode)
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_LBUTTONDBLCLK) {
+        Project p0 = ProjSnapshot();
+        if (which == 1 && !PvScene(p0)) return 0;
+        if (which == 1 && msg == WM_LBUTTONDBLCLK && !HitItem(p0, static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp)))) {
+            SwapNext();  // double click on an empty spot of «Следующий»: put it on air
+            return 0;
+        }
+        SetEditNext(which == 1);
+    }
     switch (msg) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
@@ -1415,7 +1512,7 @@ LRESULT CALLBACK ProgramProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HBITMAP bmp = CreateCompatibleBitmap(dc, (std::max)(1L, rc.right), (std::max)(1L, rc.bottom));
         HGDIOBJ old = SelectObject(m, bmp);
         SelectObject(m, g_font);
-        PaintProgram(hwnd, m);
+        PaintPreview(hwnd, m);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
         SelectObject(m, old);
         DeleteObject(bmp);
@@ -1427,7 +1524,7 @@ LRESULT CALLBACK ProgramProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hwnd, &pt);
-        if (g_empty) {
+        if (which == 0 && g_empty) {
             if (PtInRect(&g_emptyAdd, pt) || PtInRect(&g_emptyJson, pt)) {
                 SetCursor(LoadCursor(nullptr, IDC_HAND));
                 return TRUE;
@@ -1479,7 +1576,7 @@ LRESULT CALLBACK ProgramProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
         SetFocus(hwnd);
         POINT pt{x, y};
-        if (g_empty) {
+        if (which == 0 && g_empty) {
             if (PtInRect(&g_emptyAdd, pt)) {
                 POINT sp{g_emptyAdd.left, g_emptyAdd.bottom};
                 ClientToScreen(hwnd, &sp);
@@ -1558,8 +1655,8 @@ LRESULT CALLBACK ProgramProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ProjEdit([&](Project& p) {
                 if (Item* it = FindItem(p, uid)) {
                     if (it->locked) return;
-                    it->x += dx * step / static_cast<double>((std::max)(1, g_pv.W));
-                    it->y += dy * step / static_cast<double>((std::max)(1, g_pv.H));
+                    it->x += dx * step / static_cast<double>((std::max)(1, PV().W));
+                    it->y += dy * step / static_cast<double>((std::max)(1, PV().H));
                 }
             });
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -1571,40 +1668,20 @@ LRESULT CALLBACK ProgramProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+LRESULT CALLBACK ProgramProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    const int prev = g_pvWhich;
+    g_pvWhich = 0;
+    const LRESULT r = PreviewProc(hwnd, msg, wp, lp);
+    g_pvWhich = prev;
+    return r;
+}
+
 LRESULT CALLBACK NextProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        HDC m = CreateCompatibleDC(dc);
-        HBITMAP bmp = CreateCompatibleBitmap(dc, (std::max)(1L, rc.right), (std::max)(1L, rc.bottom));
-        HGDIOBJ old = SelectObject(m, bmp);
-        FillRect(m, &rc, g_brList);
-        Project p = ProjSnapshot();
-        const bool has = p.next >= 0 && p.next < static_cast<int>(p.scenes.size());
-        g_pubNext.wantW = has && g_uiVisible ? rc.right : 0;
-        g_pubNext.wantH = rc.bottom;
-        SelectObject(m, g_font);
-        SetBkMode(m, TRANSPARENT);
-        if (has) {
-            PaintPublished(m, g_pubNext, rc, nullptr);
-        } else {
-            SetTextColor(m, kDarkDim);
-            DrawTextW(m, L"Выберите сцену выше —\nона станет «Следующей»", -1, &rc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
-        }
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
-        SelectObject(m, old);
-        DeleteObject(bmp);
-        DeleteDC(m);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_LBUTTONDBLCLK: SwapNext(); return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
+    const int prev = g_pvWhich;
+    g_pvWhich = 1;
+    const LRESULT r = PreviewProc(hwnd, msg, wp, lp);
+    g_pvWhich = prev;
+    return r;
 }
 }  // namespace
 
@@ -1878,13 +1955,17 @@ void UiRefresh() {
         if (static_cast<int>(i) == p.next) selIdx = k;
     }
     SendMessageW(nc, CB_SETCURSEL, selIdx, 0);
-    // sources of the current scene, front first
+    // sources of the scene being edited («Сейчас» or «Следующий»), front first
+    if (g_editNext && !EditingNext(p)) {
+        g_editNext = false;  // «Следующий» is gone
+        g_editingNext = false;
+    }
     HWND src = C(IDC_SOURCES);
     SendMessageW(src, WM_SETREDRAW, FALSE, 0);
     const int stop = static_cast<int>(SendMessageW(src, LB_GETTOPINDEX, 0, 0));
     SendMessageW(src, LB_RESETCONTENT, 0, 0);
     g_rowUid.clear();
-    const Scene* sc = CurSceneC(p);
+    const Scene* sc = UiEditSceneC(p);
     bool selFound = false;
     if (sc) {
         for (auto it = sc->items.rbegin(); it != sc->items.rend(); ++it) {
@@ -1904,11 +1985,16 @@ void UiRefresh() {
     SendMessageW(src, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(src, nullptr, TRUE);
     // transitions
-    SendMessageW(C(IDC_TR_TYPE), CB_SETCURSEL, std::clamp(p.transition, 0, 4), 0);
+    SendMessageW(C(IDC_TR_TYPE), CB_SETCURSEL, std::clamp(p.transition, 0, TR_COUNT - 1), 0);
+    SendMessageW(C(IDC_TR_DIR), CB_SETCURSEL, std::clamp(p.transDir, 0, 3), 0);
+    SendMessageW(C(IDC_TR_EASE), CB_SETCURSEL, std::clamp(p.transEase, 0, 1), 0);
+    EnableWindow(C(IDC_TR_DIR), TransUsesDir(p.transition));
     SetTextIfChanged(C(IDC_TR_MS), std::to_wstring(p.transMs));
     g_syncing = false;
-    RECT dr = g_dock[2];
-    InvalidateRect(g_main, &dr, FALSE);
+    for (int d : {DOCK_SOURCES, DOCK_NEXT}) {
+        RECT dr = g_dg[d].title;
+        InvalidateRect(g_main, &dr, FALSE);
+    }
     InvalidateRect(C(IDC_PROGRAM), nullptr, FALSE);
     InvalidateRect(C(IDC_NEXTPV), nullptr, FALSE);
     UiStatus();
@@ -1954,45 +2040,144 @@ void UiStatus() {
         InvalidateRect(g_main, &g_statusRect, FALSE);
     }
     const wchar_t* tip = g_streaming ? (g_paused ? L"WVC — пауза" : L"WVC — в эфире") : L"WVC — камера остановлена";
-    if (wcscmp(g_nid.szTip, tip) != 0 && g_nid.hWnd) {
+    const int state = g_streaming ? (g_paused ? 1 : 0) : 2;  // tray icon: red dot / yellow / grey
+    static int shownState = -1;
+    if (g_nid.hWnd && (wcscmp(g_nid.szTip, tip) != 0 || state != shownState)) {
+        static HICON icons[3] = {};
+        if (!icons[state])
+            icons[state] = static_cast<HICON>(LoadImageW(g_hInst, MAKEINTRESOURCEW(2 + state), IMAGE_ICON,
+                                                         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
         wcsncpy(g_nid.szTip, tip, 127);
-        g_nid.uFlags = NIF_TIP;
+        g_nid.uFlags = NIF_TIP | NIF_ICON;
+        if (icons[state]) g_nid.hIcon = icons[state];
         Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+        shownState = state;
     }
 }
 
 namespace {
+// --- panels under the preview: order, width (splitters), collapse (title only), close; drag a title to reorder
+struct Splitter {
+    int left = -1, right = -1;  // dock ids
+    RECT r{};
+};
+std::vector<Splitter> g_splits;
+RECT g_hsplit{};      // between the preview and the panels
+int g_availW = 1, g_sumW = 1;
+struct DockDrag {
+    int mode = 0;     // 1 splitter, 2 height, 3 move a panel (title)
+    int split = -1, dock = -1;
+    POINT start{};
+    int w0[DOCK_COUNT] = {}, h0 = 0;
+    bool moved = false;
+    int dropIdx = -1, dropX = 0;
+} g_dd;
+const wchar_t* const kDockTitles[DOCK_COUNT] = {L"Следующий", L"Сцены", L"Источники", L"Переходы", L"Управление"};
+
+std::vector<int> DockCtls(int d) {
+    switch (d) {
+    case DOCK_NEXT: return {IDC_NEXT_COMBO, IDC_SWAP, IDC_NEXTPV};
+    case DOCK_SCENES: return {IDC_SCENES, IDC_SC_ADD, IDC_SC_DEL, IDC_SC_REN, IDC_SC_UP, IDC_SC_DOWN};
+    case DOCK_SOURCES: return {IDC_SOURCES, IDC_SR_ADD, IDC_SR_DEL, IDC_SR_PROPS, IDC_SR_UP, IDC_SR_DOWN};
+    case DOCK_TRANS: return {IDC_TR_TYPE, IDC_TR_DIR, IDC_TR_EASE, IDC_TR_MS, IDC_TR_SPIN};
+    default: return {IDC_START, IDC_PAUSE, IDC_SETTINGS, IDC_EXIT};
+    }
+}
+
+int g_trLabelY[3] = {};  // transitions dock: label rows (direction, smoothness, duration)
+
 void Layout(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     const int w = rc.right, h = rc.bottom, m = S(6);
     const int statusH = S(26);
     g_titleH = S(24);
-    const int dockH = std::clamp(h * 36 / 100, S(220), S(330));
-    const int progBottom = h - statusH - dockH - m;
-    MoveWindow(C(IDC_PROGRAM), m, m, w - 2 * m, (std::max)(S(60), progBottom - m), TRUE);
-    const int y0 = progBottom + m, y1 = h - statusH;
-    g_statusRect = RECT{0, y1, w, h};
-    const int nextW = std::clamp(w * 26 / 100, S(220), S(420));
-    const int ctrlW = S(168), trW = S(168);
-    const int rest = w - 2 * m - nextW - ctrlW - trW - 4 * m;
-    const int scW = (std::max)(S(120), rest * 42 / 100), srW = (std::max)(S(140), rest - scW);
-    int x = m;
-    g_dock[0] = RECT{x, y0, x + nextW, y1};
-    x += nextW + m;
-    g_dock[1] = RECT{x, y0, x + scW, y1};
-    x += scW + m;
-    g_dock[2] = RECT{x, y0, x + srW, y1};
-    x += srW + m;
-    g_dock[3] = RECT{x, y0, x + trW, y1};
-    x += trW + m;
-    g_dock[4] = RECT{x, y0, (std::max)(x + ctrlW, w - m), y1};
     const int th = g_titleH, pad = S(4), bh = S(26);
-    // next: combo + swap in the content top row, preview below
-    {
-        const RECT d = g_dock[0];
+    std::vector<int> vis;
+    bool anyOpen = false;
+    for (int k = 0; k < DOCK_COUNT; ++k) {
+        const int d = g_docks.order[k];
+        if (!g_docks.vis[d]) continue;
+        vis.push_back(d);
+        if (!g_docks.coll[d]) anyOpen = true;
+    }
+    int dockH = 0;
+    if (!vis.empty()) dockH = anyOpen ? std::clamp(S(g_docks.height), S(210), (std::max)(S(210), h - statusH - S(180))) : th;
+    const int y1 = h - statusH;
+    const int y0 = vis.empty() ? y1 : y1 - dockH;
+    const int progBottom = vis.empty() ? y1 - m : y0 - m;
+    MoveWindow(C(IDC_PROGRAM), m, m, w - 2 * m, (std::max)(S(60), progBottom - m), TRUE);
+    g_statusRect = RECT{0, y1, w, h};
+    g_hsplit = anyOpen ? RECT{0, progBottom, w, y0} : RECT{0, 0, 0, 0};
+    for (int d = 0; d < DOCK_COUNT; ++d) {
+        g_dock[d] = RECT{0, 0, 0, 0};
+        g_dg[d] = DockGeo();
+    }
+    g_splits.clear();
+    // widths: collapsed panels are narrow strips (or title tabs when every panel is collapsed)
+    HDC dc = GetDC(hwnd);
+    HGDIOBJ of = SelectObject(dc, g_fontBold);
+    int fixedW = 0, sumW = 0;
+    std::vector<int> wid(DOCK_COUNT, 0);
+    for (int d : vis) {
+        if (g_docks.coll[d]) {
+            if (anyOpen) {
+                wid[d] = S(26);
+            } else {
+                SIZE sz{};
+                GetTextExtentPoint32W(dc, kDockTitles[d], static_cast<int>(wcslen(kDockTitles[d])), &sz);
+                wid[d] = sz.cx + S(64);
+            }
+            fixedW += wid[d];
+        } else {
+            sumW += g_docks.weight[d];
+        }
+    }
+    SelectObject(dc, of);
+    ReleaseDC(hwnd, dc);
+    const int gaps = vis.empty() ? 0 : static_cast<int>(vis.size() - 1) * m;
+    const int avail = (std::max)(1, w - 2 * m - gaps - fixedW);
+    g_availW = avail;
+    g_sumW = (std::max)(1, sumW);
+    int x = m;
+    int prevOpen = -1;
+    for (size_t k = 0; k < vis.size(); ++k) {
+        const int d = vis[k];
+        int ww = wid[d];
+        if (!g_docks.coll[d]) ww = (std::max)(S(60), static_cast<int>(static_cast<long long>(avail) * g_docks.weight[d] / g_sumW));
+        if (k + 1 == vis.size() && !g_docks.coll[d]) ww = (std::max)(S(60), w - m - x);
+        g_dock[d] = RECT{x, y0, x + ww, y1};
+        DockGeo& g = g_dg[d];
+        g.strip = g_docks.coll[d] && anyOpen;
+        const int bs = S(20);
+        if (g.strip) {
+            g.title = g_dock[d];
+            g.btnColl = RECT{x + (ww - bs) / 2, y0 + S(3), x + (ww + bs) / 2, y0 + S(3) + bs};
+            g.btnClose = RECT{g.btnColl.left, g.btnColl.bottom + S(2), g.btnColl.right, g.btnColl.bottom + S(2) + bs};
+        } else {
+            g.title = RECT{x, y0, x + ww, y0 + th};
+            g.btnClose = RECT{x + ww - bs - S(2), y0 + (th - bs) / 2, x + ww - S(2), y0 + (th - bs) / 2 + bs};
+            g.btnColl = RECT{g.btnClose.left - bs - S(2), g.btnClose.top, g.btnClose.left - S(2), g.btnClose.bottom};
+        }
+        if (k > 0 && prevOpen >= 0 && !g_docks.coll[d] && vis[k - 1] == prevOpen) {
+            Splitter sp;
+            sp.left = prevOpen;
+            sp.right = d;
+            sp.r = RECT{x - m, y0, x, y1};
+            g_splits.push_back(sp);
+        }
+        prevOpen = g_docks.coll[d] ? -1 : d;
+        x += ww + m;
+    }
+    // controls
+    for (int d = 0; d < DOCK_COUNT; ++d) {
+        const bool open = g_docks.vis[d] && !g_docks.coll[d];
+        for (int id : DockCtls(d)) ShowWindow(C(id), open ? SW_SHOWNA : SW_HIDE);
+    }
+    if (g_docks.vis[DOCK_NEXT] && !g_docks.coll[DOCK_NEXT]) {
+        const RECT d = g_dock[DOCK_NEXT];
         const int cy = d.top + th + pad;
-        const int swapW = S(92);
+        const int swapW = S(96);
         MoveWindow(C(IDC_NEXT_COMBO), d.left + pad, cy, d.right - d.left - 3 * pad - swapW, S(300), TRUE);
         MoveWindow(C(IDC_SWAP), d.right - pad - swapW, cy, swapW, bh, TRUE);
         MoveWindow(C(IDC_NEXTPV), d.left + pad, cy + bh + pad, d.right - d.left - 2 * pad,
@@ -2005,18 +2190,29 @@ void Layout(HWND hwnd) {
         const int bw = S(34);
         for (int i = 0; i < nb; ++i) MoveWindow(C(b0 + i), d.left + pad + i * (bw + S(2)), by, bw, bh, TRUE);
     };
-    listDock(g_dock[1], IDC_SCENES, IDC_SC_ADD, 5);
-    listDock(g_dock[2], IDC_SOURCES, IDC_SR_ADD, 5);
-    {
-        const RECT d = g_dock[3];
+    if (g_docks.vis[DOCK_SCENES] && !g_docks.coll[DOCK_SCENES]) listDock(g_dock[DOCK_SCENES], IDC_SCENES, IDC_SC_ADD, 5);
+    if (g_docks.vis[DOCK_SOURCES] && !g_docks.coll[DOCK_SOURCES]) listDock(g_dock[DOCK_SOURCES], IDC_SOURCES, IDC_SR_ADD, 5);
+    if (g_docks.vis[DOCK_TRANS] && !g_docks.coll[DOCK_TRANS]) {
+        const RECT d = g_dock[DOCK_TRANS];
+        const int cw = d.right - d.left - 2 * pad;
         int y = d.top + th + pad;
-        MoveWindow(C(IDC_TR_TYPE), d.left + pad, y, d.right - d.left - 2 * pad, S(300), TRUE);
-        y += bh + S(28);
-        MoveWindow(C(IDC_TR_MS), d.left + pad, y, d.right - d.left - 2 * pad - S(60), bh - 2, TRUE);
+        MoveWindow(C(IDC_TR_TYPE), d.left + pad, y, cw, S(400), TRUE);
+        y += bh + S(4);
+        g_trLabelY[0] = y;
+        y += S(18);
+        MoveWindow(C(IDC_TR_DIR), d.left + pad, y, cw, S(300), TRUE);
+        y += bh + S(4);
+        g_trLabelY[1] = y;
+        y += S(18);
+        MoveWindow(C(IDC_TR_EASE), d.left + pad, y, cw, S(300), TRUE);
+        y += bh + S(4);
+        g_trLabelY[2] = y;
+        y += S(18);
+        MoveWindow(C(IDC_TR_MS), d.left + pad, y, cw - S(60), bh - 2, TRUE);
         SendMessageW(C(IDC_TR_SPIN), UDM_SETBUDDY, reinterpret_cast<WPARAM>(C(IDC_TR_MS)), 0);
     }
-    {
-        const RECT d = g_dock[4];
+    if (g_docks.vis[DOCK_CONTROLS] && !g_docks.coll[DOCK_CONTROLS]) {
+        const RECT d = g_dock[DOCK_CONTROLS];
         int y = d.top + th + pad;
         const int bw = d.right - d.left - 2 * pad, big = S(36);
         MoveWindow(C(IDC_START), d.left + pad, y, bw, big, TRUE);
@@ -2030,38 +2226,94 @@ void Layout(HWND hwnd) {
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
+void DockChanged() {
+    DocksSave();
+    if (g_main) {
+        Layout(g_main);
+        DrawMenuBar(g_main);
+    }
+}
+
+void DrawGlyph(HDC dc, const RECT& r, const wchar_t* t, bool hot) {
+    if (hot) {
+        HBRUSH b = CreateSolidBrush(RGB(70, 72, 82));
+        FillRect(dc, &r, b);
+        DeleteObject(b);
+    }
+    SetTextColor(dc, kDarkText);
+    RECT rr = r;
+    DrawTextW(dc, t, -1, &rr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
 void PaintMain(HWND hwnd, HDC dc) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     FillRect(dc, &rc, g_brDark);
-    static const wchar_t* titles[5] = {L"Следующий", L"Сцены", L"Источники", L"Переходы", L"Управление"};
     SetBkMode(dc, TRANSPARENT);
-    for (int i = 0; i < 5; ++i) {
-        RECT d = g_dock[i];
-        FillRect(dc, &d, g_brPanel);
-        RECT t{d.left + S(8), d.top, d.right - S(4), d.top + g_titleH};
-        HGDIOBJ of = SelectObject(dc, g_fontBold);
-        SetTextColor(dc, kDarkText);
-        std::wstring title = titles[i];
-        if (i == 2) {
-            Project p = ProjSnapshot();
-            if (const Scene* sc = CurSceneC(p)) title += L"  —  " + sc->name;
+    POINT mp;
+    GetCursorPos(&mp);
+    ScreenToClient(hwnd, &mp);
+    Project p = ProjSnapshot();
+    const bool editNext = EditingNext(p);
+    for (int d = 0; d < DOCK_COUNT; ++d) {
+        if (!g_docks.vis[d]) continue;
+        const RECT r = g_dock[d];
+        const DockGeo& g = g_dg[d];
+        HBRUSH pb = CreateSolidBrush(g_dd.mode == 3 && g_dd.dock == d && g_dd.moved ? RGB(58, 62, 80) : kDarkPanel);
+        FillRect(dc, &r, pb);
+        DeleteObject(pb);
+        std::wstring title = kDockTitles[d];
+        if (d == DOCK_SOURCES) {
+            const Scene* sc = UiEditSceneC(p);
+            title += editNext ? L"  —  ✎ Следующий" : L"  —  Сейчас";
+            if (sc) title += L": " + sc->name;
         }
-        DrawTextW(dc, title.c_str(), -1, &t, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (d == DOCK_NEXT && editNext) title += L"  ✎";
+        HGDIOBJ of = SelectObject(dc, g_fontBold);
+        SetTextColor(dc, d == DOCK_SOURCES && editNext ? RGB(130, 180, 255) : kDarkText);
+        if (g.strip) {
+            LOGFONTW lf{};
+            GetObjectW(g_fontBold, sizeof(lf), &lf);
+            lf.lfEscapement = lf.lfOrientation = 2700;  // top to bottom
+            HFONT vf = CreateFontIndirectW(&lf);
+            SelectObject(dc, vf);
+            TextOutW(dc, r.left + (r.right - r.left) / 2 + S(7), g.btnClose.bottom + S(8), kDockTitles[d],
+                     static_cast<int>(wcslen(kDockTitles[d])));
+            SelectObject(dc, g_fontBold);
+            DeleteObject(vf);
+        } else {
+            RECT t{g.title.left + S(8), g.title.top, g.btnColl.left - S(4), g.title.bottom};
+            DrawTextW(dc, title.c_str(), -1, &t, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (!g_docks.coll[d]) {
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 72, 80));
+                HGDIOBJ op = SelectObject(dc, pen);
+                MoveToEx(dc, r.left, r.top + g_titleH - 1, nullptr);
+                LineTo(dc, r.right, r.top + g_titleH - 1);
+                SelectObject(dc, op);
+                DeleteObject(pen);
+            }
+        }
+        SelectObject(dc, g_fontSym);
+        DrawGlyph(dc, g.btnColl, g_docks.coll[d] ? L"▸" : L"▾", PtInRect(&g.btnColl, mp) != 0);
+        DrawGlyph(dc, g.btnClose, L"×", PtInRect(&g.btnClose, mp) != 0);
         SelectObject(dc, of);
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(70, 72, 80));
-        HGDIOBJ op = SelectObject(dc, pen);
-        MoveToEx(dc, d.left, d.top + g_titleH - 1, nullptr);
-        LineTo(dc, d.right, d.top + g_titleH - 1);
-        SelectObject(dc, op);
-        DeleteObject(pen);
     }
-    {  // transitions dock: duration label
-        const RECT d = g_dock[3];
-        RECT t{d.left + S(6), d.top + g_titleH + S(4) + S(30), d.right - S(4), d.top + g_titleH + S(4) + S(54)};
+    if (g_docks.vis[DOCK_TRANS] && !g_docks.coll[DOCK_TRANS]) {
+        const RECT d = g_dock[DOCK_TRANS];
         SelectObject(dc, g_font);
         SetTextColor(dc, kDarkDim);
-        DrawTextW(dc, L"Длительность, мс:", -1, &t, DT_VCENTER | DT_SINGLELINE);
+        const wchar_t* labels[3] = {L"Направление:", L"Плавность:", L"Длительность, мс (0 — сразу):"};
+        for (int i = 0; i < 3; ++i) {
+            RECT t{d.left + S(6), g_trLabelY[i], d.right - S(4), g_trLabelY[i] + S(18)};
+            DrawTextW(dc, labels[i], -1, &t, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    }
+    // where a dragged panel would land
+    if (g_dd.mode == 3 && g_dd.moved && g_dd.dropX > 0) {
+        RECT mk{g_dd.dropX - S(2), g_dock[g_dd.dock].top, g_dd.dropX + S(2), g_statusRect.top};
+        HBRUSH b = CreateSolidBrush(RGB(70, 140, 255));
+        FillRect(dc, &mk, b);
+        DeleteObject(b);
     }
     RECT st = g_statusRect;
     HBRUSH sb = CreateSolidBrush(RGB(30, 31, 35));
@@ -2071,6 +2323,179 @@ void PaintMain(HWND hwnd, HDC dc) {
     SelectObject(dc, g_font);
     SetTextColor(dc, kDarkDim);
     DrawTextW(dc, g_statusText.c_str(), -1, &st, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+}
+
+// mouse on the main window itself (titles, buttons, splitters)
+int SplitAt(POINT pt) {
+    for (size_t i = 0; i < g_splits.size(); ++i)
+        if (PtInRect(&g_splits[i].r, pt)) return static_cast<int>(i);
+    return -1;
+}
+
+int DockTitleAt(POINT pt) {
+    for (int d = 0; d < DOCK_COUNT; ++d)
+        if (g_docks.vis[d] && PtInRect(&g_dg[d].title, pt)) return d;
+    return -1;
+}
+
+bool DockMouse(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    POINT pt{static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
+    switch (msg) {
+    case WM_SETCURSOR: {
+        POINT c;
+        GetCursorPos(&c);
+        ScreenToClient(hwnd, &c);
+        if (LOWORD(lp) != HTCLIENT) return false;
+        if (g_dd.mode == 1 || SplitAt(c) >= 0) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+            return true;
+        }
+        if (g_dd.mode == 2 || PtInRect(&g_hsplit, c)) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZENS));
+            return true;
+        }
+        if (g_dd.mode == 3 && g_dd.moved) {
+            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            return true;
+        }
+        return false;
+    }
+    case WM_LBUTTONDBLCLK: {
+        const int d = DockTitleAt(pt);
+        if (d >= 0 && !PtInRect(&g_dg[d].btnClose, pt) && !PtInRect(&g_dg[d].btnColl, pt)) {
+            g_docks.coll[d] = !g_docks.coll[d];
+            DockChanged();
+            return true;
+        }
+        return false;
+    }
+    case WM_LBUTTONDOWN: {
+        const int sp = SplitAt(pt);
+        if (sp >= 0) {
+            g_dd = DockDrag();
+            g_dd.mode = 1;
+            g_dd.split = sp;
+            g_dd.start = pt;
+            for (int d = 0; d < DOCK_COUNT; ++d) g_dd.w0[d] = g_docks.weight[d];
+            SetCapture(hwnd);
+            return true;
+        }
+        if (PtInRect(&g_hsplit, pt)) {
+            g_dd = DockDrag();
+            g_dd.mode = 2;
+            g_dd.start = pt;
+            g_dd.h0 = g_docks.height;
+            SetCapture(hwnd);
+            return true;
+        }
+        const int d = DockTitleAt(pt);
+        if (d < 0) return false;
+        if (PtInRect(&g_dg[d].btnClose, pt)) {
+            g_docks.vis[d] = false;
+            DockChanged();
+            SetNote(std::wstring(L"Панель «") + kDockTitles[d] + L"» скрыта — вернуть: «Вид → Панели».");
+            return true;
+        }
+        if (PtInRect(&g_dg[d].btnColl, pt)) {
+            g_docks.coll[d] = !g_docks.coll[d];
+            DockChanged();
+            return true;
+        }
+        g_dd = DockDrag();
+        g_dd.mode = 3;
+        g_dd.dock = d;
+        g_dd.start = pt;
+        SetCapture(hwnd);
+        return true;
+    }
+    case WM_MOUSEMOVE: {
+        if (!g_dd.mode) {
+            // hover highlight of the title buttons
+            static int lastHot = -1;
+            int hot = -1;
+            for (int d = 0; d < DOCK_COUNT; ++d)
+                if (g_docks.vis[d] && (PtInRect(&g_dg[d].btnClose, pt) || PtInRect(&g_dg[d].btnColl, pt))) hot = d;
+            if (hot != lastHot) {
+                if (lastHot >= 0) InvalidateRect(hwnd, &g_dg[lastHot].title, FALSE);
+                if (hot >= 0) InvalidateRect(hwnd, &g_dg[hot].title, FALSE);
+                lastHot = hot;
+                TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&tme);
+            }
+            return false;
+        }
+        if (g_dd.mode == 1 && g_dd.split >= 0 && g_dd.split < static_cast<int>(g_splits.size())) {
+            const Splitter& s = g_splits[static_cast<size_t>(g_dd.split)];
+            const int dxw = static_cast<int>(static_cast<long long>(pt.x - g_dd.start.x) * g_sumW / g_availW);
+            const int minW = static_cast<int>(static_cast<long long>(S(120)) * g_sumW / g_availW);
+            int a = g_dd.w0[s.left] + dxw, b = g_dd.w0[s.right] - dxw;
+            const int total = g_dd.w0[s.left] + g_dd.w0[s.right];
+            a = std::clamp(a, minW, (std::max)(minW, total - minW));
+            b = total - a;
+            g_docks.weight[s.left] = a;
+            g_docks.weight[s.right] = b;
+            Layout(hwnd);
+            return true;
+        }
+        if (g_dd.mode == 2) {
+            const int dy = MulDiv(pt.y - g_dd.start.y, 96, static_cast<int>(g_dpi));
+            g_docks.height = std::clamp(g_dd.h0 - dy, 150, 2000);
+            Layout(hwnd);
+            return true;
+        }
+        if (g_dd.mode == 3) {
+            if (!g_dd.moved && std::abs(pt.x - g_dd.start.x) + std::abs(pt.y - g_dd.start.y) < S(6)) return true;
+            g_dd.moved = true;
+            // insertion point among the visible panels (order index)
+            int idx = 0, best = INT_MAX;
+            g_dd.dropX = 0;
+            std::vector<int> vis;
+            for (int k = 0; k < DOCK_COUNT; ++k)
+                if (g_docks.vis[g_docks.order[k]]) vis.push_back(g_docks.order[k]);
+            for (size_t k = 0; k <= vis.size(); ++k) {
+                const int x = k < vis.size() ? g_dock[vis[k]].left - S(3) : g_dock[vis.back()].right + S(3);
+                if (std::abs(pt.x - x) < best) {
+                    best = std::abs(pt.x - x);
+                    idx = static_cast<int>(k);
+                    g_dd.dropX = x;
+                }
+            }
+            g_dd.dropIdx = idx;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return true;
+        }
+        return false;
+    }
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED: {
+        if (!g_dd.mode) return false;
+        const DockDrag dd = g_dd;
+        g_dd = DockDrag();
+        if (msg == WM_LBUTTONUP) ReleaseCapture();
+        if (dd.mode == 3 && dd.moved && dd.dropIdx >= 0) {
+            std::vector<int> vis, all(g_docks.order, g_docks.order + DOCK_COUNT);
+            for (int d : all)
+                if (g_docks.vis[d]) vis.push_back(d);
+            const int from = static_cast<int>(std::find(vis.begin(), vis.end(), dd.dock) - vis.begin());
+            int to = dd.dropIdx;
+            if (from < static_cast<int>(vis.size())) {
+                vis.erase(vis.begin() + from);
+                if (to > from) --to;
+                to = std::clamp(to, 0, static_cast<int>(vis.size()));
+                vis.insert(vis.begin() + to, dd.dock);
+            }
+            // hidden panels keep their place at the end
+            std::vector<int> order = vis;
+            for (int d : all)
+                if (!g_docks.vis[d]) order.push_back(d);
+            for (int k = 0; k < DOCK_COUNT; ++k) g_docks.order[k] = order[static_cast<size_t>(k)];
+        }
+        if (dd.mode) DockChanged();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return true;
+    }
+    }
+    return false;
 }
 
 void DrawButton(const DRAWITEMSTRUCT* di) {
@@ -2144,7 +2569,7 @@ void CreateControls(HWND hwnd) {
     Mk(hwnd, L"WVCNext", L"", 0, IDC_NEXTPV);
     HWND nc = Mk(hwnd, WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_NEXT_COMBO);
     SetWindowTheme(nc, L"DarkMode_CFD", nullptr);
-    Mk(hwnd, L"BUTTON", L"⇅ Сменить", od, IDC_SWAP);
+    Mk(hwnd, L"BUTTON", L"В эфир ⇅", od, IDC_SWAP);
     HWND sl = Mk(hwnd, L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS |
                                           LBS_NOINTEGRALHEIGHT, IDC_SCENES);
     SetWindowTheme(sl, L"DarkMode_Explorer", nullptr);
@@ -2159,11 +2584,16 @@ void CreateControls(HWND hwnd) {
     for (int i = 0; i < 5; ++i) Mk(hwnd, L"BUTTON", rb[i], od, IDC_SR_ADD + i);
     HWND tt = Mk(hwnd, WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_TR_TYPE);
     SetWindowTheme(tt, L"DarkMode_CFD", nullptr);
-    for (const wchar_t* s : {L"Без перехода (сразу)", L"Растворение", L"Через чёрный", L"Шторка", L"Сдвиг"})
-        SendMessageW(tt, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+    for (int k = 0; k < TR_COUNT; ++k) SendMessageW(tt, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(kTransNames[k]));
+    HWND td = Mk(hwnd, WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_TR_DIR);
+    SetWindowTheme(td, L"DarkMode_CFD", nullptr);
+    for (const wchar_t* s : {L"← влево", L"→ вправо", L"↑ вверх", L"↓ вниз"}) SendMessageW(td, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+    HWND te = Mk(hwnd, WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, IDC_TR_EASE);
+    SetWindowTheme(te, L"DarkMode_CFD", nullptr);
+    for (const wchar_t* s : {L"Равномерно", L"Плавно (разгон и торможение)"}) SendMessageW(te, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
     Mk(hwnd, L"EDIT", L"500", WS_TABSTOP | ES_NUMBER | ES_RIGHT, IDC_TR_MS, WS_EX_CLIENTEDGE);
     HWND spin = Mk(hwnd, UPDOWN_CLASSW, L"", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, IDC_TR_SPIN);
-    SendMessageW(spin, UDM_SETRANGE32, 50, 5000);
+    SendMessageW(spin, UDM_SETRANGE32, 0, 5000);
     UDACCEL acc{0, 50};
     SendMessageW(spin, UDM_SETACCEL, 1, reinterpret_cast<LPARAM>(&acc));
     Mk(hwnd, L"BUTTON", L"▶  Старт камеры", od, IDC_START);
@@ -2183,7 +2613,10 @@ void CreateControls(HWND hwnd) {
     AddTip(IDC_SR_PROPS, L"Свойства источника (двойной щелчок — то же)");
     AddTip(IDC_SR_UP, L"Выше (поверх других)");
     AddTip(IDC_SR_DOWN, L"Ниже");
-    AddTip(IDC_SWAP, L"Поменять «Сейчас» и «Следующий» (Ctrl+Shift+F9 по умолчанию)");
+    AddTip(IDC_SWAP, L"В эфир: «Следующий» становится «Сейчас» с переходом (Ctrl+Shift+F9 по умолчанию). "
+                     L"Щёлкните по «Следующему», чтобы править его источники мышью.");
+    AddTip(IDC_TR_DIR, L"Направление для шторки, сдвига, наплыва и жалюзи");
+    AddTip(IDC_TR_MS, L"0 — смена без перехода");
     AddTip(IDC_START, L"Камера «WVC Camera» начинает показывать сцену (Ctrl+Shift+F5). Остановлена — картинка паузы.");
     AddTip(IDC_PAUSE, L"Пауза: камера показывает картинку паузы, источники остаются включены (Ctrl+Shift+6)");
 }
@@ -2284,6 +2717,7 @@ void FollowTick() {
         structural = true;
     }
     UpdateFrames();
+    UndoPoll(g_drag.mode != 0 || g_frameMoving || GetKeyState(VK_LBUTTON) < 0);
     if (g_projDirty && now - g_lastSave > 1000) {
         SaveProject();
         g_lastSave = now;
@@ -2452,9 +2886,18 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_nid.uID = 1;
         g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         g_nid.uCallbackMessage = WM_TRAY;
-        g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        g_nid.hIcon = static_cast<HICON>(LoadImageW(g_hInst, MAKEINTRESOURCEW(4), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                                    GetSystemMetrics(SM_CYSMICON), 0));
         wcscpy(g_nid.szTip, L"WVC");
         Shell_NotifyIconW(NIM_ADD, &g_nid);
+        {
+            HICON big = static_cast<HICON>(LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                                      GetSystemMetrics(SM_CYICON), 0));
+            HICON sm = static_cast<HICON>(LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                                     GetSystemMetrics(SM_CYSMICON), 0));
+            if (big) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+            if (sm) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(sm));
+        }
         SetTimer(hwnd, kTimerStatus, 1000, nullptr);
         SetTimer(hwnd, kTimerPreview, 50, nullptr);
         SetTimer(hwnd, kTimerFollow, 100, nullptr);
@@ -2488,6 +2931,29 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SHOWWINDOW:
         g_uiVisible = wp != 0;
         break;
+    case WM_SETCURSOR:
+        if (reinterpret_cast<HWND>(wp) == hwnd && DockMouse(hwnd, msg, wp, lp)) return TRUE;
+        break;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_MOUSEMOVE:
+    case WM_CAPTURECHANGED:
+        if (DockMouse(hwnd, msg, wp, lp)) return 0;
+        break;
+    case WM_MOUSELEAVE:
+        for (int d = 0; d < DOCK_COUNT; ++d) InvalidateRect(hwnd, &g_dg[d].title, FALSE);
+        return 0;
+    case WM_UPDATE_RESULT: OnUpdateResult(lp); return 0;
+    case WM_INITMENUPOPUP: {
+        HMENU m = reinterpret_cast<HMENU>(wp);
+        for (int d = 0; d < DOCK_COUNT; ++d)
+            CheckMenuItem(m, ID_MENU_DOCK0 + d, MF_BYCOMMAND | (g_docks.vis[d] ? MF_CHECKED : MF_UNCHECKED));
+        EnableMenuItem(m, ID_MENU_UNDO, MF_BYCOMMAND | (UndoAvailable(false) ? MF_ENABLED : MF_GRAYED));
+        EnableMenuItem(m, ID_MENU_REDO, MF_BYCOMMAND | (UndoAvailable(true) ? MF_ENABLED : MF_GRAYED));
+        CheckMenuItem(m, ID_MENU_EDITNEXT, MF_BYCOMMAND | (g_editNext ? MF_CHECKED : MF_UNCHECKED));
+        return 0;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -2532,7 +2998,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
                 InvalidateRect(C(IDC_PROGRAM), nullptr, FALSE);
                 static int k = 0;
-                if (++k % 3 == 0) InvalidateRect(C(IDC_NEXTPV), nullptr, FALSE);
+                if (g_editNext || ++k % 3 == 0) InvalidateRect(C(IDC_NEXTPV), nullptr, FALSE);
             } else {
                 g_pubProgram.wantW = 0;
                 g_pubNext.wantW = 0;
@@ -2566,12 +3032,23 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ShowMain();
         } else if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
             HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, L"Открыть WVC");
-            AppendMenuW(m, MF_STRING, ID_TRAY_TOGGLE, g_streaming ? L"Стоп камеры" : L"Старт камеры");
-            if (g_streaming) AppendMenuW(m, MF_STRING, ID_TRAY_PAUSE, g_paused ? L"Продолжить" : L"Пауза");
-            AppendMenuW(m, MF_STRING, ID_TRAY_SWAP, L"Сейчас ⇄ Следующий");
+            AppendMenuW(m, MF_STRING, ID_TRAY_TOGGLE, g_streaming ? L"■  Стоп камеры" : L"▶  Старт камеры");
+            AppendMenuW(m, MF_STRING | (g_streaming ? 0 : MF_GRAYED), ID_TRAY_PAUSE, g_paused ? L"Продолжить" : L"Пауза");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            {
+                Project p = ProjSnapshot();
+                HMENU sm = CreatePopupMenu();
+                for (size_t i = 0; i < p.scenes.size() && i < 80; ++i)
+                    AppendMenuW(sm, MF_STRING | (static_cast<int>(i) == p.cur ? MF_CHECKED : 0), ID_TRAY_SCENE0 + static_cast<UINT>(i),
+                                p.scenes[i].name.c_str());
+                AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(sm), L"Сцены");
+                const bool hasNext = p.next >= 0 && p.next < static_cast<int>(p.scenes.size()) && p.next != p.cur;
+                AppendMenuW(m, MF_STRING | (hasNext ? 0 : MF_GRAYED), ID_TRAY_SWAP, L"«Следующий» в эфир ⇅");
+            }
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, L"Показать окно");
             AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, L"Выход");
+            SetMenuDefaultItem(m, ID_TRAY_OPEN, FALSE);
             POINT pt;
             GetCursorPos(&pt);
             SetForegroundWindow(hwnd);
@@ -2581,6 +3058,49 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_COMMAND: {
         const int id = LOWORD(wp), code = HIWORD(wp);
+        if (id >= ID_TRAY_SCENE0 && id < ID_TRAY_SCENE0 + 80) {
+            SetProgramScene(id - ID_TRAY_SCENE0);
+            return 0;
+        }
+        if (id >= ID_MENU_DOCK0 && id < ID_MENU_DOCK0 + DOCK_COUNT) {
+            const int d = id - ID_MENU_DOCK0;
+            g_docks.vis[d] = !g_docks.vis[d];
+            if (g_docks.vis[d]) g_docks.coll[d] = false;
+            DockChanged();
+            return 0;
+        }
+        switch (id) {
+        case ID_MENU_DOCKRESET: DocksReset(); DockChanged(); return 0;
+        case ID_MENU_SETTINGS: OpenSettings(0); return 0;
+        case ID_MENU_EXPORT: DoExportJson(hwnd); return 0;
+        case ID_MENU_IMPORT: DoImportJson(hwnd); return 0;
+        case ID_MENU_EXIT: DestroyWindow(hwnd); return 0;
+        case ID_MENU_UNDO: UndoStep(false); return 0;
+        case ID_MENU_REDO: UndoStep(true); return 0;
+        case ID_MENU_EDITNEXT: SetEditNext(!g_editNext); return 0;
+        case ID_MENU_LOG: OpenLogWindow(); return 0;
+        case ID_MENU_UPDATES: CheckUpdates(true); return 0;
+        case ID_MENU_README: {
+            const std::wstring f = ExeDir() + L"\\README.txt";
+            if (reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", f.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+                ShellExecuteW(hwnd, L"open", L"https://github.com/Finn013/WVC", nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+        }
+        case ID_MENU_ABOUT: {
+            MSGBOXPARAMSW mb{};
+            mb.cbSize = sizeof(mb);
+            mb.hwndOwner = hwnd;
+            mb.hInstance = g_hInst;
+            mb.lpszText = L"WVC " WVC_VERSION L" — лёгкая виртуальная камера в стиле OBS.\n\n"
+                          L"Камера «WVC Camera» для Zoom, Telegram, Discord и браузеров; телефон как камера (WVC Phone).\n"
+                          L"https://github.com/Finn013/WVC\n\nКамера основана на softcam (MIT).";
+            mb.lpszCaption = L"О программе WVC";
+            mb.dwStyle = MB_USERICON | MB_OK;
+            mb.lpszIcon = MAKEINTRESOURCEW(1);
+            MessageBoxIndirectW(&mb);
+            return 0;
+        }
+        }
         if (id >= ID_S_REN && id <= ID_S_ADD) {
             SceneCommand(id, lp >= 0x10000 ? static_cast<int>(lp - 0x10000) : -1);
             return 0;
@@ -2646,7 +3166,20 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_TR_TYPE:
             if (code == CBN_SELCHANGE && !g_syncing) {
                 const int t = static_cast<int>(SendMessageW(C(IDC_TR_TYPE), CB_GETCURSEL, 0, 0));
-                ProjEdit([&](Project& p) { p.transition = std::clamp(t, 0, 4); });
+                ProjEdit([&](Project& p) { p.transition = std::clamp(t, 0, TR_COUNT - 1); });
+                EnableWindow(C(IDC_TR_DIR), TransUsesDir(t));
+            }
+            break;
+        case IDC_TR_DIR:
+            if (code == CBN_SELCHANGE && !g_syncing) {
+                const int t = static_cast<int>(SendMessageW(C(IDC_TR_DIR), CB_GETCURSEL, 0, 0));
+                ProjEdit([&](Project& p) { p.transDir = std::clamp(t, 0, 3); });
+            }
+            break;
+        case IDC_TR_EASE:
+            if (code == CBN_SELCHANGE && !g_syncing) {
+                const int t = static_cast<int>(SendMessageW(C(IDC_TR_EASE), CB_GETCURSEL, 0, 0));
+                ProjEdit([&](Project& p) { p.transEase = std::clamp(t, 0, 1); });
             }
             break;
         case IDC_TR_MS:
@@ -2654,7 +3187,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 wchar_t b[16] = {};
                 GetWindowTextW(C(IDC_TR_MS), b, 16);
                 const int v = _wtoi(b);
-                if (v >= 50 && v <= 5000) ProjEdit([&](Project& p) { p.transMs = v; });
+                if (b[0] && v >= 0 && v <= 5000) ProjEdit([&](Project& p) { p.transMs = v; });
             }
             break;
         }
@@ -2755,8 +3288,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
         ++g_projVer;
         SaveProject();
     }
+    LogMsg(L"WVC " WVC_VERSION L" запущен: " + ExePath());
+    DocksLoad();
     LoadHotkeys();
-    LoadCameraDll();
+    if (!LoadCameraDll()) LogErr(L"Не загрузился WVCCam.dll рядом с WVC.exe");
     RenderStart();  // the camera exists while WVC runs; Start / Stop only switch the picture
 
     {
@@ -2799,10 +3334,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     RegisterClassW(&dc);
 
     WNDCLASSW wc{};
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = MainProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"WVCMain";
     RegisterClassW(&wc);
@@ -2819,8 +3355,38 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
         RECT test{wx, wy, wx + ww, wy + wh};
         if (wx != CW_USEDEFAULT && !MonitorFromRect(&test, MONITOR_DEFAULTTONULL)) wx = wy = CW_USEDEFAULT;
     }
+    HMENU bar = CreateMenu();
+    {
+        HMENU f = CreatePopupMenu();
+        AppendMenuW(f, MF_STRING, ID_MENU_SETTINGS, L"Настройки…");
+        AppendMenuW(f, MF_STRING, ID_MENU_EXPORT, L"Сохранить настройки в JSON…");
+        AppendMenuW(f, MF_STRING, ID_MENU_IMPORT, L"Загрузить настройки из JSON…");
+        AppendMenuW(f, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(f, MF_STRING, ID_MENU_EXIT, L"Выход");
+        AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(f), L"Файл");
+        HMENU e = CreatePopupMenu();
+        AppendMenuW(e, MF_STRING, ID_MENU_UNDO, L"Отменить\tCtrl+Z");
+        AppendMenuW(e, MF_STRING, ID_MENU_REDO, L"Повторить\tCtrl+Y");
+        AppendMenuW(e, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(e, MF_STRING, ID_MENU_EDITNEXT, L"Править «Следующий» (студийный режим)");
+        AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(e), L"Правка");
+        HMENU v = CreatePopupMenu();
+        HMENU pn = CreatePopupMenu();
+        static const wchar_t* names[DOCK_COUNT] = {L"Следующий", L"Сцены", L"Источники", L"Переходы", L"Управление"};
+        for (int d = 0; d < DOCK_COUNT; ++d) AppendMenuW(pn, MF_STRING, ID_MENU_DOCK0 + d, names[d]);
+        AppendMenuW(v, MF_POPUP, reinterpret_cast<UINT_PTR>(pn), L"Панели");
+        AppendMenuW(v, MF_STRING, ID_MENU_DOCKRESET, L"Сбросить раскладку");
+        AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(v), L"Вид");
+        HMENU h = CreatePopupMenu();
+        AppendMenuW(h, MF_STRING, ID_MENU_LOG, L"Журнал");
+        AppendMenuW(h, MF_STRING, ID_MENU_UPDATES, L"Проверить обновления");
+        AppendMenuW(h, MF_STRING, ID_MENU_README, L"Инструкция (README)");
+        AppendMenuW(h, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(h, MF_STRING, ID_MENU_ABOUT, L"О программе");
+        AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(h), L"Справка");
+    }
     HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, L"WVCMain", L"WVC " WVC_VERSION L" — виртуальная камера",
-                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, wx, wy, ww, wh, nullptr, nullptr, hInst, nullptr);
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, wx, wy, ww, wh, nullptr, bar, hInst, nullptr);
     if (!hwnd) return 1;
     UiRefresh();
     const bool tray = cmdLine && wcsstr(cmdLine, L"--tray");
@@ -2833,9 +3399,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     }
     UiStatus();
     if (g_ini.Int(L"WVC", L"AutoStream", 0) && g_camOk) ToggleStreaming();
+    if (ProjSnapshot().checkUpdates) CheckUpdates(false);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) in the main window, but not while typing in a text field
+        if (msg.message == WM_KEYDOWN && (msg.wParam == 'Z' || msg.wParam == 'Y') && GetKeyState(VK_CONTROL) < 0 &&
+            GetKeyState(VK_MENU) >= 0 && GetAncestor(msg.hwnd, GA_ROOT) == hwnd) {
+            wchar_t cls[32] = {};
+            GetClassNameW(msg.hwnd, cls, 32);
+            if (_wcsicmp(cls, L"Edit") != 0) {
+                const bool redo = msg.wParam == 'Y' || GetKeyState(VK_SHIFT) < 0;
+                UndoStep(redo);
+                continue;
+            }
+        }
         if (!IsDialogMessageW(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -2843,6 +3421,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     }
     g_quitting = true;
     g_streaming = false;
+    LogMsg(L"WVC закрыт");
     SaveProject();
     RenderStop();
     InputsShutdown();

@@ -1,4 +1,4 @@
-// WVC 0.11 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
+// WVC 0.12 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
 // Общие объявления для всех файлов приложения.
 #pragma once
 
@@ -19,6 +19,7 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <mftransform.h>
+#include <strmif.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,7 +40,8 @@
 #include <thread>
 #include <vector>
 
-#define WVC_VERSION L"0.11"
+#define WVC_VERSION L"0.12"
+#define WVC_VERSION_NUM 12  // minor number, for the update check
 
 template <class T> static inline void SafeRelease(T*& p) {
     if (p) {
@@ -60,6 +62,17 @@ std::wstring FileNameOf(const std::wstring& path);
 std::wstring LowerExt(const std::wstring& f);
 bool IsVideoFile(const std::wstring& f);
 std::wstring Trim(const std::wstring& s);
+
+// log.cpp: ring buffer of recent events + wvc.log next to the exe (rotated at ~1 MB)
+void LogMsg(const std::wstring& m);
+void LogErr(const std::wstring& m);
+std::vector<std::wstring> LogLines();
+std::wstring LogFilePath();
+void OpenLogWindow();
+// update.cpp
+void CheckUpdates(bool manual);  // manual: always shows the result; startup: only when there is a newer one
+static const UINT WM_UPDATE_RESULT = WM_APP + 20;
+void OnUpdateResult(LPARAM lp);
 
 // Settings file (UTF-16 INI), kept in memory and written in one go.
 struct IniDoc {
@@ -154,6 +167,7 @@ struct Item {
     std::wstring winTitle;
     HWND hwnd = nullptr;     // runtime
     int winCapture = 0;      // 0 = from the screen, 1 = straight from the window (PrintWindow)
+    bool winFrame = true;    // thin coloured frame around the captured window on the screen
     std::wstring monDevice;
     RECT monRect{};          // last known monitor rectangle
     bool cursor = false;
@@ -202,8 +216,10 @@ struct Project {
     std::vector<Scene> scenes;
     int cur = 0, next = -1;
     OutputCfg out;
-    int transition = 1;   // 0 none, 1 dissolve, 2 through black, 3 wipe, 4 slide
-    int transMs = 500;
+    int transition = 1;   // TR_*
+    int transMs = 500;    // 0 = cut
+    int transDir = 0;     // 0 ←, 1 →, 2 ↑, 3 ↓ (wipes, push, slide, blinds)
+    int transEase = 1;    // 0 linear, 1 smooth
     int pauseMode = 2;    // 0 last frame, 1 black, 2 text, 3 picture
     std::wstring pauseText = L"Скоро вернусь";
     std::wstring pauseImage;
@@ -211,6 +227,9 @@ struct Project {
     int defPhoneConn = 0, defPhoneRes = 0, defPhoneCodec = 0;
     bool defAutoRotate = true;
     std::wstring lastPhoneIp;
+    bool hideStartGlare = true;   // «Скрывать засвет при старте» (webcams / phone cameras)
+    bool checkUpdates = false;    // check for a new version at start
+    std::wstring placeholder;     // picture the camera shows while WVC is closed (empty = built in)
     int nextUid = 1;
 };
 
@@ -250,6 +269,13 @@ struct Input {
     ULONGLONG failedAt = 0;
     std::thread th;
     ULONGLONG lastWanted = 0;
+    // «Скрывать засвет при старте»: after Arm(), frames are held back until the brightness settles
+    // (mean luma changes < 2% over 3 frames) or 2 s pass; until then the last picture (or nothing) stays.
+    std::atomic<bool> gateArm{false};
+    std::atomic<bool> gating{false};
+    int gateStable = 0;
+    double gateLuma = -1;
+    ULONGLONG gateStart = 0;
     void Publish(const uint8_t* bgra, int fw, int fh);
     void Clear();
     virtual void Start() = 0;
@@ -259,6 +285,24 @@ struct Input {
 std::wstring InputKeyOf(const Item& it);
 std::shared_ptr<Input> GetInput(const std::wstring& key);
 void InputsSync();      // UI timer: start / stop what is needed
+extern std::atomic<bool> g_hideGlare;
+// webcam picture controls (IAMCameraControl / IAMVideoProcAmp of the Media Foundation source), per device
+struct CamCtlCfg {
+    int expMode = 0, expVal = 0;  // 0 auto, 1 manual
+    int brMode = 0, brVal = 0;    // 0 as the camera has it, 1 manual
+    int wbMode = 0, wbVal = 0;    // 0 auto, 1 manual
+};
+struct CamCtlRange {
+    bool has = false;
+    long lo = 0, hi = 0, step = 1, def = 0, cur = 0;
+};
+struct CamCtlInfo {
+    bool open = false;
+    CamCtlRange exp, br, wb;
+};
+CamCtlCfg CamCtlGet(const std::wstring& link);
+void CamCtlSet(const std::wstring& link, const CamCtlCfg& c);  // saved and applied at once (if the camera is open)
+CamCtlInfo CamCtlInfoFor(const std::wstring& link);
 void InputsShutdown();
 void MediaNextAll(const std::wstring& key);  // empty key = every player
 std::wstring MediaNowName(const std::wstring& key);
@@ -333,6 +377,30 @@ void BuildShapeMask(int w, int h, const ShapeDef& sd, std::vector<uint8_t>& m);
 void ShapeOutline(double w, double h, const ShapeDef& sd, std::vector<std::vector<POINT>>* polys);  // for previews
 void DrawCheckerboard(HDC dc, const RECT& r, int cell);
 
+enum TransKind {
+    TR_NONE = 0, TR_DISSOLVE, TR_BLACK, TR_WIPE, TR_PUSH, TR_SOFTWIPE, TR_CIRCLE, TR_CLOCK, TR_ZOOM, TR_BLUR, TR_SLIDE,
+    TR_BLINDS, TR_DIAMOND, TR_FLASH, TR_COUNT
+};
+extern const wchar_t* const kTransNames[TR_COUNT];
+bool TransUsesDir(int kind);
+class TransEngine {
+public:
+    void Begin(const uint8_t* cur, int W, int H, int kind, int ms, int dir, int ease);  // cur = shown now (null = black)
+    const uint8_t* Step(const uint8_t* to, int W, int H, bool targetReady, HDC ref);   // what to show this frame
+    void Reset();
+    bool Active() const { return active; }
+
+private:
+    void MaskBlend(const uint8_t* a, const uint8_t* b, uint8_t* o, int W, int H,
+                   const std::function<double(double, double)>& f);
+    int kind = 0, ms = 0, dir = 0, ease = 1, fw = 0, fh = 0;
+    bool active = false, started = false;
+    ULONGLONG begun = 0, t0 = 0;
+    std::vector<uint8_t> from, scratch;
+    std::vector<uint16_t> grid;
+    Surface out, sa, sb, tiny;
+};
+
 struct Published {
     std::mutex mx;
     std::vector<uint8_t> px;  // BGRA top-down
@@ -349,6 +417,7 @@ extern Item g_soloItem;         // the copy being edited in Properties
 extern std::atomic<int> g_fpsX10;
 extern std::atomic<bool> g_resetCapture, g_pauseDirty;
 extern std::atomic<int> g_transGen;
+extern std::atomic<bool> g_editingNext;  // «Следующий» is being edited: its preview is drawn at full rate
 struct NativeInfo {
     int w = 0, h = 0;  // as shown: after rotation, before crop
 };
@@ -406,6 +475,26 @@ bool PickFile(HWND owner, const wchar_t* filter, std::wstring* out, bool multi =
 const wchar_t* kImageFilter();
 const wchar_t* kMediaFilter();
 
+Scene* UiEditScene(Project& p);              // the scene being edited: «Сейчас» or «Следующий»
+const Scene* UiEditSceneC(const Project& p);
+// undo.cpp
+void UndoPoll(bool userBusy);
+bool UndoStep(bool redo);
+bool UndoAvailable(bool redo);
+// docks.cpp: panels under the preview
+enum { DOCK_NEXT = 0, DOCK_SCENES, DOCK_SOURCES, DOCK_TRANS, DOCK_CONTROLS, DOCK_COUNT };
+struct DockState {
+    int order[DOCK_COUNT];
+    bool vis[DOCK_COUNT];
+    bool coll[DOCK_COUNT];
+    int weight[DOCK_COUNT];  // width share, px at 96 dpi
+    int height;              // px at 96 dpi
+};
+extern DockState g_docks;
+void DocksLoad();
+void DocksSave();
+void DocksReset();
+
 // properties (ui_props.cpp)
 bool OpenProperties(int uid, bool isNew);
 void AddSourceMenu(HWND owner, POINT pt);
@@ -441,3 +530,4 @@ void DoExportJson(HWND owner);
 void DoImportJson(HWND owner);
 void ReloadAfterImport();
 void RestartCameraForFormat(const wchar_t* note);
+bool WritePlaceholder(const std::wstring& image);  // for the camera DLL while WVC is closed (empty = built in)

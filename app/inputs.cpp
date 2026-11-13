@@ -6,8 +6,44 @@ bool g_wsaOk = false;
 HWND g_notify = nullptr;
 std::atomic<bool> g_streaming{false}, g_paused{false}, g_uiVisible{true}, g_quitting{false};
 std::atomic<int> g_soloUid{0};
+std::atomic<bool> g_hideGlare{true};
+
+static double MeanLuma(const uint8_t* bgra, int w, int h) {
+    // a sparse grid is enough for the average brightness
+    const int sx = (std::max)(1, w / 64), sy = (std::max)(1, h / 36);
+    double sum = 0;
+    int n = 0;
+    for (int y = sy / 2; y < h; y += sy) {
+        const uint8_t* row = bgra + static_cast<size_t>(y) * w * 4;
+        for (int x = sx / 2; x < w; x += sx) {
+            const uint8_t* q = row + static_cast<size_t>(x) * 4;
+            sum += (q[2] * 77 + q[1] * 150 + q[0] * 29) >> 8;
+            ++n;
+        }
+    }
+    return n ? sum / n : 0;
+}
 
 void Input::Publish(const uint8_t* bgra, int fw, int fh) {
+    if (gateArm.exchange(false)) {
+        gating = true;
+        gateStable = 0;
+        gateLuma = -1;
+        gateStart = GetTickCount64();
+    }
+    if (gating) {
+        const double l = MeanLuma(bgra, fw, fh);
+        const bool steady = gateLuma >= 0 && std::fabs(l - gateLuma) < 255 * 0.02;
+        gateStable = steady ? gateStable + 1 : 0;
+        gateLuma = l;
+        if (gateStable >= 3 || GetTickCount64() - gateStart > 2000) {
+            gating = false;
+            LogMsg(L"Источник «" + key.substr(0, 60) + L"»: экспозиция установилась за " +
+                   std::to_wstring(GetTickCount64() - gateStart) + L" мс");
+        } else {
+            return;  // still adjusting: keep showing the previous picture
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(mx);
         buf.assign(bgra, bgra + static_cast<size_t>(fw) * fh * 4);
@@ -33,6 +69,152 @@ void Input::Halt() {
 }
 
 // ---------------------------------------------------------------------------
+// Webcam picture controls: exposure, brightness, white balance (remembered per device in [CamCtl <hash>])
+// ---------------------------------------------------------------------------
+namespace {
+std::mutex g_ccMx;
+struct CamCtlRt {
+    int ver = 0, applied = -1;
+    bool loaded = false;  // cfg read from settings.ini (on the UI thread only)
+    CamCtlCfg cfg;
+    CamCtlInfo info;
+};
+std::map<std::wstring, CamCtlRt> g_cc;  // by device link
+
+std::wstring CamCtlSec(const std::wstring& link) {
+    unsigned long long h = 1469598103934665603ull;
+    for (wchar_t c : link) h = (h ^ static_cast<unsigned long long>(std::towlower(c))) * 1099511628211ull;
+    wchar_t b[40];
+    swprintf(b, 40, L"CamCtl %016llx", h);
+    return b;
+}
+
+void ReadRange(IAMCameraControl* cc, IAMVideoProcAmp* va, bool camCtl, long prop, CamCtlRange* r) {
+    long lo = 0, hi = 0, step = 0, def = 0, flags = 0, cur = 0;
+    HRESULT hr = camCtl ? (cc ? cc->GetRange(prop, &lo, &hi, &step, &def, &flags) : E_FAIL)
+                        : (va ? va->GetRange(prop, &lo, &hi, &step, &def, &flags) : E_FAIL);
+    if (FAILED(hr) || hi <= lo) {
+        r->has = false;
+        return;
+    }
+    r->has = true;
+    r->lo = lo;
+    r->hi = hi;
+    r->step = step > 0 ? step : 1;
+    r->def = def;
+    if (SUCCEEDED(camCtl ? cc->Get(prop, &cur, &flags) : va->Get(prop, &cur, &flags))) r->cur = cur;
+    else r->cur = def;
+}
+
+void ApplyCtl(const std::wstring& link, IMFMediaSource* src) {
+    CamCtlCfg c;
+    {
+        std::lock_guard<std::mutex> lk(g_ccMx);
+        c = g_cc[link].cfg;  // the webcam thread never touches settings.ini itself
+    }
+    IAMCameraControl* cc = nullptr;
+    IAMVideoProcAmp* va = nullptr;
+    src->QueryInterface(IID_PPV_ARGS(&cc));
+    src->QueryInterface(IID_PPV_ARGS(&va));
+    CamCtlInfo info;
+    info.open = true;
+    ReadRange(cc, va, true, CameraControl_Exposure, &info.exp);
+    ReadRange(cc, va, false, VideoProcAmp_Brightness, &info.br);
+    ReadRange(cc, va, false, VideoProcAmp_WhiteBalance, &info.wb);
+    auto clampTo = [](const CamCtlRange& r, int v) { return static_cast<long>(std::clamp<long>(v, r.lo, r.hi)); };
+    if (cc && info.exp.has) {
+        if (c.expMode == 1) cc->Set(CameraControl_Exposure, clampTo(info.exp, c.expVal), CameraControl_Flags_Manual);
+        else cc->Set(CameraControl_Exposure, info.exp.cur, CameraControl_Flags_Auto);
+    }
+    if (va && info.br.has) {
+        if (c.brMode == 1) va->Set(VideoProcAmp_Brightness, clampTo(info.br, c.brVal), VideoProcAmp_Flags_Manual);
+        else va->Set(VideoProcAmp_Brightness, info.br.def, VideoProcAmp_Flags_Manual);
+    }
+    if (va && info.wb.has) {
+        if (c.wbMode == 1) va->Set(VideoProcAmp_WhiteBalance, clampTo(info.wb, c.wbVal), VideoProcAmp_Flags_Manual);
+        else va->Set(VideoProcAmp_WhiteBalance, info.wb.cur, VideoProcAmp_Flags_Auto);
+    }
+    // the values now (auto settings report what the camera chose)
+    ReadRange(cc, va, true, CameraControl_Exposure, &info.exp);
+    ReadRange(cc, va, false, VideoProcAmp_Brightness, &info.br);
+    ReadRange(cc, va, false, VideoProcAmp_WhiteBalance, &info.wb);
+    SafeRelease(cc);
+    SafeRelease(va);
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    g_cc[link].info = info;
+}
+}  // namespace
+
+CamCtlCfg CamCtlGet(const std::wstring& link) {  // UI thread
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    CamCtlRt& rt = g_cc[link];
+    if (!rt.loaded) {
+        const std::wstring sec = CamCtlSec(link);
+        CamCtlCfg& c = rt.cfg;
+        c.expMode = g_ini.Int(sec, L"ExpMode", 0);
+        c.expVal = g_ini.Int(sec, L"ExpVal", 0);
+        c.brMode = g_ini.Int(sec, L"BrMode", 0);
+        c.brVal = g_ini.Int(sec, L"BrVal", 0);
+        c.wbMode = g_ini.Int(sec, L"WbMode", 0);
+        c.wbVal = g_ini.Int(sec, L"WbVal", 0);
+        rt.loaded = true;
+    }
+    return rt.cfg;
+}
+
+void CamCtlSet(const std::wstring& link, const CamCtlCfg& c) {  // UI thread
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    g_cc[link].cfg = c;
+    g_cc[link].loaded = true;
+    const std::wstring sec = CamCtlSec(link);
+    g_ini.SetInt(sec, L"ExpMode", c.expMode);
+    g_ini.SetInt(sec, L"ExpVal", c.expVal);
+    g_ini.SetInt(sec, L"BrMode", c.brMode);
+    g_ini.SetInt(sec, L"BrVal", c.brVal);
+    g_ini.SetInt(sec, L"WbMode", c.wbMode);
+    g_ini.SetInt(sec, L"WbVal", c.wbVal);
+    ++g_cc[link].ver;
+    g_projDirty = true;
+}
+
+CamCtlInfo CamCtlInfoFor(const std::wstring& link) {
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    auto it = g_cc.find(link);
+    return it == g_cc.end() ? CamCtlInfo() : it->second.info;
+}
+
+// webcam thread
+static void CamCtlOpened(const std::wstring& link, IMFMediaSource* src) {
+    int v;
+    {
+        std::lock_guard<std::mutex> lk(g_ccMx);
+        v = g_cc[link].ver;
+    }
+    ApplyCtl(link, src);
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    g_cc[link].applied = v;
+}
+
+static void CamCtlPoll(const std::wstring& link, IMFMediaSource* src) {
+    int v, a;
+    {
+        std::lock_guard<std::mutex> lk(g_ccMx);
+        v = g_cc[link].ver;
+        a = g_cc[link].applied;
+    }
+    if (v == a) return;
+    ApplyCtl(link, src);
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    g_cc[link].applied = v;
+}
+
+static void CamCtlClosed(const std::wstring& link) {
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    g_cc[link].info.open = false;
+    g_cc[link].applied = -1;
+}
+
+// ---------------------------------------------------------------------------
 // Webcam
 // ---------------------------------------------------------------------------
 namespace {
@@ -41,6 +223,7 @@ struct WebcamInput : Input {
     void Start() override {
         stop = false;
         status = 1;
+        if (g_hideGlare) gateArm = true;
         th = std::thread([this] { Run(); });
     }
     void Run() {
@@ -59,7 +242,11 @@ struct WebcamInput : Input {
             if (FAILED(MFCreateAttributes(&a, 2))) break;
             a->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
             a->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, link.c_str());
-            if (FAILED(MFCreateDeviceSource(a, &src))) break;
+            if (FAILED(MFCreateDeviceSource(a, &src))) {
+                LogErr(L"Веб-камера не открылась: " + link.substr(0, 80));
+                break;
+            }
+            CamCtlOpened(link, src);
             if (FAILED(MFCreateAttributes(&ra, 1))) break;
             ra->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
             if (FAILED(MFCreateSourceReaderFromMediaSource(src, ra, &rd))) break;
@@ -108,8 +295,10 @@ struct WebcamInput : Input {
             ok = true;
         } while (false);
         if (ok) {
+            LogMsg(L"Веб-камера открыта: " + std::to_wstring(fw) + L"×" + std::to_wstring(fh));
             std::vector<uint8_t> local(static_cast<size_t>(fw) * fh * 4);
             while (!stop) {
+                CamCtlPoll(link, src);
                 DWORD si = 0, flags = 0;
                 LONGLONG ts = 0;
                 IMFSample* sample = nullptr;
@@ -165,6 +354,7 @@ struct WebcamInput : Input {
         SafeRelease(outType);
         SafeRelease(rd);
         SafeRelease(ra);
+        CamCtlClosed(link);
         if (src) src->Shutdown();
         SafeRelease(src);
         SafeRelease(a);
@@ -836,7 +1026,10 @@ struct PhoneInput : Input {
     void SyncWanted() {  // UI thread: tell the phone what changed
         if (status != 2) return;
         const int s = wantSrc, r = wantRes;
-        if (s != sentSrc && SendLine(SrcCmd(s, wantCodec))) sentSrc = s;
+        if (s != sentSrc && SendLine(SrcCmd(s, wantCodec))) {
+            sentSrc = s;
+            if (s < 2 && g_hideGlare) gateArm = true;  // a camera starts: hide its first bright frames
+        }
         if (r != sentRes && SendLine(r == 1 ? "RES 1080" : "RES 720")) sentRes = r;
     }
     void HandleText(const std::string& t) {
@@ -1000,6 +1193,8 @@ struct PhoneInput : Input {
         }
         if (s != INVALID_SOCKET) {
             status = 2;
+            LogMsg(L"Телефон подключён: " + link);
+            if (g_hideGlare && wantSrc < 2) gateArm = true;
             const int codecMode = wantCodec;
             if (g_h264Avail < 0) {
                 H264Decoder probe;
@@ -1262,6 +1457,7 @@ static std::shared_ptr<Input> CreateInput(const Item& it, const std::wstring& ke
     if (it.type == IT_WEBCAM) {
         auto w = std::make_shared<WebcamInput>();
         w->link = it.camLink;
+        CamCtlGet(it.camLink);  // load the remembered picture settings before the thread starts
         in = w;
     } else if (it.type == IT_MEDIA) {
         auto m = std::make_shared<MediaInput>();
@@ -1299,6 +1495,7 @@ void InputsSync() {
     Project p = ProjSnapshot();
     const bool live = g_streaming;
     const bool preview = g_uiVisible && p.liveWhenStopped;
+    g_hideGlare = p.hideStartGlare;
     struct Want {
         const Item* item;
         int prio;
@@ -1323,7 +1520,8 @@ void InputsSync() {
         if (live || preview)
             for (const auto& it : cur.items)
                 if (it.visible) add(it, 1);
-        if (preview && p.next >= 0 && p.next < n)
+        // «Следующий» is opened in advance (also while on air in the tray), so the switch has a picture at once
+        if ((preview || live) && p.next >= 0 && p.next < n)
             for (const auto& it : p.scenes[static_cast<size_t>(p.next)].items)
                 if (it.visible) add(it, 2);
         if (p.keepCamOn)
@@ -1460,6 +1658,7 @@ std::wstring InputMessage(const Item& it) {
     const std::wstring key = InputKeyOf(it);
     auto in = GetInput(key);
     const int st = in ? in->status.load() : 0;
+    if (in && in->gating && (it.type == IT_WEBCAM || it.type == IT_PHONE)) return L" ";  // exposure settling: dark
     switch (it.type) {
     case IT_WEBCAM:
         if (it.camLink.empty()) return L"Веб-камера не выбрана";

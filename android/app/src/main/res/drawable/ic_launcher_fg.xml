@@ -1,8 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- WVC icon (docs/icon/wvc.svg) as the adaptive-icon foreground; the dark rounded square is the background layer -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp"
     android:viewportWidth="108" android:viewportHeight="108">
-    <group android:translateX="30" android:translateY="30" android:scaleX="2" android:scaleY="2">
+    <group android:translateX="18" android:translateY="18" android:scaleX="0.28125" android:scaleY="0.28125">
+        <path android:strokeColor="#FFFFFFFF" android:strokeWidth="12" android:strokeLineJoin="round" android:strokeLineCap="round"
+            android:pathData="M54,58 H186 A10,10 0 0 1 196,68 V152 A10,10 0 0 1 186,162 H54 A10,10 0 0 1 44,152 V68 A10,10 0 0 1 54,58 Z" />
+        <path android:strokeColor="#FFFFFFFF" android:strokeWidth="12" android:strokeLineCap="round"
+            android:pathData="M120,162 V186 M88,192 H152" />
+        <path android:strokeColor="#FFFFFFFF" android:strokeWidth="8" android:strokeLineCap="butt" android:strokeLineJoin="miter"
+            android:pathData="M68.0,80.0L82.0,80.0M91.0,80.0L105.0,80.0M114.0,80.0L128.0,80.0M137.0,80.0L151.0,80.0M160.0,80.0L172.0,80.0L172.0,82.0M172.0,91.0L172.0,105.0M172.0,114.0L172.0,128.0M172.0,137.0L172.0,140.0L161.0,140.0M152.0,140.0L138.0,140.0M129.0,140.0L115.0,140.0M106.0,140.0L92.0,140.0M83.0,140.0L69.0,140.0M68.0,132.0L68.0,118.0M68.0,109.0L68.0,95.0M68.0,86.0L68.0,80.0" />
+        <path android:fillColor="#FFFF5A14" android:strokeColor="#FF1A2340" android:strokeWidth="8"
+            android:pathData="M140,182 A46,46 0 1,0 232,182 A46,46 0 1,0 140,182 Z" />
+        <path android:strokeColor="#FFFFFFFF" android:strokeWidth="9"
+            android:pathData="M162,182 A24,24 0 1,0 210,182 A24,24 0 1,0 162,182 Z" />
         <path android:fillColor="#FFFFFFFF"
-            android:pathData="M17,10.5V7c0,-0.55 -0.45,-1 -1,-1H4c-0.55,0 -1,0.45 -1,1v10c0,0.55 0.45,1 1,1h12c0.55,0 1,-0.45 1,-1v-3.5l4,4v-11l-4,4z"/>
+            android:pathData="M177,182 A9,9 0 1,0 195,182 A9,9 0 1,0 177,182 Z" />
     </group>
 </vector>

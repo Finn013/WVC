@@ -11,8 +11,8 @@ android {
         applicationId = "com.wvc.phone"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.11"
+        versionCode = 5
+        versionName = "0.12"
     }
 
     signingConfigs {

@@ -17,6 +17,7 @@ enum {
     P_IMAGE, P_IMAGE_BTN,
     P_ASPECT, P_FIT, P_CROP0, P_CROP0_UD, P_CROP1, P_CROP1_UD, P_CROP2, P_CROP2_UD, P_CROP3, P_CROP3_UD,
     P_ROT, P_MIRROR, P_ZOOM, P_ZOOM_UD, P_SHAPE, P_RADIUS, P_FEATHER, P_MASK, P_MASK_BTN, P_OPACITY, P_BORDER,
+    P_WINFRAME, P_CC_EXP, P_CC_EXPV, P_CC_BR, P_CC_BRV, P_CC_WB, P_CC_WBV, P_CC_NOTE,
     P_LAST
 };
 const UINT_PTR kTimerProps = 7;
@@ -190,7 +191,15 @@ void SyncControls() {
     case IT_WINDOW:
         ComboSet(P_WINCAP, e.winCapture);
         CheckSet(P_CURSOR, e.cursor);
+        CheckSet(P_WINFRAME, e.winFrame);
         break;
+    case IT_WEBCAM: {
+        const CamCtlCfg c = CamCtlGet(e.camLink);
+        ComboSet(P_CC_EXP, c.expMode);
+        ComboSet(P_CC_BR, c.brMode);
+        ComboSet(P_CC_WB, c.wbMode);
+        break;
+    }
     case IT_MONITOR: CheckSet(P_CURSOR, e.cursor); break;
     case IT_MEDIA:
         FillMedia();
@@ -246,6 +255,7 @@ void ReadControls(int id) {
         break;
     }
     case P_CURSOR: e.cursor = CheckGet(P_CURSOR); break;
+    case P_WINFRAME: e.winFrame = CheckGet(P_WINFRAME); break;
     case P_WIN: {
         const int k = ComboGet(P_WIN);
         if (k >= 0 && k < static_cast<int>(s.wins.size()) && s.wins[static_cast<size_t>(k)].hwnd) {
@@ -373,8 +383,54 @@ std::wstring PhoneStatus() {
     return t;
 }
 
+// webcam picture controls: the sliders follow the camera's ranges once it is open
+void CamCtlFromControls() {
+    if (!g_ps || g_ps->edit.camLink.empty()) return;
+    CamCtlCfg c;
+    c.expMode = (std::max)(0, ComboGet(P_CC_EXP));
+    c.brMode = (std::max)(0, ComboGet(P_CC_BR));
+    c.wbMode = (std::max)(0, ComboGet(P_CC_WB));
+    c.expVal = static_cast<int>(SendMessageW(P(P_CC_EXPV), TBM_GETPOS, 0, 0));
+    c.brVal = static_cast<int>(SendMessageW(P(P_CC_BRV), TBM_GETPOS, 0, 0));
+    c.wbVal = static_cast<int>(SendMessageW(P(P_CC_WBV), TBM_GETPOS, 0, 0));
+    CamCtlSet(g_ps->edit.camLink, c);
+}
+
+void CamCtlLive() {
+    const CamCtlInfo info = CamCtlInfoFor(g_ps->edit.camLink);
+    const CamCtlCfg cfg = CamCtlGet(g_ps->edit.camLink);
+    struct Row {
+        int track, combo;
+        const CamCtlRange* r;
+        int mode, val;
+    } rows[3] = {{P_CC_EXPV, P_CC_EXP, &info.exp, cfg.expMode, cfg.expVal},
+                 {P_CC_BRV, P_CC_BR, &info.br, cfg.brMode, cfg.brVal},
+                 {P_CC_WBV, P_CC_WB, &info.wb, cfg.wbMode, cfg.wbVal}};
+    g_ps->syncing = true;
+    for (const Row& r : rows) {
+        HWND t = P(r.track);
+        const bool has = info.open && r.r->has;
+        EnableWindow(P(r.combo), !info.open || r.r->has);
+        EnableWindow(t, has && r.mode == 1);
+        if (!has) continue;
+        if (SendMessageW(t, TBM_GETRANGEMIN, 0, 0) != r.r->lo || SendMessageW(t, TBM_GETRANGEMAX, 0, 0) != r.r->hi) {
+            SendMessageW(t, TBM_SETRANGEMIN, FALSE, r.r->lo);
+            SendMessageW(t, TBM_SETRANGEMAX, TRUE, r.r->hi);
+            SendMessageW(t, TBM_SETLINESIZE, 0, r.r->step);
+        }
+        // manual: the remembered value; auto: what the camera chose itself
+        if (GetCapture() != t) SendMessageW(t, TBM_SETPOS, TRUE, r.mode == 1 ? std::clamp<long>(r.val, r.r->lo, r.r->hi) : r.r->cur);
+    }
+    g_ps->syncing = false;
+    SetCtlText(P(P_CC_NOTE), !info.open ? L"Камера сейчас выключена — настройки применятся, когда она включится."
+                             : (!info.exp.has && !info.br.has && !info.wb.has)
+                                 ? L"Эта камера не даёт менять экспозицию, яркость и баланс белого."
+                                 : L"Меняется сразу и запоминается для этой камеры (применяется при каждом включении).");
+}
+
 void UpdateLive() {
     if (!g_ps) return;
+    if (g_ps->edit.type == IT_WEBCAM && P(P_CC_EXP)) CamCtlLive();
     if (g_ps->edit.type == IT_PHONE) {
         SetCtlText(P(P_PH_STATUS), PhoneStatus());
         const int us = PhoneUserState(InputKeyOf(g_ps->edit));
@@ -764,12 +820,17 @@ void OnCommand(int id, int code) {
     }
     }
     if (s.syncing) return;
+    if ((id == P_CC_EXP || id == P_CC_BR || id == P_CC_WB) && code == CBN_SELCHANGE) {
+        CamCtlFromControls();
+        CamCtlLive();
+        return;
+    }
     const bool edit = id == P_NAME || id == P_PH_IP || id == P_TEXT || id == P_TEXTPX || id == P_ZOOM ||
                       (id >= P_CROP0 && id <= P_CROP3_UD);
     const bool combo = id == P_WIN || id == P_WINCAP || id == P_MON || id == P_CAM || id == P_MEDIA_SEC || id == P_PH_CONN ||
                        id == P_PH_LIST || id == P_PH_SRC || id == P_PH_RES || id == P_PH_CODEC || id == P_TEXTCOLOR ||
                        id == P_ASPECT || id == P_FIT || id == P_ROT || id == P_SHAPE;
-    const bool check = id == P_CURSOR || id == P_PH_AUTOROT || id == P_TEXTBG || id == P_TEXTBOLD || id == P_MIRROR ||
+    const bool check = id == P_CURSOR || id == P_WINFRAME || id == P_PH_AUTOROT || id == P_TEXTBG || id == P_TEXTBOLD || id == P_MIRROR ||
                        id == P_BORDER;
     if ((edit && code == EN_CHANGE) || (combo && code == CBN_SELCHANGE) || (check && code == BN_CLICKED)) {
         if (id == P_PH_IP) {  // the address is used when the field loses focus or OK is pressed
@@ -799,6 +860,10 @@ LRESULT CALLBACK PropsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (t == P(P_RADIUS)) g_ps->edit.shape.radius = pos;
             else if (t == P(P_FEATHER)) g_ps->edit.shape.feather = pos;
             else if (t == P(P_OPACITY)) g_ps->edit.opacity = pos;
+            if (t == P(P_CC_EXPV) || t == P(P_CC_BRV) || t == P(P_CC_WBV)) {
+                CamCtlFromControls();
+                return 0;
+            }
             Push();
         }
         return 0;
@@ -872,6 +937,7 @@ void BuildForm(PropsState& s) {
         keep(P_WINCAP, f.Combo(L"Способ захвата:", P_WINCAP, {L"С экрана (окно должно быть видно)", L"Прямо из окна (можно перекрыть)"}));
         keep(P_HIDEWIN, f.Row(L"", L"BUTTON", L"Спрятать окно за экран / вернуть", WS_TABSTOP | BS_PUSHBUTTON, P_HIDEWIN, 28, 260));
         keep(P_CURSOR, f.Check(L"Показывать курсор мыши", P_CURSOR));
+        keep(P_WINFRAME, f.Check(L"Тонкая цветная рамка вокруг окна на экране", P_WINFRAME));
         f.Hint(L"Окно ищется по заголовку и после перезапуска. Свёрнутое окно не показывается — «Спрятать окно за экран» "
                L"оставляет его работать.", 2);
         break;
@@ -885,6 +951,14 @@ void BuildForm(PropsState& s) {
         keep(P_CAM, f.Combo(L"Устройство:", P_CAM, {}));
         f.Hint(L"Камера включается, только пока она видна в сцене (или открыт предпросмотр). «Держать веб-камеру "
                L"включённой» — в «Настройки → Дополнительно».", 2);
+        f.Header(L"Изображение камеры");
+        keep(P_CC_EXP, f.Combo(L"Экспозиция:", P_CC_EXP, {L"Авто", L"Вручную"}, 140));
+        keep(P_CC_EXPV, f.Track(L"", P_CC_EXPV, 0, 100));
+        keep(P_CC_BR, f.Combo(L"Яркость:", P_CC_BR, {L"Как у камеры", L"Вручную"}, 140));
+        keep(P_CC_BRV, f.Track(L"", P_CC_BRV, 0, 100));
+        keep(P_CC_WB, f.Combo(L"Баланс белого:", P_CC_WB, {L"Авто", L"Вручную"}, 140));
+        keep(P_CC_WBV, f.Track(L"", P_CC_WBV, 0, 100));
+        keep(P_CC_NOTE, f.Hint(L"", 2));
         break;
     case IT_MEDIA: {
         f.Header(L"Медиафайлы (картинки, GIF, видео без звука)");
@@ -1005,7 +1079,7 @@ bool OpenProperties(int uid, bool isNew) {
         WNDCLASSW wc{};
         wc.hInstance = g_hInst;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        wc.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(1));
         wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
         wc.lpfnWndProc = PropsProc;
         wc.lpszClassName = L"WVCProps";
@@ -1090,7 +1164,7 @@ void AddSourceOfType(int type) {
     if (type == IT_MONITOR) mons = Monitors();
     int uid = 0;
     ProjEdit([&](Project& p) {
-        Scene* sc = CurScene(p);
+        Scene* sc = UiEditScene(p);  // «Сейчас» or «Следующий» — the one being edited
         if (!sc) return;
         Item it = NewItem(p, type);
         it.name = UniqueItemName(*sc, it.name);
