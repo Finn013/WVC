@@ -78,13 +78,13 @@ class CameraSource(
     /** Main thread. [h264] = into the hardware encoder; [target] = show in a view (camera through the screen). */
     fun start(front: Boolean, longSide: Int, h264: Boolean = false, target: Preview.SurfaceProvider? = null, fps: Int = 30) {
         // 60 fps only through the hardware encoder (JPEG stays at 30: the CPU would not keep up)
-        val f = if (h264 && target == null && fps >= 50) 60 else 30
-        val key = "$front|$longSide|$h264|${target?.hashCode() ?: 0}|$f"
+        val rate = if (h264 && target == null && fps >= 50) 60 else 30
+        val key = "$front|$longSide|$h264|${target?.hashCode() ?: 0}|$rate"
         if (wantFront != null && key == boundKey && provider != null) return  // already like that
         wantFront = front
         wantLongSide = longSide
         wantH264 = h264
-        wantFps = f
+        wantFps = rate
         previewTo = target
         val p = provider
         if (p != null) {
