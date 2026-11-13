@@ -172,6 +172,12 @@ extern "C" void     scSendFrame(scCamera camera, const void* image_bits)
     return softcam::sender::SendFrame(camera, image_bits);
 }
 
+// WVC: deliver at once, no pacing (the sender follows a real camera's clock and calls this once per camera frame)
+extern "C" void     scSendFrameNow(scCamera camera, const void* image_bits)
+{
+    return softcam::sender::SendFrameNow(camera, image_bits);
+}
+
 extern "C" bool     scWaitForConnection(scCamera camera, float timeout)
 {
     return softcam::sender::WaitForConnection(camera, timeout);

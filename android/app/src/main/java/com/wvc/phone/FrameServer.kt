@@ -153,7 +153,7 @@ class FrameServer(private val listener: Listener, private val deviceName: String
     /** Once a second: -1 = the network is behind (lower the bitrate), 1 = it keeps up easily, 0 = leave it. */
     fun h264Congestion(): Int = synchronized(lock) {
         val r = when {
-            overflows > 0 || maxQueue > 8 -> -1
+            overflows > 0 || maxQueue > 5 -> -1
             maxQueue <= 2 -> 1
             else -> 0
         }
@@ -171,7 +171,7 @@ class FrameServer(private val listener: Listener, private val deviceName: String
                 return
             }
             if (key) waitKey = false
-            if (h264q.size >= 45 || h264Bytes > 4 * 1024 * 1024) {
+            if (h264q.size >= 15 || h264Bytes > 4 * 1024 * 1024) {  // ~0.25–0.5 s behind: old frames are useless
                 // the network is far behind: drop what waits, start again at a key frame
                 h264q.clear()
                 h264Bytes = 0

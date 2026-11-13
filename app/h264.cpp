@@ -12,7 +12,7 @@ const GUID kSubNV12 = {0x3231564E, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xAA, 0x00
 inline uint8_t Clip(int v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); }
 
 // NV12 (BT.601, limited range) -> BGRA
-void Nv12ToBgra(const uint8_t* y, int yPitch, const uint8_t* uv, int uvPitch, int w, int h, uint8_t* out) {
+[[maybe_unused]] void Nv12ToBgra(const uint8_t* y, int yPitch, const uint8_t* uv, int uvPitch, int w, int h, uint8_t* out) {
     for (int r = 0; r < h; ++r) {
         const uint8_t* yr = y + static_cast<ptrdiff_t>(r) * yPitch;
         const uint8_t* cr = uv + static_cast<ptrdiff_t>(r / 2) * uvPitch;
@@ -218,7 +218,8 @@ bool H264Decoder::Decode(const uint8_t* data, size_t n, int64_t pts, std::vector
                     if (scan0 && pitch > 0) {
                         const int w = static_cast<int>(d->vw) & ~1, h = static_cast<int>(d->vh) & ~1;
                         outPx->resize(static_cast<size_t>(w) * h * 4);
-                        Nv12ToBgra(scan0, pitch, scan0 + static_cast<size_t>(pitch) * d->fh, pitch, w, h, outPx->data());
+                        Nv12ToBgraFast(scan0, pitch, scan0 + static_cast<size_t>(pitch) * d->fh, pitch, w, h, outPx->data(), w * 4, false,
+                                       false);
                         *ow = w;
                         *oh = h;
                         got = true;

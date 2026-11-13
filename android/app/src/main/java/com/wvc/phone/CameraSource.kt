@@ -51,6 +51,7 @@ class CameraSource(
     private var wantFront: Boolean? = null  // null = stopped
     private var wantLongSide = 720
     private var wantH264 = false
+    private var wantFps = 30
     private var previewTo: Preview.SurfaceProvider? = null
     private var boundKey = ""
     private var preview: Preview? = null
@@ -75,12 +76,15 @@ class CameraSource(
     val isRunning: Boolean get() = wantFront != null
 
     /** Main thread. [h264] = into the hardware encoder; [target] = show in a view (camera through the screen). */
-    fun start(front: Boolean, longSide: Int, h264: Boolean = false, target: Preview.SurfaceProvider? = null) {
-        val key = "$front|$longSide|$h264|${target?.hashCode() ?: 0}"
+    fun start(front: Boolean, longSide: Int, h264: Boolean = false, target: Preview.SurfaceProvider? = null, fps: Int = 30) {
+        // 60 fps only through the hardware encoder (JPEG stays at 30: the CPU would not keep up)
+        val f = if (h264 && target == null && fps >= 50) 60 else 30
+        val key = "$front|$longSide|$h264|${target?.hashCode() ?: 0}|$f"
         if (wantFront != null && key == boundKey && provider != null) return  // already like that
         wantFront = front
         wantLongSide = longSide
         wantH264 = h264
+        wantFps = f
         previewTo = target
         val p = provider
         if (p != null) {
@@ -133,13 +137,18 @@ class CameraSource(
         synchronized(lock) { lock.notifyAll() }
     }
 
-    /** Frame rate range for steady ~30 fps: [30,30] when the camera has it, else the closest range ending at 30. */
+    /** Frame rate range for steady ~30 fps: [30,30] when the camera has it, else the closest range ending at 30.
+     *  With 60 wanted: a range reaching 60 (the steadiest one), when the camera has one. */
     @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
     private fun pickFpsRange(p: ProcessCameraProvider, sel: CameraSelector): Range<Int>? {
         return try {
             val info = sel.filter(p.availableCameraInfos).firstOrNull() ?: return null
             val ranges = Camera2CameraInfo.from(info)
                 .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return null
+            if (wantFps >= 60) {
+                val r60 = ranges.filter { it.upper >= 60 }.maxWithOrNull(compareBy<Range<Int>>({ -it.upper }, { it.lower }))
+                if (r60 != null) return r60
+            }
             val upTo30 = ranges.filter { it.upper in 24..30 }
             val best = upTo30.maxWithOrNull(compareBy<Range<Int>>({ it.upper }, { it.lower }))
             best ?: ranges.filter { it.upper >= 24 }.minByOrNull { it.upper }
@@ -190,7 +199,7 @@ class CameraSource(
                 }
                 analysis = a
             }
-            boundKey = "$front|$wantLongSide|$wantH264|${target?.hashCode() ?: 0}"
+            boundKey = "$front|$wantLongSide|$wantH264|${target?.hashCode() ?: 0}|$wantFps"
         } catch (e: Exception) {
             onError("camera_error")
         }
@@ -216,7 +225,7 @@ class CameraSource(
         override fun onSurfaceRequested(request: androidx.camera.core.SurfaceRequest) {
             val size = request.resolution
             val e = AvcEncoder(server) { true }
-            val s = e.start(size.width, size.height)
+            val s = e.start(size.width, size.height, wantFps)
             if (s == null) {
                 request.willNotProvideSurface()
                 onError("encoder_error")

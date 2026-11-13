@@ -17,7 +17,7 @@ enum {
     P_IMAGE, P_IMAGE_BTN,
     P_ASPECT, P_FIT, P_CROP0, P_CROP0_UD, P_CROP1, P_CROP1_UD, P_CROP2, P_CROP2_UD, P_CROP3, P_CROP3_UD,
     P_ROT, P_MIRROR, P_ZOOM, P_ZOOM_UD, P_SHAPE, P_RADIUS, P_FEATHER, P_MASK, P_MASK_BTN, P_OPACITY, P_BORDER,
-    P_WINFRAME, P_CC_EXP, P_CC_EXPV, P_CC_BR, P_CC_BRV, P_CC_WB, P_CC_WBV, P_CC_NOTE,
+    P_WINFRAME, P_CC_EXP, P_CC_EXPV, P_CC_BR, P_CC_BRV, P_CC_WB, P_CC_WBV, P_CC_NOTE, P_CC_MODE, P_CC_RGB, P_CC_STAT,
     P_LAST
 };
 const UINT_PTR kTimerProps = 7;
@@ -34,6 +34,8 @@ struct PropsState {
     std::vector<CamDevice> cams;
     std::vector<std::wstring> phoneChoices;  // IP (Wi-Fi) or serial (USB) per list row
     std::wstring phoneNote;
+    std::vector<CamMode> modes;   // webcam: native formats listed in P_CC_MODE (after «Авто»)
+    std::wstring modesKey;        // link + count they were listed for
     // preview geometry (for dragging the crop)
     RECT drawn{};
     int dragEdge = -1;
@@ -386,7 +388,7 @@ std::wstring PhoneStatus() {
 // webcam picture controls: the sliders follow the camera's ranges once it is open
 void CamCtlFromControls() {
     if (!g_ps || g_ps->edit.camLink.empty()) return;
-    CamCtlCfg c;
+    CamCtlCfg c = CamCtlGet(g_ps->edit.camLink);  // keeps the format choice
     c.expMode = (std::max)(0, ComboGet(P_CC_EXP));
     c.brMode = (std::max)(0, ComboGet(P_CC_BR));
     c.wbMode = (std::max)(0, ComboGet(P_CC_WB));
@@ -428,9 +430,62 @@ void CamCtlLive() {
                                  : L"Меняется сразу и запоминается для этой камеры (применяется при каждом включении).");
 }
 
+// webcam formats: «Авто» + what the camera offers (known once it has been opened)
+void FillCamModes(bool force) {
+    if (!g_ps || !P(P_CC_MODE)) return;
+    const std::wstring& link = g_ps->edit.camLink;
+    std::vector<CamMode> modes = CamModesFor(link);
+    const CamCtlCfg cfg = CamCtlGet(link);
+    const std::wstring k = link + L"|" + std::to_wstring(modes.size()) + L"|" + cfg.mode;
+    if (!force && k == g_ps->modesKey) return;
+    g_ps->modesKey = k;
+    g_ps->modes = modes;
+    HWND c = P(P_CC_MODE);
+    g_ps->syncing = true;
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Авто (подходящая частота кадров)"));
+    int sel = 0;
+    for (size_t i = 0; i < modes.size(); ++i) {
+        SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(modes[i].Label().c_str()));
+        if (!cfg.mode.empty() && modes[i].Key() == cfg.mode) sel = static_cast<int>(i) + 1;
+    }
+    if (!cfg.mode.empty() && sel == 0) {  // remembered, but the list is not known yet
+        const std::wstring t = L"Выбрано: " + cfg.mode;
+        SendMessageW(c, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(t.c_str()));
+        sel = static_cast<int>(modes.size()) + 1;
+    }
+    SendMessageW(c, CB_SETCURSEL, sel, 0);
+    SendMessageW(P(P_CC_RGB), BM_SETCHECK, cfg.rgb32 ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_ps->syncing = false;
+}
+
+void CamModeFromControls() {
+    if (!g_ps || g_ps->edit.camLink.empty()) return;
+    CamCtlCfg c = CamCtlGet(g_ps->edit.camLink);
+    const int i = static_cast<int>(SendMessageW(P(P_CC_MODE), CB_GETCURSEL, 0, 0));
+    if (i == 0) c.mode.clear();
+    else if (i > 0 && i <= static_cast<int>(g_ps->modes.size())) c.mode = g_ps->modes[static_cast<size_t>(i - 1)].Key();
+    c.rgb32 = SendMessageW(P(P_CC_RGB), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    CamCtlSet(g_ps->edit.camLink, c);
+}
+
 void UpdateLive() {
     if (!g_ps) return;
     if (g_ps->edit.type == IT_WEBCAM && P(P_CC_EXP)) CamCtlLive();
+    if (g_ps->edit.type == IT_WEBCAM && P(P_CC_STAT)) {
+        FillCamModes(false);
+        const InputStats st = InputStatsFor(InputKeyOf(g_ps->edit));
+        std::wstring t;
+        if (!st.exists || st.status != 2) {
+            t = L"Камера сейчас выключена.";
+        } else {
+            wchar_t b[200];
+            swprintf(b, 200, L"Сейчас: %ls · получено %.1f к/с", st.info.empty() ? L"—" : st.info.c_str(), st.fpsX10 / 10.0);
+            t = b;
+            if (g_streaming) t += L" · вывод " + std::to_wstring(g_fpsX10.load() / 10) + L" к/с";
+        }
+        SetCtlText(P(P_CC_STAT), t);
+    }
     if (g_ps->edit.type == IT_PHONE) {
         SetCtlText(P(P_PH_STATUS), PhoneStatus());
         const int us = PhoneUserState(InputKeyOf(g_ps->edit));
@@ -820,6 +875,11 @@ void OnCommand(int id, int code) {
     }
     }
     if (s.syncing) return;
+    if ((id == P_CC_MODE && code == CBN_SELCHANGE) || (id == P_CC_RGB && code == BN_CLICKED)) {
+        CamModeFromControls();
+        FillCamModes(true);
+        return;
+    }
     if ((id == P_CC_EXP || id == P_CC_BR || id == P_CC_WB) && code == CBN_SELCHANGE) {
         CamCtlFromControls();
         CamCtlLive();
@@ -959,6 +1019,13 @@ void BuildForm(PropsState& s) {
         keep(P_CC_WB, f.Combo(L"Баланс белого:", P_CC_WB, {L"Авто", L"Вручную"}, 140));
         keep(P_CC_WBV, f.Track(L"", P_CC_WBV, 0, 100));
         keep(P_CC_NOTE, f.Hint(L"", 2));
+        f.Header(L"Формат камеры");
+        keep(P_CC_MODE, f.Combo(L"Режим:", P_CC_MODE, {}));
+        keep(P_CC_RGB, f.Check(L"Совместимое преобразование цвета (RGB32, как в 0.12; медленнее)", P_CC_RGB));
+        keep(P_CC_STAT, f.Row(L"Сейчас:", L"STATIC", L"", SS_LEFT, P_CC_STAT, 40));
+        f.Hint(L"«Авто» выбирает режим с частотой не ниже выбранной для камеры WVC (MJPG/NV12 при HD — быстрее YUY2). "
+               L"Список появляется, когда камера включится (например, при открытом предпросмотре). Сохраняется для этой "
+               L"камеры.", 3);
         break;
     case IT_MEDIA: {
         f.Header(L"Медиафайлы (картинки, GIF, видео без звука)");
@@ -1125,7 +1192,10 @@ bool OpenProperties(int uid, bool isNew) {
     switch (st.edit.type) {
     case IT_WINDOW: FillWindows(); break;
     case IT_MONITOR: FillMonitors(); break;
-    case IT_WEBCAM: FillCams(); break;
+    case IT_WEBCAM:
+        FillCams();
+        FillCamModes(true);
+        break;
     case IT_PHONE:
         FillPhones();
         if (st.edit.phoneConn == 1) PhoneUsbList(st.dlg);

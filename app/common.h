@@ -1,4 +1,4 @@
-// WVC 0.12 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
+// WVC 0.13 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
 // Общие объявления для всех файлов приложения.
 #pragma once
 
@@ -40,8 +40,8 @@
 #include <thread>
 #include <vector>
 
-#define WVC_VERSION L"0.12"
-#define WVC_VERSION_NUM 12  // minor number, for the update check
+#define WVC_VERSION L"0.13"
+#define WVC_VERSION_NUM 13  // minor number, for the update check
 
 template <class T> static inline void SafeRelease(T*& p) {
     if (p) {
@@ -230,6 +230,10 @@ struct Project {
     bool hideStartGlare = true;   // «Скрывать засвет при старте» (webcams / phone cameras)
     bool checkUpdates = false;    // check for a new version at start
     std::wstring placeholder;     // picture the camera shows while WVC is closed (empty = built in)
+    bool nextFrame = true;        // dashed outline on the screen of what «Следующий» will capture
+    int outPace = 0;              // 0 follow the webcam / phone when its rate matches, 1 steady timer
+    int scaleMode = 0;            // 0 fast resampler (0.13), 1 GDI HALFTONE (as before)
+    int captureMode = 0;          // 0 DXGI Desktop Duplication with GDI fallback, 1 GDI only
     int nextUid = 1;
 };
 
@@ -257,18 +261,32 @@ void ItemFrameKeysToIni(const Item& it, IniDoc* doc, const std::wstring& sec);
 // ---------------------------------------------------------------------------
 // Inputs (inputs.cpp): webcams, media players and phones, shared by key
 // ---------------------------------------------------------------------------
+// one decoded picture (BGRA top-down); shared between the input thread and the renderer without copies
+struct VFrame {
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+};
+
 struct Input {
-    virtual ~Input() {}
+    Input();
+    virtual ~Input();
     std::wstring key;
     std::atomic<bool> stop{false};
     std::atomic<int> status{0};  // 0 off, 1 opening, 2 running, 3 failed
     std::atomic<uint64_t> seq{0};
     std::mutex mx;
-    std::vector<uint8_t> buf;  // BGRA top-down
-    int w = 0, h = 0;
+    std::shared_ptr<VFrame> frame;               // newest picture (mx); null = none
+    std::vector<std::shared_ptr<VFrame>> pool;   // reused buffers (mx)
     ULONGLONG failedAt = 0;
     std::thread th;
     ULONGLONG lastWanted = 0;
+    HANDLE newFrameEv = nullptr;  // auto-reset, set on every new picture (the renderer can follow the camera's pace)
+    // frames per second actually delivered
+    std::atomic<int> fpsX10{0};
+    int fpsCount = 0;
+    ULONGLONG fpsT0 = 0;
+    std::atomic<ULONGLONG> lastFrameAt{0};
+    std::wstring info;            // format text for the UI / log (mx)
     // «Скрывать засвет при старте»: after Arm(), frames are held back until the brightness settles
     // (mean luma changes < 2% over 3 frames) or 2 s pass; until then the last picture (or nothing) stays.
     std::atomic<bool> gateArm{false};
@@ -276,7 +294,11 @@ struct Input {
     int gateStable = 0;
     double gateLuma = -1;
     ULONGLONG gateStart = 0;
-    void Publish(const uint8_t* bgra, int fw, int fh);
+    std::shared_ptr<VFrame> NewFrame(int fw, int fh);  // a buffer of that size nobody else is reading
+    void PublishFrame(const std::shared_ptr<VFrame>& f);
+    void Publish(const uint8_t* bgra, int fw, int fh);  // copies
+    std::shared_ptr<VFrame> Latest();
+    int FpsX10() const;
     void Clear();
     virtual void Start() = 0;
     virtual void Halt();
@@ -288,6 +310,8 @@ void InputsSync();      // UI timer: start / stop what is needed
 extern std::atomic<bool> g_hideGlare;
 // webcam picture controls (IAMCameraControl / IAMVideoProcAmp of the Media Foundation source), per device
 struct CamCtlCfg {
+    std::wstring mode;            // native format "WxH@fps.ff/FOURCC"; empty = automatic
+    bool rgb32 = false;           // «Совместимое преобразование» (MF converts to RGB32, as before 0.13)
     int expMode = 0, expVal = 0;  // 0 auto, 1 manual
     int brMode = 0, brVal = 0;    // 0 as the camera has it, 1 manual
     int wbMode = 0, wbVal = 0;    // 0 auto, 1 manual
@@ -303,6 +327,20 @@ struct CamCtlInfo {
 CamCtlCfg CamCtlGet(const std::wstring& link);
 void CamCtlSet(const std::wstring& link, const CamCtlCfg& c);  // saved and applied at once (if the camera is open)
 CamCtlInfo CamCtlInfoFor(const std::wstring& link);
+struct CamMode {
+    UINT32 w = 0, h = 0, num = 0, den = 1;
+    std::wstring fourcc;
+    double Fps() const { return den ? static_cast<double>(num) / den : 0; }
+    std::wstring Key() const;    // "1280x720@30.00/MJPG"
+    std::wstring Label() const;  // "1280×720, 30 к/с, MJPG"
+};
+std::vector<CamMode> CamModesFor(const std::wstring& link);  // seen when the camera was last opened
+struct InputStats {
+    bool exists = false;
+    int status = 0, fpsX10 = 0, w = 0, h = 0;
+    std::wstring info;
+};
+InputStats InputStatsFor(const std::wstring& key);
 void InputsShutdown();
 void MediaNextAll(const std::wstring& key);  // empty key = every player
 std::wstring MediaNowName(const std::wstring& key);
@@ -353,6 +391,37 @@ public:
     void Reset();
     int errors = 0;
 
+private:
+    struct Impl;
+    Impl* d;
+};
+
+// ---------------------------------------------------------------------------
+// fastimg.cpp: per-frame picture work (thread pool, resampler, blending, YUV)
+// ---------------------------------------------------------------------------
+void ParallelFor(int n, const std::function<void(int, int)>& fn, int minChunk = 16);
+// source rect [sx0,sx1)x[sy0,sy1) (source px, may be fractional) -> outW x outH, antialiased; mirror = flip left-right
+void ResampleBgra(const uint8_t* src, int srcStride, int srcW, int srcH, double sx0, double sy0, double sx1, double sy1,
+                  uint8_t* dst, int dstStride, int outW, int outH, bool mirror);
+void TransformCopy(const uint8_t* cv, int CW, int CH, uint8_t* dst, int dstStride, int TW, int TH, int rot, bool mirror);
+void BuildMaskSpans(const uint8_t* m, int w, int h, std::vector<int>& spans);
+void BlendMaskedRows(uint8_t* dst, int dstStride, const uint8_t* src, int srcStride, int w, int h, const uint8_t* mask,
+                     int mstride, const int* spans, int spanX0, int opacity);
+void Nv12ToBgraFast(const uint8_t* y, int yPitch, const uint8_t* uv, int uvPitch, int w, int h, uint8_t* out, int outStride,
+                    bool bt709, bool fullRange);
+void Yuy2ToBgra(const uint8_t* src, int pitch, int w, int h, uint8_t* out, int outStride, bool bt709, bool fullRange);
+void CopyBgrxOpaque(const uint8_t* src, int pitch, int w, int h, uint8_t* out, int outStride);
+void PackBgraToBgr(const uint8_t* p, uint8_t* dst, int w, int h);
+
+// capture.cpp: screen capture through DXGI Desktop Duplication (render thread only; GDI is the fallback)
+class ScreenCapture {
+public:
+    ScreenCapture();
+    ~ScreenCapture();
+    void NewFrame();  // call once per rendered frame
+    // pixels of r (screen coordinates) when r lies on one duplicated monitor; null = use GDI
+    const uint8_t* View(const RECT& r, int* stride);
+    std::wstring Status() const;  // for the log
 private:
     struct Impl;
     Impl* d;
@@ -415,6 +484,9 @@ extern Published g_pubCanvas;   // scene canvas before the output shape (Setting
 extern std::mutex g_soloMx;
 extern Item g_soloItem;         // the copy being edited in Properties
 extern std::atomic<int> g_fpsX10;
+extern std::atomic<int> g_composeAvgX10, g_composeMaxX10;  // ms x 10 per frame (last second)
+extern std::atomic<bool> g_pacedByInput;                   // the output follows a camera right now
+std::wstring RenderStatsLine();                            // «Вывод 30.0 к/с · кадр 4.1 мс (макс. 7) · …»
 extern std::atomic<bool> g_resetCapture, g_pauseDirty;
 extern std::atomic<int> g_transGen;
 extern std::atomic<bool> g_editingNext;  // «Следующий» is being edited: its preview is drawn at full rate
@@ -426,6 +498,7 @@ void SetNativeSize(int uid, int w, int h);
 void RenderStart();
 void RenderStop();
 extern int g_camW, g_camH, g_camFps;
+bool IsValidFps(int f);  // 24 / 30 / 50 / 60
 extern bool g_camOk;
 bool CameraDllLoaded();
 bool LoadCameraDll();

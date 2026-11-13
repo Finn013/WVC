@@ -660,6 +660,8 @@ struct FrameWin {
     bool tabBelow = false;
     bool movable = true;
     bool thin = false;  // a captured window: a thin line, no label, clicks go through
+    bool dashed = false;   // 0.13: what «Следующий» will capture (blue dashed line)
+    bool createdThin = false;
     std::wstring label, look;
     std::vector<std::vector<POINT>> outline;  // screen coordinates
 };
@@ -678,6 +680,8 @@ COLORREF FrameColor() {
     if (!g_streaming) return RGB(40, 170, 70);
     return g_paused ? RGB(235, 170, 0) : RGB(230, 40, 40);
 }
+const COLORREF kNextColor = RGB(40, 140, 255);
+COLORREF ColorOf(const FrameWin& f) { return f.dashed ? kNextColor : FrameColor(); }
 
 int FrameB(const FrameWin& f) { return f.thin ? (std::max)(2, g_fb / 2) : g_fb; }
 int FrameTab(const FrameWin& f) { return f.thin ? 0 : g_tabH; }
@@ -688,8 +692,9 @@ void FrameRects(const FrameWin& f, int w, int h, RECT* border, RECT* hole, RECT*
     const int bottom = f.tabBelow ? h - tabH : h;
     *border = RECT{0, top, w, bottom};
     *hole = RECT{fb, top + fb, w - fb, bottom - fb};
-    const int tw = (std::min)(g_tabW, w);
-    *tab = f.tabBelow ? RECT{0, h - tabH, tw, h} : RECT{0, 0, tw, tabH};
+    const int tw = (std::min)(g_tabW + (f.dashed ? g_tabW / 3 : 0), w);
+    const int tx = f.dashed ? w - tw : 0;  // the «Следующий» label sits on the right, so it never hides the on-air one
+    *tab = f.tabBelow ? RECT{tx, h - tabH, tx + tw, h} : RECT{tx, 0, tx + tw, tabH};
 }
 
 void RegionFromFrame(HWND hwnd) {
@@ -716,10 +721,26 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetClientRect(hwnd, &rc);
         if (f) {
             FrameRects(*f, rc.right, rc.bottom, &border, &hole, &tab);
-            const COLORREF col = FrameColor();
+            const COLORREF col = ColorOf(*f);
             HBRUSH key = CreateSolidBrush(kKey), red = CreateSolidBrush(col);
             FillRect(dc, &rc, key);
-            if (!f->outline.empty()) {
+            HPEN dash = nullptr;
+            const int pw = (std::max)(2, g_fb * 2 / 3);
+            if (f->dashed) {
+                LOGBRUSH lb{BS_SOLID, col, 0};
+                dash = ExtCreatePen(PS_GEOMETRIC | PS_DASH | PS_ENDCAP_FLAT | PS_JOIN_MITER, static_cast<DWORD>(pw), &lb, 0,
+                                    nullptr);
+            }
+            if (f->dashed && f->outline.empty()) {
+                // dashed rectangle in the middle of the band (around the area, outside the picture)
+                HGDIOBJ op = SelectObject(dc, dash ? static_cast<HGDIOBJ>(dash) : GetStockObject(BLACK_PEN));
+                HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                const int fbw = f->thin ? 0 : FrameB(*f) / 2;
+                Rectangle(dc, border.left + fbw + pw / 2, border.top + fbw + pw / 2, border.right - fbw - pw / 2 + 1,
+                          border.bottom - fbw - pw / 2 + 1);
+                SelectObject(dc, ob);
+                SelectObject(dc, op);
+            } else if (!f->outline.empty()) {
                 const int L = (std::min)(g_tabH * 3 / 2, (std::min)(static_cast<int>(border.right - border.left),
                                                                     static_cast<int>(border.bottom - border.top)) / 3);
                 const RECT marks[8] = {
@@ -732,11 +753,12 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     {border.right - L, border.bottom - g_fb, border.right, border.bottom},
                     {border.right - g_fb, border.bottom - L, border.right, border.bottom},
                 };
-                for (const RECT& m : marks) FillRect(dc, &m, red);
+                if (!f->thin)
+                    for (const RECT& m : marks) FillRect(dc, &m, red);
                 RECT wr;
                 GetWindowRect(hwnd, &wr);
-                HPEN pen = CreatePen(PS_SOLID, (std::max)(2, g_fb * 2 / 3), col);
-                HGDIOBJ op = SelectObject(dc, pen);
+                HPEN pen = dash ? nullptr : CreatePen(PS_SOLID, (std::max)(2, g_fb * 2 / 3), col);
+                HGDIOBJ op = SelectObject(dc, dash ? dash : pen);
                 HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
                 for (auto poly : f->outline) {
                     for (POINT& pt : poly) {
@@ -747,11 +769,12 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 SelectObject(dc, ob);
                 SelectObject(dc, op);
-                DeleteObject(pen);
+                if (pen) DeleteObject(pen);
             } else {
                 FillRect(dc, &border, red);
                 FillRect(dc, &hole, key);
             }
+            if (dash) DeleteObject(dash);
             if (FrameTab(*f) > 0) FillRect(dc, &tab, red);
             DeleteObject(red);
             DeleteObject(key);
@@ -820,14 +843,23 @@ LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // shape outline of the item mapped back onto the screen
-void ScreenOutline(const Item& it, const RECT& src, int W, int H, std::vector<std::vector<POINT>>* out) {
+void ScreenOutline(const Item& it, const RECT& src, int W, int H, std::vector<std::vector<POINT>>* out, bool rectToo = false) {
     out->clear();
-    if (it.shape.kind == SH_RECT || it.shape.kind == SH_MASK) return;
     const double NW = src.right - src.left, NH = src.bottom - src.top;
     const double DW = (it.rot & 1) ? NH : NW, DH = (it.rot & 1) ? NW : NH;
     RectD Cr, D;
     ItemLayout(it, W, H, DW, DH, &Cr, &D);
     if (Cr.W() < 2 || Cr.H() < 2) return;
+    if (it.shape.kind == SH_RECT || it.shape.kind == SH_MASK) {
+        if (!rectToo) return;
+        // «Следующий»: the part of the area that is really shown (crop / zoom / fill), when it is smaller
+        const RectD r = DispToSrc(D, it.rot, it.mirror, NW, NH);
+        if (r.x0 < 2 && r.y0 < 2 && r.x1 > NW - 2 && r.y1 > NH - 2) return;
+        const LONG x0 = static_cast<LONG>(std::lround(src.left + r.x0)), y0 = static_cast<LONG>(std::lround(src.top + r.y0));
+        const LONG x1 = static_cast<LONG>(std::lround(src.left + r.x1)), y1 = static_cast<LONG>(std::lround(src.top + r.y1));
+        out->push_back({POINT{x0, y0}, POINT{x1, y0}, POINT{x1, y1}, POINT{x0, y1}});
+        return;
+    }
     std::vector<std::vector<POINT>> polys;
     // a little outside the shape, so the line never shows in the picture
     const double grow = 1.0 + (g_fb + 2.0) * 2 / (std::min)(Cr.W(), Cr.H()) * (std::min)(D.W() / Cr.W(), 1.0);
@@ -845,6 +877,67 @@ void ScreenOutline(const Item& it, const RECT& src, int W, int H, std::vector<st
     }
 }
 
+// Windows 10 2004+: the frames never get into a screen capture (DXGI / GDI), whatever they cover
+void ExcludeFromCapture(HWND h) {
+    typedef BOOL(WINAPI * PFN)(HWND, DWORD);
+    static PFN f = reinterpret_cast<PFN>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity"));
+    if (f && h) f(h, 0x11 /* WDA_EXCLUDEFROMCAPTURE */);
+}
+
+// one frame window around r (screen coordinates); returns false when it could not be made
+bool PlaceFrame(FrameWin& f, const Item& it, const RECT& r, int W, int H, std::map<int, bool>& keep, bool monitor) {
+    keep[it.uid] = true;
+    f.uid = it.uid;
+    if (f.hwnd && f.createdThin != f.thin) {
+        DestroyWindow(f.hwnd);
+        f.hwnd = nullptr;
+    }
+    if (!f.hwnd) {
+        const DWORD ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (f.thin ? WS_EX_TRANSPARENT : 0);
+        f.hwnd = CreateWindowExW(ex, L"WVCFrame", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, g_hInst, nullptr);
+        if (f.hwnd) {
+            SetLayeredWindowAttributes(f.hwnd, kKey, 255, LWA_COLORKEY);
+            ExcludeFromCapture(f.hwnd);
+        }
+        f.createdThin = f.thin;
+        f.look.clear();
+    }
+    if (!f.hwnd) return false;
+    const int fb = FrameB(f), tabH = FrameTab(f);
+    RECT w;
+    if (monitor) {
+        f.tabBelow = false;
+        w = r;  // a whole monitor: the dashed line runs along its edge, inside
+    } else {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi);
+        f.tabBelow = (r.top - fb - tabH) < mi.rcMonitor.top;
+        w = RECT{r.left - fb, r.top - fb, r.right + fb, r.bottom + fb};
+        if (f.tabBelow)
+            w.bottom += tabH;
+        else
+            w.top -= tabH;
+    }
+    if (it.type == IT_REGION || (f.dashed && it.type == IT_WINDOW)) ScreenOutline(it, r, W, H, &f.outline, f.dashed);
+    else f.outline.clear();
+    if (f.thin && !f.dashed) f.outline.clear();
+    wchar_t look[300];
+    swprintf(look, 300, L"%u|%ls|%d|%.4f,%.4f,%.4f,%.4f|%d,%d,%d,%d|%d%d%d|%ls|%d%d", static_cast<unsigned>(ColorOf(f)),
+             it.shape.Key().c_str(), it.fit, it.x, it.y, it.w, it.h, it.crop[0], it.crop[1], it.crop[2], it.crop[3], it.rot,
+             it.mirror ? 1 : 0, it.zoom, f.label.c_str(), f.dashed ? 1 : 0, f.tabBelow ? 1 : 0);
+    RECT cur;
+    GetWindowRect(f.hwnd, &cur);
+    if (!IsWindowVisible(f.hwnd) || !EqualRect(&cur, &w)) {
+        SetWindowPos(f.hwnd, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(f.hwnd, nullptr, TRUE);
+    } else if (f.look != look) {
+        InvalidateRect(f.hwnd, nullptr, TRUE);
+    }
+    f.look = look;
+    return true;
+}
+
 void UpdateFrames() {
     if (g_frameMoving) return;
     Project p = ProjSnapshot();
@@ -852,6 +945,7 @@ void UpdateFrames() {
     int W, H;
     UiOutputSize(&W, &H);
     std::map<int, bool> keep;
+    // the scene on air (or the current one while stopped): green / red / yellow, as before
     if (sc && (g_streaming || p.idleFrame)) {
         for (const auto& it : sc->items) {
             if (!it.visible || (it.type != IT_REGION && it.type != IT_WINDOW)) continue;
@@ -862,44 +956,42 @@ void UpdateFrames() {
             } else if (!it.winFrame || !WindowRectOf(it.hwnd, &r) || IsIconic(it.hwnd)) {
                 continue;  // «Окно»: the frame is optional (per source)
             }
-            keep[it.uid] = true;
             FrameWin& f = g_frames[it.uid];
-            f.uid = it.uid;
+            f.dashed = false;
             f.movable = it.type == IT_REGION && !it.locked;
             f.thin = it.type == IT_WINDOW;
             f.label = (f.movable ? L"✥ " : L"") + it.name;
-            if (!f.hwnd) {
-                const DWORD ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (f.thin ? WS_EX_TRANSPARENT : 0);
-                f.hwnd = CreateWindowExW(ex, L"WVCFrame", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, g_hInst, nullptr);
-                if (f.hwnd) SetLayeredWindowAttributes(f.hwnd, kKey, 255, LWA_COLORKEY);
+            PlaceFrame(f, it, r, W, H, keep, false);
+        }
+    }
+    // 0.13: «Следующий» — a blue dashed outline of what it will capture, on air or not; areas can be moved / resized
+    const int n = static_cast<int>(p.scenes.size());
+    if (p.nextFrame && p.next >= 0 && p.next < n && p.next != p.cur) {
+        const Scene& nx = p.scenes[static_cast<size_t>(p.next)];
+        for (const auto& it : nx.items) {
+            if (!it.visible || keep.count(it.uid)) continue;
+            RECT r;
+            bool monitor = false;
+            if (it.type == IT_REGION) {
+                r = it.region;
+                if (r.right - r.left < 16 || r.bottom - r.top < 16) continue;
+            } else if (it.type == IT_WINDOW) {
+                if (!WindowRectOf(it.hwnd, &r) || IsIconic(it.hwnd)) continue;
+            } else if (it.type == IT_MONITOR) {
+                r = it.monRect;
+                for (const auto& m : Monitors())
+                    if (!it.monDevice.empty() && m.device == it.monDevice) r = m.rc;
+                if (r.right - r.left < 16 || r.bottom - r.top < 16) continue;
+                monitor = true;
+            } else {
+                continue;
             }
-            if (!f.hwnd) continue;
-            const int fb = FrameB(f), tabH = FrameTab(f);
-            MONITORINFO mi{};
-            mi.cbSize = sizeof(mi);
-            GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mi);
-            f.tabBelow = (r.top - fb - tabH) < mi.rcMonitor.top;
-            RECT w{r.left - fb, r.top - fb, r.right + fb, r.bottom + fb};
-            if (f.tabBelow)
-                w.bottom += tabH;
-            else
-                w.top -= tabH;
-            ScreenOutline(it, r, W, H, &f.outline);
-            if (f.thin) f.outline.clear();
-            wchar_t look[300];
-            swprintf(look, 300, L"%u|%ls|%d|%.4f,%.4f,%.4f,%.4f|%d,%d,%d,%d|%d%d%d|%ls", static_cast<unsigned>(FrameColor()),
-                     it.shape.Key().c_str(), it.fit, it.x, it.y, it.w, it.h, it.crop[0], it.crop[1], it.crop[2],
-                     it.crop[3], it.rot, it.mirror ? 1 : 0, it.zoom, f.label.c_str());
-            RECT cur;
-            GetWindowRect(f.hwnd, &cur);
-            if (!IsWindowVisible(f.hwnd) || !EqualRect(&cur, &w)) {
-                SetWindowPos(f.hwnd, HWND_TOPMOST, w.left, w.top, w.right - w.left, w.bottom - w.top,
-                             SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                InvalidateRect(f.hwnd, nullptr, TRUE);
-            } else if (f.look != look) {
-                InvalidateRect(f.hwnd, nullptr, TRUE);
-            }
-            f.look = look;
+            FrameWin& f = g_frames[it.uid];
+            f.dashed = true;
+            f.movable = it.type == IT_REGION && !it.locked;
+            f.thin = !f.movable;
+            f.label = std::wstring(f.movable ? L"✥ " : L"") + L"Следующий: " + it.name;
+            PlaceFrame(f, it, r, W, H, keep, monitor);
         }
     }
     for (auto it = g_frames.begin(); it != g_frames.end();) {
@@ -1050,6 +1142,7 @@ bool SelectRegion(HINSTANCE hInst, RECT* out) {
     g_sel = &st;
     HWND hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"WVCSelect", L"WVC", WS_POPUP,
                                 vs.left, vs.top, vs.right - vs.left, vs.bottom - vs.top, nullptr, nullptr, hInst, nullptr);
+    ExcludeFromCapture(hwnd);
     if (!hwnd) {
         g_sel = prev;
         DeleteObject(st.font);
@@ -1344,7 +1437,7 @@ void PaintPreview(HWND hwnd, HDC dc) {
         bc = RGB(240, 70, 70);
     }
     wchar_t fmt[64];
-    swprintf(fmt, 64, L"   %d×%d  %.1f к/с", W, H, g_fpsX10.load() / 10.0);
+    swprintf(fmt, 64, L"   %d×%d  %.1f к/с · %.1f мс", W, H, g_fpsX10.load() / 10.0, g_composeAvgX10.load() / 10.0);
     SetTextColor(dc, bc);
     RECT bt{rc.right / 2, 0, rc.right - S(8), hh};
     DrawTextW(dc, (badge + fmt).c_str(), -1, &bt, DT_VCENTER | DT_SINGLELINE | DT_RIGHT);
@@ -2020,6 +2113,10 @@ void UiStatus() {
     s += g_streaming ? (g_paused ? L"Пауза — камера показывает картинку паузы." : L"Камера показывает сцену «" +
                                                                                     (CurSceneC(p) ? CurSceneC(p)->name : L"") + L"».")
                      : L"Камера остановлена (показывает картинку паузы).";
+    {
+        const std::wstring st = RenderStatsLine();
+        if (!st.empty()) s += L"  " + st + L".";
+    }
     // phones in the current scene
     if (const Scene* sc = CurSceneC(p)) {
         for (const auto& it : sc->items) {

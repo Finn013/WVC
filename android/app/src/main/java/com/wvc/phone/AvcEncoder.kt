@@ -12,8 +12,8 @@ import android.view.Surface
  * Hardware H.264 (AVC) encoder with an input Surface: the camera (CameraX Preview) or the screen (VirtualDisplay)
  * draws straight into it, no copies through the CPU. Output: Annex-B access units to [FrameServer.sendH264];
  * SPS/PPS are put in front of every key frame, so WVC can start decoding at any key frame.
- * Baseline profile, 30 fps, a key frame every second, bitrate adapts to the network
- * (1080p: 4–8 Mbit/s, 720p: 2–4 Mbit/s).
+ * Baseline profile, 30 fps (60 when WVC asks, 0.13), a key frame every second, bitrate adapts to the network
+ * (1080p: 4–8 Mbit/s, 720p: 2–4 Mbit/s; x1.5 at 60 fps).
  */
 class AvcEncoder(private val server: FrameServer, private val gate: () -> Boolean) {
 
@@ -32,10 +32,11 @@ class AvcEncoder(private val server: FrameServer, private val gate: () -> Boolea
     private var minBr = 0
     private var maxBr = 0
     private var lastAdjust = 0L
+    private var frameRate = 30
 
     /** Returns the input surface, or null when the phone has no usable AVC encoder. */
     @Synchronized
-    fun start(w: Int, h: Int): Surface? {
+    fun start(w: Int, h: Int, fps: Int = 30): Surface? {
         stop()
         val ew = (w + 1) and 1.inv()
         val eh = (h + 1) and 1.inv()
@@ -47,6 +48,8 @@ class AvcEncoder(private val server: FrameServer, private val gate: () -> Boolea
             px >= 800L * 1000 -> 4_000_000
             else -> 2_500_000
         }
+        frameRate = if (fps >= 50) 60 else 30
+        if (frameRate == 60) maxBr = maxBr * 3 / 2
         minBr = maxBr / 2
         bitrate = maxBr * 3 / 4
         config = null
@@ -83,7 +86,7 @@ class AvcEncoder(private val server: FrameServer, private val gate: () -> Boolea
         val f = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         f.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-        f.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+        f.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
         f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         f.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)  // a still screen keeps sending frames
         if (withProfile) {

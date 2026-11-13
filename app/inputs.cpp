@@ -24,7 +24,31 @@ static double MeanLuma(const uint8_t* bgra, int w, int h) {
     return n ? sum / n : 0;
 }
 
-void Input::Publish(const uint8_t* bgra, int fw, int fh) {
+Input::Input() { newFrameEv = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
+Input::~Input() {
+    if (newFrameEv) CloseHandle(newFrameEv);
+}
+
+std::shared_ptr<VFrame> Input::NewFrame(int fw, int fh) {
+    const size_t n = static_cast<size_t>(fw) * fh * 4;
+    std::lock_guard<std::mutex> lk(mx);
+    for (auto& f : pool)
+        if (f.use_count() == 1 && f != frame) {  // only the pool holds it: nobody is reading
+            f->px.resize(n);
+            f->w = fw;
+            f->h = fh;
+            return f;
+        }
+    auto f = std::make_shared<VFrame>();
+    f->px.resize(n);
+    f->w = fw;
+    f->h = fh;
+    if (pool.size() < 4) pool.push_back(f);
+    return f;
+}
+
+void Input::PublishFrame(const std::shared_ptr<VFrame>& f) {
+    if (!f || f->w <= 0 || f->h <= 0) return;
     if (gateArm.exchange(false)) {
         gating = true;
         gateStable = 0;
@@ -32,7 +56,7 @@ void Input::Publish(const uint8_t* bgra, int fw, int fh) {
         gateStart = GetTickCount64();
     }
     if (gating) {
-        const double l = MeanLuma(bgra, fw, fh);
+        const double l = MeanLuma(f->px.data(), f->w, f->h);
         const bool steady = gateLuma >= 0 && std::fabs(l - gateLuma) < 255 * 0.02;
         gateStable = steady ? gateStable + 1 : 0;
         gateLuma = l;
@@ -46,18 +70,43 @@ void Input::Publish(const uint8_t* bgra, int fw, int fh) {
     }
     {
         std::lock_guard<std::mutex> lk(mx);
-        buf.assign(bgra, bgra + static_cast<size_t>(fw) * fh * 4);
-        w = fw;
-        h = fh;
+        frame = f;
     }
     ++seq;
     status = 2;
+    const ULONGLONG now = GetTickCount64();
+    lastFrameAt = now;
+    if (fpsT0 == 0) fpsT0 = now;
+    ++fpsCount;
+    if (now - fpsT0 >= 1000) {
+        fpsX10 = static_cast<int>(fpsCount * 10000 / (now - fpsT0));
+        fpsCount = 0;
+        fpsT0 = now;
+    }
+    if (newFrameEv) SetEvent(newFrameEv);
+}
+
+void Input::Publish(const uint8_t* bgra, int fw, int fh) {
+    auto f = NewFrame(fw, fh);
+    std::memcpy(f->px.data(), bgra, static_cast<size_t>(fw) * fh * 4);
+    PublishFrame(f);
+}
+
+std::shared_ptr<VFrame> Input::Latest() {
+    std::lock_guard<std::mutex> lk(mx);
+    return frame;
+}
+
+int Input::FpsX10() const {
+    const ULONGLONG last = lastFrameAt;
+    if (!last || GetTickCount64() - last > 2000) return 0;
+    return fpsX10;
 }
 
 void Input::Clear() {
     {
         std::lock_guard<std::mutex> lk(mx);
-        buf.clear();
+        frame.reset();
     }
     ++seq;
 }
@@ -157,6 +206,8 @@ CamCtlCfg CamCtlGet(const std::wstring& link) {  // UI thread
         c.brVal = g_ini.Int(sec, L"BrVal", 0);
         c.wbMode = g_ini.Int(sec, L"WbMode", 0);
         c.wbVal = g_ini.Int(sec, L"WbVal", 0);
+        c.mode = g_ini.Str(sec, L"Mode");
+        c.rgb32 = g_ini.Int(sec, L"Rgb32", 0) != 0;
         rt.loaded = true;
     }
     return rt.cfg;
@@ -173,6 +224,8 @@ void CamCtlSet(const std::wstring& link, const CamCtlCfg& c) {  // UI thread
     g_ini.SetInt(sec, L"BrVal", c.brVal);
     g_ini.SetInt(sec, L"WbMode", c.wbMode);
     g_ini.SetInt(sec, L"WbVal", c.wbVal);
+    g_ini.Set(sec, L"Mode", c.mode);
+    g_ini.SetInt(sec, L"Rgb32", c.rgb32);
     ++g_cc[link].ver;
     g_projDirty = true;
 }
@@ -215,9 +268,61 @@ static void CamCtlClosed(const std::wstring& link) {
 }
 
 // ---------------------------------------------------------------------------
-// Webcam
+// Webcam modes (native formats), cached per device when it is opened
+// ---------------------------------------------------------------------------
+static std::mutex g_modesMx;
+static std::map<std::wstring, std::vector<CamMode>> g_modes;
+
+static std::wstring FourccOf(const GUID& g) {
+    if (g == MFVideoFormat_RGB32) return L"RGB32";
+    if (g == MFVideoFormat_RGB24) return L"RGB24";
+    // FOURCC subtypes: Data1 holds the four characters
+    std::wstring t;
+    for (int i = 0; i < 4; ++i) {
+        const wchar_t c = static_cast<wchar_t>((g.Data1 >> (8 * i)) & 0xFF);
+        if (c >= 32 && c < 127) t += c;
+    }
+    if (t == L"YUY2" || t == L"MJPG" || t == L"NV12" || t == L"H264" || t == L"I420" || t == L"YV12" || t == L"UYVY" ||
+        t == L"HEVC" || t == L"Y800" || t == L"L8")
+        return t;
+    return t.empty() ? L"?" : t;
+}
+
+std::wstring CamMode::Key() const {
+    wchar_t b[80];
+    swprintf(b, 80, L"%ux%u@%.2f/%ls", w, h, Fps(), fourcc.c_str());
+    return b;
+}
+
+std::wstring CamMode::Label() const {
+    wchar_t b[100];
+    const double f = Fps();
+    if (std::fabs(f - std::round(f)) < 0.05)
+        swprintf(b, 100, L"%u×%u, %d к/с, %ls", w, h, static_cast<int>(std::lround(f)), fourcc.c_str());
+    else
+        swprintf(b, 100, L"%u×%u, %.2f к/с, %ls", w, h, f, fourcc.c_str());
+    return b;
+}
+
+std::vector<CamMode> CamModesFor(const std::wstring& link) {
+    std::lock_guard<std::mutex> lk(g_modesMx);
+    auto it = g_modes.find(link);
+    return it == g_modes.end() ? std::vector<CamMode>() : it->second;
+}
+
+static void CamWanted(const std::wstring& link, std::wstring* mode, bool* rgb) {
+    std::lock_guard<std::mutex> lk(g_ccMx);
+    const CamCtlRt& rt = g_cc[link];
+    *mode = rt.cfg.mode;
+    *rgb = rt.cfg.rgb32;
+}
+
+// ---------------------------------------------------------------------------
+// Webcam: native format with the needed frame rate, YUV converted by WVC (parallel) straight into a shared frame
 // ---------------------------------------------------------------------------
 namespace {
+const GUID kLowLatencyAttr = {0x9c27891a, 0xed7a, 0x40e1, {0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee}};
+
 struct WebcamInput : Input {
     std::wstring link;
     void Start() override {
@@ -228,6 +333,32 @@ struct WebcamInput : Input {
     }
     void Run() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        for (int round = 0; !stop; ++round) {
+            const int r = Session(round);  // 0 stopped / failed, 2 = open again with another format
+            if (r != 2) break;
+        }
+        if (!stop) {
+            failedAt = GetTickCount64();
+            status = 3;
+        }
+        CoUninitialize();
+    }
+
+    // automatic choice: frame rate first (at least the camera's FPS), then size near the output height, then
+    // formats that are cheap to convert (MJPG / NV12 before YUY2 at HD sizes; others last)
+    static double Score(const CamMode& m, int wantFps, int targetH) {
+        const double f = m.Fps();
+        double s = 0;
+        if (f + 0.5 < wantFps) s += (wantFps - f) * 1e6;
+        else if (f > wantFps * 1.3) s += 2e3;  // faster than the output: wasted work, slightly worse
+        if (m.h > 1080 || m.w > 1920) s += 5e5;
+        s += std::fabs(static_cast<double>(m.h) - targetH) * 10;
+        if (m.fourcc == L"YUY2" && m.h >= 720) s += 60;
+        else if (m.fourcc != L"MJPG" && m.fourcc != L"NV12" && m.fourcc != L"YUY2") s += 3e5;
+        return s;
+    }
+
+    int Session(int round) {
         IMFAttributes* a = nullptr;
         IMFMediaSource* src = nullptr;
         IMFAttributes* ra = nullptr;
@@ -238,115 +369,159 @@ struct WebcamInput : Input {
         bool ok = false;
         UINT32 fw = 0, fh = 0;
         LONG defStride = 0;
+        GUID outSub = GUID_NULL;
+        bool bt709 = false, full = false;
+        std::wstring wantMode, openedMode;
+        bool wantRgb = false;
+        CamWanted(link, &wantMode, &wantRgb);
+        CamMode chosen;
+        int result = 0;
+        const int autoFps = g_camFps > 0 ? g_camFps : 30;
         do {
             if (FAILED(MFCreateAttributes(&a, 2))) break;
             a->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
             a->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, link.c_str());
             if (FAILED(MFCreateDeviceSource(a, &src))) {
-                LogErr(L"Веб-камера не открылась: " + link.substr(0, 80));
+                if (round == 0) LogErr(L"Веб-камера не открылась: " + link.substr(0, 80));
                 break;
             }
             CamCtlOpened(link, src);
-            if (FAILED(MFCreateAttributes(&ra, 1))) break;
+            if (FAILED(MFCreateAttributes(&ra, 3))) break;
             ra->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+            ra->SetUINT32(kLowLatencyAttr, TRUE);
             if (FAILED(MFCreateSourceReaderFromMediaSource(src, ra, &rd))) break;
-            DWORD best = MAXDWORD;
-            double bestScore = 1e300;
-            UINT32 bw = 0, bh = 0;
+            // native formats
+            std::vector<CamMode> modes;
+            std::vector<DWORD> idx;
             for (DWORD i = 0;; ++i) {
                 IMFMediaType* t = nullptr;
                 if (FAILED(rd->GetNativeMediaType(stream, i, &t))) break;
-                UINT32 tw = 0, tth = 0, num = 0, den = 1;
-                MFGetAttributeSize(t, MF_MT_FRAME_SIZE, &tw, &tth);
-                MFGetAttributeRatio(t, MF_MT_FRAME_RATE, &num, &den);
-                const double fps = den ? static_cast<double>(num) / den : 0;
-                const double px = static_cast<double>(tw) * tth;
-                double score = std::fabs(px - 1280.0 * 720.0);
-                if (fps < 24) score += 1e12;
-                if (px > 1920.0 * 1080.0) score += 1e11;
-                if (tw && tth && score < bestScore) {
-                    bestScore = score;
-                    best = i;
-                    bw = tw;
-                    bh = tth;
+                CamMode m;
+                GUID sub{};
+                t->GetGUID(MF_MT_SUBTYPE, &sub);
+                MFGetAttributeSize(t, MF_MT_FRAME_SIZE, &m.w, &m.h);
+                MFGetAttributeRatio(t, MF_MT_FRAME_RATE, &m.num, &m.den);
+                UINT32 mn = 0, md = 1;
+                if (SUCCEEDED(MFGetAttributeRatio(t, MF_MT_FRAME_RATE_RANGE_MAX, &mn, &md)) && md &&
+                    static_cast<double>(mn) / md > m.Fps()) {
+                    m.num = mn;
+                    m.den = md;
                 }
+                m.fourcc = FourccOf(sub);
                 t->Release();
+                if (!m.w || !m.h) continue;
+                modes.push_back(m);
+                idx.push_back(i);
             }
-            if (best != MAXDWORD) {
+            {
+                // the list for «Свойства» (unique by key, sorted: bigger first, then faster)
+                std::vector<CamMode> list;
+                for (const auto& m : modes) {
+                    bool dup = false;
+                    for (const auto& o : list) dup = dup || o.Key() == m.Key();
+                    if (!dup) list.push_back(m);
+                }
+                std::sort(list.begin(), list.end(), [](const CamMode& x, const CamMode& y) {
+                    if (x.w * x.h != y.w * y.h) return x.w * x.h > y.w * y.h;
+                    if (std::fabs(x.Fps() - y.Fps()) > 0.01) return x.Fps() > y.Fps();
+                    return x.fourcc < y.fourcc;
+                });
+                std::lock_guard<std::mutex> lk(g_modesMx);
+                g_modes[link] = list;
+            }
+            int best = -1;
+            if (!wantMode.empty())
+                for (size_t i = 0; i < modes.size() && best < 0; ++i)
+                    if (modes[i].Key() == wantMode) best = static_cast<int>(i);
+            if (best < 0) {
+                const int wantFps = autoFps;
+                const int targetH = std::clamp(g_camH > 0 ? (std::min)(g_camH, g_camW) : 1080, 480, 1080);
+                double bs = 1e300;
+                for (size_t i = 0; i < modes.size(); ++i) {
+                    const double sc = Score(modes[i], wantFps, targetH);
+                    if (sc < bs) {
+                        bs = sc;
+                        best = static_cast<int>(i);
+                    }
+                }
+                if (!wantMode.empty() && round == 0) LogMsg(L"Веб-камера: выбранного режима " + wantMode + L" больше нет — выбираю сам");
+            }
+            if (best >= 0) {
+                chosen = modes[static_cast<size_t>(best)];
                 IMFMediaType* t = nullptr;
-                if (SUCCEEDED(rd->GetNativeMediaType(stream, best, &t))) {
-                    rd->SetCurrentMediaType(stream, nullptr, t);
+                if (SUCCEEDED(rd->GetNativeMediaType(stream, idx[static_cast<size_t>(best)], &t))) {
+                    if (chosen.num && (chosen.num != 0)) MFSetAttributeRatio(t, MF_MT_FRAME_RATE, chosen.num, chosen.den);
+                    if (FAILED(rd->SetCurrentMediaType(stream, nullptr, t))) {
+                        LogErr(L"Веб-камера не приняла режим " + chosen.Label());
+                    }
                     t->Release();
                 }
             }
+            // output: the native YUV as is (no conversion by Media Foundation) or NV12 from MJPG; RGB32 = old way
+            std::vector<GUID> outs;
+            if (wantRgb) outs = {MFVideoFormat_RGB32};
+            else if (chosen.fourcc == L"YUY2") outs = {MFVideoFormat_YUY2, MFVideoFormat_NV12, MFVideoFormat_RGB32};
+            else outs = {MFVideoFormat_NV12, MFVideoFormat_YUY2, MFVideoFormat_RGB32};
             if (FAILED(MFCreateMediaType(&outType))) break;
-            outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-            outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-            if (bw && bh) MFSetAttributeSize(outType, MF_MT_FRAME_SIZE, bw, bh);
-            if (FAILED(rd->SetCurrentMediaType(stream, nullptr, outType))) {
+            bool set = false;
+            for (const GUID& g : outs) {
+                outType->DeleteAllItems();
+                outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                outType->SetGUID(MF_MT_SUBTYPE, g);
+                if (chosen.w && chosen.h) MFSetAttributeSize(outType, MF_MT_FRAME_SIZE, chosen.w, chosen.h);
+                if (SUCCEEDED(rd->SetCurrentMediaType(stream, nullptr, outType))) {
+                    set = true;
+                    break;
+                }
                 outType->DeleteItem(MF_MT_FRAME_SIZE);
-                if (FAILED(rd->SetCurrentMediaType(stream, nullptr, outType))) break;
+                if (SUCCEEDED(rd->SetCurrentMediaType(stream, nullptr, outType))) {
+                    set = true;
+                    break;
+                }
             }
+            if (!set) break;
             if (FAILED(rd->GetCurrentMediaType(stream, &cur))) break;
-            MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &fw, &fh);
-            UINT32 st = 0;
-            if (SUCCEEDED(cur->GetUINT32(MF_MT_DEFAULT_STRIDE, &st))) defStride = static_cast<LONG>(st);
-            if (!fw || !fh) break;
-            ok = true;
+            ok = ReadType(cur, &fw, &fh, &defStride, &outSub, &bt709, &full);
         } while (false);
         if (ok) {
-            LogMsg(L"Веб-камера открыта: " + std::to_wstring(fw) + L"×" + std::to_wstring(fh));
-            std::vector<uint8_t> local(static_cast<size_t>(fw) * fh * 4);
+            openedMode = wantMode;
+            std::wstring outName = outSub == MFVideoFormat_NV12 ? L"NV12" : outSub == MFVideoFormat_YUY2 ? L"YUY2" : L"RGB32";
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                info = chosen.Label() + (chosen.fourcc == outName ? L"" : L" → " + outName) + (wantMode.empty() ? L" (авто)" : L"");
+            }
+            LogMsg(L"Веб-камера открыта: " + chosen.Label() + L" → " + outName + L", кадр " + std::to_wstring(fw) + L"×" +
+                   std::to_wstring(fh) + (wantMode.empty() ? L" (режим выбран автоматически)" : L" (режим из свойств)"));
+            ULONGLONG lastPoll = GetTickCount64();
             while (!stop) {
-                CamCtlPoll(link, src);
+                const ULONGLONG now = GetTickCount64();
+                if (now - lastPoll >= 250) {
+                    lastPoll = now;
+                    CamCtlPoll(link, src);
+                    std::wstring m;
+                    bool rgb;
+                    CamWanted(link, &m, &rgb);
+                    if (m != openedMode || rgb != wantRgb || (m.empty() && g_camFps > 0 && g_camFps != autoFps)) {
+                        LogMsg(L"Веб-камера: меняю режим");
+                        result = 2;
+                        break;
+                    }
+                }
                 DWORD si = 0, flags = 0;
                 LONGLONG ts = 0;
                 IMFSample* sample = nullptr;
                 HRESULT hr = rd->ReadSample(stream, 0, &si, &flags, &ts, &sample);
                 if (FAILED(hr) || (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
                     SafeRelease(sample);
+                    LogErr(L"Веб-камера перестала отдавать кадры");
                     break;
                 }
                 if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
                     SafeRelease(cur);
-                    if (SUCCEEDED(rd->GetCurrentMediaType(stream, &cur))) {
-                        MFGetAttributeSize(cur, MF_MT_FRAME_SIZE, &fw, &fh);
-                        UINT32 st = 0;
-                        defStride = SUCCEEDED(cur->GetUINT32(MF_MT_DEFAULT_STRIDE, &st)) ? static_cast<LONG>(st) : 0;
-                        local.assign(static_cast<size_t>(fw) * fh * 4, 0);
-                    }
+                    if (SUCCEEDED(rd->GetCurrentMediaType(stream, &cur))) ReadType(cur, &fw, &fh, &defStride, &outSub, &bt709, &full);
                 }
                 if (!sample) continue;
-                IMFMediaBuffer* mb = nullptr;
-                if (SUCCEEDED(sample->ConvertToContiguousBuffer(&mb))) {
-                    BYTE* scan0 = nullptr;
-                    LONG pitch = 0;
-                    IMF2DBuffer* b2 = nullptr;
-                    BYTE* raw = nullptr;
-                    DWORD len = 0;
-                    bool locked2d = false, locked = false;
-                    if (SUCCEEDED(mb->QueryInterface(IID_PPV_ARGS(&b2))) && SUCCEEDED(b2->Lock2D(&scan0, &pitch))) {
-                        locked2d = true;
-                    } else if (SUCCEEDED(mb->Lock(&raw, nullptr, &len))) {
-                        locked = true;
-                        pitch = defStride ? defStride : static_cast<LONG>(fw * 4);
-                        scan0 = pitch < 0 ? raw + static_cast<size_t>(fh - 1) * static_cast<size_t>(-pitch) : raw;
-                        if (len < static_cast<size_t>(std::labs(pitch)) * fh) scan0 = nullptr;
-                    }
-                    if (scan0) {
-                        for (UINT32 y = 0; y < fh; ++y) {
-                            const uint8_t* s = scan0 + static_cast<ptrdiff_t>(y) * pitch;
-                            uint8_t* d = local.data() + static_cast<size_t>(y) * fw * 4;
-                            std::memcpy(d, s, static_cast<size_t>(fw) * 4);
-                            for (UINT32 x = 0; x < fw; ++x) d[x * 4 + 3] = 255;
-                        }
-                        Publish(local.data(), static_cast<int>(fw), static_cast<int>(fh));
-                    }
-                    if (locked2d) b2->Unlock2D();
-                    if (locked) mb->Unlock();
-                    SafeRelease(b2);
-                    mb->Release();
-                }
+                Convert(sample, fw, fh, defStride, outSub, bt709, full);
                 sample->Release();
             }
         }
@@ -358,11 +533,67 @@ struct WebcamInput : Input {
         if (src) src->Shutdown();
         SafeRelease(src);
         SafeRelease(a);
-        if (!stop) {
-            failedAt = GetTickCount64();
-            status = 3;
+        return result;
+    }
+
+    static bool ReadType(IMFMediaType* t, UINT32* fw, UINT32* fh, LONG* stride, GUID* sub, bool* bt709, bool* full) {
+        *fw = *fh = 0;
+        MFGetAttributeSize(t, MF_MT_FRAME_SIZE, fw, fh);
+        t->GetGUID(MF_MT_SUBTYPE, sub);
+        UINT32 st = 0;
+        *stride = SUCCEEDED(t->GetUINT32(MF_MT_DEFAULT_STRIDE, &st)) ? static_cast<LONG>(st) : 0;
+        // like the Media Foundation video processor: unknown matrix = BT.709 for HD, unknown range = 16..235
+        UINT32 mtx = 0, rng = 0;
+        if (SUCCEEDED(t->GetUINT32(MF_MT_YUV_MATRIX, &mtx)) && mtx != MFVideoTransferMatrix_Unknown)
+            *bt709 = mtx == MFVideoTransferMatrix_BT709;
+        else
+            *bt709 = *fh >= 720;
+        *full = SUCCEEDED(t->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &rng)) && rng == MFNominalRange_0_255;
+        return *fw > 0 && *fh > 0;
+    }
+
+    void Convert(IMFSample* sample, UINT32 fw, UINT32 fh, LONG defStride, const GUID& sub, bool bt709, bool full) {
+        IMFMediaBuffer* mb = nullptr;
+        DWORD nb = 0;
+        if (SUCCEEDED(sample->GetBufferCount(&nb)) && nb == 1) sample->GetBufferByIndex(0, &mb);  // no copy
+        if (!mb && FAILED(sample->ConvertToContiguousBuffer(&mb))) return;
+        BYTE* scan0 = nullptr;
+        LONG pitch = 0;
+        IMF2DBuffer* b2 = nullptr;
+        BYTE* raw = nullptr;
+        DWORD len = 0;
+        bool locked2d = false, locked = false;
+        const bool nv12 = sub == MFVideoFormat_NV12, yuy2 = sub == MFVideoFormat_YUY2;
+        const LONG minPitch = static_cast<LONG>(nv12 ? fw : yuy2 ? fw * 2 : fw * 4);
+        if (SUCCEEDED(mb->QueryInterface(IID_PPV_ARGS(&b2))) && SUCCEEDED(b2->Lock2D(&scan0, &pitch))) {
+            locked2d = true;
+        } else if (SUCCEEDED(mb->Lock(&raw, nullptr, &len))) {
+            locked = true;
+            pitch = defStride ? defStride : minPitch;
+            const size_t need = static_cast<size_t>(std::labs(pitch)) * fh * (nv12 ? 3 : 2) / 2;
+            scan0 = pitch < 0 ? raw + static_cast<size_t>(fh - 1) * static_cast<size_t>(-pitch) : raw;
+            if (len < (nv12 || yuy2 ? need : static_cast<size_t>(std::labs(pitch)) * fh)) scan0 = nullptr;
         }
-        CoUninitialize();
+        if (scan0 && (nv12 || yuy2 || sub == MFVideoFormat_RGB32) && std::labs(pitch) >= minPitch) {
+            auto f = NewFrame(static_cast<int>(fw), static_cast<int>(fh));
+            uint8_t* o = f->px.data();
+            const int ow = static_cast<int>(fw) * 4;
+            if (nv12)
+                Nv12ToBgraFast(scan0, pitch, scan0 + static_cast<ptrdiff_t>(pitch) * fh, pitch, static_cast<int>(fw) & ~1,
+                               static_cast<int>(fh), o, ow, bt709, full);
+            else if (yuy2)
+                Yuy2ToBgra(scan0, pitch, static_cast<int>(fw), static_cast<int>(fh), o, ow, bt709, full);
+            else
+                CopyBgrxOpaque(scan0, pitch, static_cast<int>(fw), static_cast<int>(fh), o, ow);
+            if (nv12 && (fw & 1)) {
+                for (UINT32 y = 0; y < fh; ++y) std::memcpy(o + y * ow + (fw - 1) * 4, o + y * ow + (fw - 2) * 4, 4);
+            }
+            PublishFrame(f);
+        }
+        if (locked2d) b2->Unlock2D();
+        if (locked) mb->Unlock();
+        SafeRelease(b2);
+        mb->Release();
     }
 };
 
@@ -981,8 +1212,8 @@ std::mutex g_phoneUserMx;
 struct PhoneInput : Input {
     std::wstring link;  // IP, or "usb:<preferred serial>"
     // what the phone should send (set from the UI thread)
-    std::atomic<int> wantSrc{0}, wantRes{0}, wantCodec{0};
-    std::atomic<int> sentSrc{-1}, sentRes{-1};
+    std::atomic<int> wantSrc{0}, wantRes{0}, wantCodec{0}, wantFps{30};
+    std::atomic<int> sentSrc{-1}, sentRes{-1}, sentFps{-1};
     std::mutex pmx;  // socket + strings
     SOCKET sock = INVALID_SOCKET;
     std::wstring name, state, err, usbModel, usbSerial, codec;
@@ -1031,6 +1262,8 @@ struct PhoneInput : Input {
             if (s < 2 && g_hideGlare) gateArm = true;  // a camera starts: hide its first bright frames
         }
         if (r != sentRes && SendLine(r == 1 ? "RES 1080" : "RES 720")) sentRes = r;
+        const int f = wantFps;
+        if (f != sentFps && SendLine("FPS " + std::to_string(f))) sentFps = f;  // WVC Phone 0.13+ (older ones ignore it)
     }
     void HandleText(const std::string& t) {
         if (t.rfind("STATE ", 0) == 0) {
@@ -1058,6 +1291,9 @@ struct PhoneInput : Input {
         } else if (t.rfind("NAME ", 0) == 0) {
             std::lock_guard<std::mutex> lk(pmx);
             name = PhoneW(t.substr(5));
+        } else if (t.rfind("FPS ", 0) == 0) {
+            std::lock_guard<std::mutex> lk(mx);
+            info = L"телефон: " + PhoneW(t.substr(4)) + L" к/с";
         } else if (t.rfind("CODEC ", 0) == 0) {
             std::lock_guard<std::mutex> lk(pmx);
             codec = t.substr(6) == "h264" ? L"H.264" : L"JPEG";
@@ -1204,6 +1440,7 @@ struct PhoneInput : Input {
             {  // first the codec, so the phone starts in the right mode
                 std::string hello;
                 if (tryH264) hello += "CODEC h264\n";
+                hello += "FPS " + std::to_string(wantFps.load()) + "\n";  // before SRC: the camera starts at that rate
                 hello += SrcCmd(wantSrc, codecMode) + "\n";
                 hello += wantRes == 1 ? "RES 1080\n" : "RES 720\n";
                 std::lock_guard<std::mutex> lk(pmx);
@@ -1211,6 +1448,7 @@ struct PhoneInput : Input {
             }
             sentSrc = wantSrc.load();
             sentRes = wantRes.load();
+            sentFps = wantFps.load();
             // decoding on its own thread: JPEG = newest frame only; H.264 = every packet in order (drop to the next
             // key frame when it falls behind)
             struct Job {
@@ -1335,7 +1573,7 @@ struct PhoneInput : Input {
                             // dropping until the next key frame
                         } else {
                             needKey = false;
-                            if (hq.size() > 45) {  // the decoder is ~1.5 s behind: start again from a key frame
+                            if (hq.size() > 8) {  // the decoder is behind (~0.15–0.3 s): drop to the next key frame
                                 hq.clear();
                                 needKey = !j.key;
                                 askKey = !j.key;
@@ -1470,6 +1708,7 @@ static std::shared_ptr<Input> CreateInput(const Item& it, const std::wstring& ke
         p->wantSrc = it.phoneSrc;
         p->wantRes = it.phoneRes;
         p->wantCodec = it.phoneCodec;
+        p->wantFps = g_camFps >= 50 ? 60 : 30;
         in = p;
     }
     if (in) in->key = key;
@@ -1562,6 +1801,7 @@ void InputsSync() {
                 const Item& it = *kv.second.item;
                 ph->wantSrc = it.phoneSrc;
                 ph->wantRes = it.phoneRes;
+                ph->wantFps = p.out.fps >= 50 ? 60 : 30;
                 if (ph->wantCodec != it.phoneCodec) {  // a new transfer mode needs a new connection
                     ph->wantCodec = it.phoneCodec;
                     ph->forceJpeg = false;
@@ -1646,12 +1886,27 @@ PhoneInfo PhoneInfoFor(const std::wstring& key) {
     pi.decFpsX10 = ph->decFpsX10;
     pi.kbps = ph->kbps;
     pi.res = ph->resRep;
-    {
-        std::lock_guard<std::mutex> lk(ph->mx);
-        pi.w = ph->buf.empty() ? 0 : ph->w;
-        pi.h = ph->buf.empty() ? 0 : ph->h;
+    if (auto f = ph->Latest()) {
+        pi.w = f->w;
+        pi.h = f->h;
     }
     return pi;
+}
+
+InputStats InputStatsFor(const std::wstring& key) {
+    InputStats st;
+    auto in = GetInput(key);
+    if (!in) return st;
+    st.exists = true;
+    st.status = in->status;
+    st.fpsX10 = in->FpsX10();
+    if (auto f = in->Latest()) {
+        st.w = f->w;
+        st.h = f->h;
+    }
+    std::lock_guard<std::mutex> lk(in->mx);
+    st.info = in->info;
+    return st;
 }
 
 std::wstring InputMessage(const Item& it) {

@@ -68,6 +68,8 @@ class StreamService : LifecycleService(), FrameServer.Listener {
     var state = "back"
         private set
     var longSide = 720
+    /** Frame rate WVC asked for ("FPS 60" when its camera runs at 50/60); 30 otherwise. Camera + H.264 only. */
+    var wantFps = 30
         private set
     var clientAddr: String? = null
         private set
@@ -209,6 +211,15 @@ class StreamService : LifecycleService(), FrameServer.Listener {
         screen.resize(r)
     }
 
+    /** WVC 0.13: "FPS 30|60". The answer "FPS n" says what the phone will try. */
+    fun setFps(f: Int) {
+        val v = if (f >= 50) 60 else 30
+        server.sendText("FPS $v")
+        if (v == wantFps) return
+        wantFps = v
+        if (camera.isRunning) applySource()
+    }
+
     private fun applySource() {
         if (stopped) return
         val connected = clientAddr != null
@@ -219,7 +230,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
                     camera.stop()
                     setState("no_camera_permission")
                 } else {
-                    if (connected) camera.start(source == "front", longSide, h264) else camera.stop()
+                    if (connected) camera.start(source == "front", longSide, h264, null, wantFps) else camera.stop()
                     setState(source)
                 }
             }
@@ -327,6 +338,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
         main.post {
             clientAddr = address
             h264 = false  // WVC 0.11 sends "CODEC h264" first; older WVC gets JPEG as before
+            wantFps = 30  // WVC 0.13 sends "FPS 60" when it wants it
             screen.setH264(false)
             acquireLocks()
             server.sendText("NAME ${Net.deviceName()}")
@@ -363,6 +375,7 @@ class StreamService : LifecycleService(), FrameServer.Listener {
                     applySource()
                 }
                 "KEY" -> server.requestKeyFrame()
+                "FPS" -> arg.toIntOrNull()?.let { setFps(it) }
             }
         }
     }

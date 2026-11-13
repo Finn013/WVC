@@ -57,8 +57,8 @@ endif()
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_executable(WVC WIN32 app/ui_main.cpp app/ui_props.cpp app/ui_settings.cpp app/model.cpp app/render.cpp
         app/inputs.cpp app/h264.cpp app/util.cpp app/transition.cpp app/log.cpp app/update.cpp app/undo.cpp app/docks.cpp
-        app/app.rc app/app.manifest)
+        app/fastimg.cpp app/capture.cpp app/app.rc app/app.manifest)
     target_compile_definitions(WVC PRIVATE NOMINMAX)
-    target_link_libraries(WVC PRIVATE user32 gdi32 shell32 advapi32 comctl32 ole32 dwmapi comdlg32 windowscodecs uxtheme mfplat mf mfreadwrite mfuuid ws2_32 iphlpapi msimg32 winhttp strmiids)
+    target_link_libraries(WVC PRIVATE user32 gdi32 shell32 advapi32 comctl32 ole32 dwmapi comdlg32 windowscodecs uxtheme mfplat mf mfreadwrite mfuuid ws2_32 iphlpapi msimg32 winhttp strmiids winmm d3d11 dxgi)
     add_dependencies(WVC wvccam)
 endif()

@@ -92,6 +92,17 @@ void            SendFrame(CameraHandle camera, const void* image_bits)
     }
 }
 
+void            SendFrameNow(CameraHandle camera, const void* image_bits)
+{
+    Camera* target = static_cast<Camera*>(camera);
+    if (target && s_camera.load() == target && image_bits)
+    {
+        // keep the pacing timer in step, so a later paced SendFrame continues smoothly
+        target->m_timer.reset();
+        target->m_frame_buffer.write(image_bits);
+    }
+}
+
 bool            WaitForConnection(CameraHandle camera, float timeout)
 {
     Camera* target = static_cast<Camera*>(camera);

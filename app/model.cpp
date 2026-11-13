@@ -348,6 +348,10 @@ void ProjectToIni(const Project& p, IniDoc* d) {
     d->Set(kMain, L"PauseText", p.pauseText);
     d->Set(kMain, L"PauseImage", p.pauseImage);
     d->SetInt(kMain, L"IdleFrame", p.idleFrame);
+    d->SetInt(kMain, L"NextFrame", p.nextFrame);
+    d->SetInt(kMain, L"PaceMode", p.outPace);
+    d->SetInt(kMain, L"ScaleMode", p.scaleMode);
+    d->SetInt(kMain, L"CaptureMode", p.captureMode);
     d->SetInt(kMain, L"KeepCamOn", p.keepCamOn);
     d->SetInt(kMain, L"LiveWhenStopped", p.liveWhenStopped);
     d->SetInt(kMain, L"MinToTray", p.minToTray);
@@ -375,7 +379,8 @@ static void ProjectFromIni11(const IniDoc& d, Project* p) {
     OutputCfg& o = p->out;
     o.quality = std::clamp(d.Int(kMain, L"Resolution", 1), 0, 1);
     o.aspect = std::clamp(d.Int(kMain, L"Aspect", 0), 0, 3);
-    o.fps = d.Int(kMain, L"FPS", 30) == 60 ? 60 : 30;
+    o.fps = d.Int(kMain, L"FPS", 30);
+    if (!IsValidFps(o.fps)) o.fps = 30;
     o.native = d.Int(kMain, L"OutNative", 0) != 0;
     o.nativeUid = d.Int(kMain, L"OutNativeUid", 0);
     o.nativeW = std::clamp(d.Int(kMain, L"OutNativeW", 1280), 64, 8192);
@@ -396,6 +401,10 @@ static void ProjectFromIni11(const IniDoc& d, Project* p) {
     p->pauseText = d.Str(kMain, L"PauseText", L"Скоро вернусь");
     p->pauseImage = d.Str(kMain, L"PauseImage");
     p->idleFrame = d.Int(kMain, L"IdleFrame", 1) != 0;
+    p->nextFrame = d.Int(kMain, L"NextFrame", 1) != 0;
+    p->outPace = std::clamp(d.Int(kMain, L"PaceMode", 0), 0, 1);
+    p->scaleMode = std::clamp(d.Int(kMain, L"ScaleMode", 0), 0, 1);
+    p->captureMode = std::clamp(d.Int(kMain, L"CaptureMode", 0), 0, 1);
     p->keepCamOn = d.Int(kMain, L"KeepCamOn", 0) != 0;
     p->liveWhenStopped = d.Int(kMain, L"LiveWhenStopped", 1) != 0;
     p->minToTray = d.Int(kMain, L"MinToTray", 1) != 0;
@@ -1083,3 +1092,5 @@ bool SaveProject() {
     g_projDirty = false;
     return g_ini.Save(IniPath());
 }
+
+bool IsValidFps(int f) { return f == 24 || f == 30 || f == 50 || f == 60; }

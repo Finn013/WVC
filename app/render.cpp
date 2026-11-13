@@ -7,6 +7,8 @@ Published g_pubProgram, g_pubNext, g_pubSolo, g_pubCanvas;
 std::mutex g_soloMx;
 Item g_soloItem;
 std::atomic<int> g_fpsX10{0};
+std::atomic<int> g_composeAvgX10{0}, g_composeMaxX10{0};
+std::atomic<bool> g_pacedByInput{false};
 std::atomic<bool> g_resetCapture{false}, g_pauseDirty{false};
 std::atomic<int> g_transGen{0};
 std::atomic<bool> g_editingNext{false};
@@ -536,6 +538,7 @@ void DrawCardRect(HDC dc, const RECT& rc, const wchar_t* text, std::map<int, HFO
 struct MaskEntry {
     std::wstring key;
     std::vector<uint8_t> m;
+    std::vector<int> spans;  // per row: the fully opaque run (copied without blending)
 };
 
 struct AlphaPic {
@@ -553,7 +556,8 @@ struct AlphaOut {
 };
 
 struct InSurf {
-    Surface s;
+    Surface s;                       // GDI mode only
+    std::shared_ptr<VFrame> frame;   // fast mode: the input's picture itself, no copy
     uint64_t seq = ~0ull;
     int w = 0, h = 0;
 };
@@ -570,6 +574,8 @@ public:
     }
     HDC screenDC = nullptr;
     int screenFails = 0;
+    int scaleMode = 0, captureMode = 0;  // from the project, set by the render loop
+    ScreenCapture cap;
 
     // Scene into dst (W x H). slot separates caches (0 program, 1 next, 2 solo)
     void RenderScene(const Scene* sc, Surface& dst, int slot, bool cards) {
@@ -610,6 +616,8 @@ private:
     std::vector<uint8_t> scratch;
 
     struct View {
+        const uint8_t* mem = nullptr;  // fast mode: BGRA pixels of the source origin (screen via DXGI, inputs)
+        int memStride = 0;
         HDC dc = nullptr;
         double ox = 0, oy = 0;  // source rect origin inside dc
         double NW = 0, NH = 0;  // native (unrotated) size
@@ -625,6 +633,7 @@ private:
                                std::to_wstring(y0) + L"," + std::to_wstring(mw) + L"," + std::to_wstring(mh) + L"|" + sd.Key();
         if (e.key != k) {
             e.key = k;
+            e.spans.clear();
             if (mw == w && mh == h && x0 == 0 && y0 == 0) {
                 BuildShapeMask(w, h, sd, e.m);
             } else {
@@ -640,9 +649,11 @@ private:
                     e.m.assign(static_cast<size_t>(mw) * mh, 255);
                 }
             }
+            BuildMaskSpans(e.m.data(), mw, mh, e.spans);
         }
         return e.m;
     }
+    const std::vector<int>& Spans(int key) { return masks[key].spans; }
 
     bool GetView(const Item& it, View* v, double scaleHint) {
         switch (it.type) {
@@ -661,6 +672,7 @@ private:
             v->screen = true;
             v->scrX = r.left;
             v->scrY = r.top;
+            if (scaleMode == 0 && captureMode == 0) v->mem = cap.View(r, &v->memStride);
             return true;
         }
         case IT_WINDOW: {
@@ -691,6 +703,7 @@ private:
                 v->dc = screenDC;
                 v->ox = r.left;
                 v->oy = r.top;
+                if (scaleMode == 0 && captureMode == 0) v->mem = cap.View(r, &v->memStride);
             }
             return true;
         }
@@ -706,21 +719,23 @@ private:
             InSurf& is = inSurf[key];
             const uint64_t q = in->seq;
             if (q != is.seq) {
-                std::lock_guard<std::mutex> lk(in->mx);
-                if (in->buf.empty()) {
-                    is.w = is.h = 0;
-                } else if (is.s.Ensure(screenDC, in->w, in->h)) {
-                    std::memcpy(is.s.bits, in->buf.data(), static_cast<size_t>(in->w) * in->h * 4);
-                    is.w = in->w;
-                    is.h = in->h;
-                }
+                is.frame = in->Latest();
                 is.seq = q;
+                is.w = is.frame ? is.frame->w : 0;
+                is.h = is.frame ? is.frame->h : 0;
+                if (scaleMode != 0 && is.frame && is.s.Ensure(screenDC, is.w, is.h))
+                    std::memcpy(is.s.bits, is.frame->px.data(), static_cast<size_t>(is.w) * is.h * 4);
             }
-            if (!is.w) {
+            if (!is.w || !is.frame) {
                 v->card = InputMessage(it);
                 return true;
             }
-            v->dc = is.s.dc;
+            if (scaleMode == 0) {
+                v->mem = is.frame->px.data();
+                v->memStride = is.w * 4;
+            } else {
+                v->dc = is.s.dc;
+            }
             v->NW = is.w;
             v->NH = is.h;
             return true;
@@ -944,7 +959,12 @@ public:
             RenderAlpha(it, v, S, dst, vx0, vy0, vw, vh, mask, mstride, opacity, slot);
             return;
         }
-        // opaque GDI source
+        if (scaleMode == 0) {
+            RenderFast(it, v, S, dst, vx0, vy0, vw, vh, mask, mstride, trivialMask, opacity, mkey, hugeBox ? 0 : vx0 - cx0,
+                       hugeBox ? 0 : vy0 - cy0);
+            return;
+        }
+        // opaque GDI source (ScaleMode = 1: as before 0.13)
         const int sx = static_cast<int>(std::floor(v.ox + S.x0)), sy = static_cast<int>(std::floor(v.oy + S.y0));
         const int sw = (std::max)(1, static_cast<int>(std::lround(S.W()))), sh = (std::max)(1, static_cast<int>(std::lround(S.H())));
         const bool direct = (it.rot & 3) == 0 && !it.mirror && trivialMask && opacity == 255 && !(it.cursor && v.screen);
@@ -972,6 +992,58 @@ public:
     }
 
 private:
+    Surface grab;
+    // 0.13: everything in memory — source part -> antialiased resample (mirror folded in) -> rotation -> mask blend
+    void RenderFast(const Item& it, const View& v0, const RectD& S0, Surface& dst, int vx0, int vy0, int vw, int vh,
+                    const uint8_t* mask, int mstride, bool trivialMask, int opacity, int mkey, int spanX0, int spanY0) {
+        View v = v0;
+        RectD S = S0;
+        int memW = static_cast<int>(v.NW), memH = static_cast<int>(v.NH);
+        if (!v.mem) {
+            // GDI source (screen without DXGI, PrintWindow): copy just the needed part 1:1, then the same path
+            const int gx0 = static_cast<int>(std::floor(v.ox + S.x0)) - 1, gy0 = static_cast<int>(std::floor(v.oy + S.y0)) - 1;
+            const int gx1 = static_cast<int>(std::ceil(v.ox + S.x1)) + 1, gy1 = static_cast<int>(std::ceil(v.oy + S.y1)) + 1;
+            const int gw = (std::max)(1, gx1 - gx0), gh = (std::max)(1, gy1 - gy0);
+            if (!v.dc || !grab.Ensure(screenDC, gw, gh)) return;
+            if (!BitBlt(grab.dc, 0, 0, gw, gh, v.dc, gx0, gy0, SRCCOPY) && v.screen) ++screenFails;
+            GdiFlush();
+            v.mem = grab.bits;
+            v.memStride = gw * 4;
+            S = RectD{v.ox + S.x0 - gx0, v.oy + S.y0 - gy0, v.ox + S.x1 - gx0, v.oy + S.y1 - gy0};
+            v.ox = v.oy = 0;
+            // the cursor is placed relative to the source origin: shift it with the grab
+            v.scrX += gx0 - v0.ox;
+            v.scrY += gy0 - v0.oy;
+            memW = gw;
+            memH = gh;
+        }
+        const bool cursorOn = it.cursor && v.screen;
+        const int rot = it.rot & 3;
+        const bool foldMirror = rot == 0 && !cursorOn;
+        uint8_t* dstAt = dst.bits + (static_cast<size_t>(vy0) * dst.w + vx0) * 4;
+        const int dstStride = dst.w * 4;
+        if (rot == 0 && trivialMask && opacity == 255 && !cursorOn) {
+            ResampleBgra(v.mem, v.memStride, memW, memH, S.x0, S.y0, S.x1, S.y1, dstAt, dstStride, vw, vh, it.mirror);
+            return;
+        }
+        const int tw = (rot & 1) ? vh : vw, th = (rot & 1) ? vw : vh;
+        if (!tmpT.Ensure(screenDC, tw, th)) return;
+        ResampleBgra(v.mem, v.memStride, memW, memH, S.x0, S.y0, S.x1, S.y1, tmpT.bits, tw * 4, tw, th, foldMirror && it.mirror);
+        if (cursorOn) {
+            DrawCursorInto(tmpT, v, S);
+            GdiFlush();
+        }
+        const uint8_t* src = tmpT.bits;
+        if (rot != 0 || (it.mirror && !foldMirror)) {
+            if (!tmpU.Ensure(screenDC, vw, vh)) return;
+            TransformCopy(tmpT.bits, tw, th, tmpU.bits, vw * 4, vw, vh, rot, it.mirror && !foldMirror);
+            src = tmpU.bits;
+        }
+        const std::vector<int>* sp = trivialMask ? nullptr : &Spans(mkey);
+        BlendMaskedRows(dstAt, dstStride, src, vw * 4, vw, vh, trivialMask ? nullptr : mask, mstride,
+                        sp && !sp->empty() ? sp->data() + static_cast<size_t>(spanY0) * 2 : nullptr, spanX0, opacity);
+    }
+
     // pictures with transparency (logo, text): sampled in software, cached while nothing changes
     void RenderAlpha(const Item& it, const View& v, const RectD& S, Surface& dst, int vx0, int vy0, int vw, int vh,
                      const uint8_t* mask, int mstride, int opacity, int slot) {
@@ -1160,6 +1232,7 @@ static HMODULE g_camDll = nullptr;
 static PFN_scCreateCamera pCreate = nullptr;
 static PFN_scDeleteCamera pDelete = nullptr;
 static PFN_scSendFrame pSend = nullptr;
+static PFN_scSendFrame pSendNow = nullptr;  // WVCCam 0.13+: no pacing inside (the output follows a camera)
 static scCamera g_cam = nullptr;
 static std::thread g_renderTh;
 static std::atomic<bool> g_renderQuit{false};
@@ -1174,6 +1247,7 @@ bool LoadCameraDll() {
     pCreate = reinterpret_cast<PFN_scCreateCamera>(GetProcAddress(g_camDll, "scCreateCamera"));
     pDelete = reinterpret_cast<PFN_scDeleteCamera>(GetProcAddress(g_camDll, "scDeleteCamera"));
     pSend = reinterpret_cast<PFN_scSendFrame>(GetProcAddress(g_camDll, "scSendFrame"));
+    pSendNow = reinterpret_cast<PFN_scSendFrame>(GetProcAddress(g_camDll, "scSendFrameNow"));
     if (!pCreate || !pDelete || !pSend) {
         FreeLibrary(g_camDll);
         g_camDll = nullptr;
@@ -1182,23 +1256,27 @@ bool LoadCameraDll() {
     return true;
 }
 
-static void PublishScaled(Published& pub, Surface& src, const RECT* part, Surface& tmp, HDC ref) {
+// a smaller copy for the UI (keeps the picture's proportions inside the wanted size)
+static void PublishPx(Published& pub, const uint8_t* px, int stride, int W, int H, const RECT* part) {
     int ww = pub.wantW, wh = pub.wantH;
-    if (ww < 8 || wh < 8) return;
+    if (ww < 8 || wh < 8 || !px) return;
     const int sx = part ? part->left : 0, sy = part ? part->top : 0;
-    const int sw = part ? part->right - part->left : src.w, sh = part ? part->bottom - part->top : src.h;
-    // keep the picture's proportions inside the wanted size
+    const int sw = part ? part->right - part->left : W, sh = part ? part->bottom - part->top : H;
     const double s = (std::min)(static_cast<double>(ww) / sw, static_cast<double>(wh) / sh);
     ww = (std::max)(1, static_cast<int>(sw * s));
     wh = (std::max)(1, static_cast<int>(sh * s));
-    if (!tmp.Ensure(ref, ww, wh)) return;
-    StretchBlt(tmp.dc, 0, 0, ww, wh, src.dc, sx, sy, sw, sh, SRCCOPY);
-    GdiFlush();
+    thread_local std::vector<uint8_t> tmp;
+    tmp.resize(static_cast<size_t>(ww) * wh * 4);
+    ResampleBgra(px, stride, W, H, sx, sy, sx + sw, sy + sh, tmp.data(), ww * 4, ww, wh, false);
     std::lock_guard<std::mutex> lk(pub.mx);
-    pub.px.assign(tmp.bits, tmp.bits + static_cast<size_t>(ww) * wh * 4);
+    pub.px.swap(tmp);
     pub.w = ww;
     pub.h = wh;
     ++pub.seq;
+}
+
+static void PublishScaled(Published& pub, Surface& src, const RECT* part) {
+    PublishPx(pub, src.bits, src.w * 4, src.w, src.h, part);
 }
 
 // pause / stopped picture (BGRA)
@@ -1241,25 +1319,39 @@ static bool SceneReady(const Scene* sc) {
         const int st = in->status;
         if (st == 3) continue;
         if (st != 2) return false;
-        std::lock_guard<std::mutex> lk(in->mx);
-        if (in->buf.empty()) return false;
+        if (!in->Latest()) return false;
     }
     return true;
 }
 
-static void PublishBgra(Published& pub, const uint8_t* px, int W, int H, Surface& src, Surface& tmp, HDC ref) {
-    // px -> src surface -> scaled publish
-    if (!src.Ensure(ref, W, H)) return;
-    if (src.bits != px) std::memcpy(src.bits, px, static_cast<size_t>(W) * H * 4);
-    PublishScaled(pub, src, nullptr, tmp, ref);
+static void PublishBgra(Published& pub, const uint8_t* px, int W, int H) { PublishPx(pub, px, W * 4, W, H, nullptr); }
+
+// the camera / phone the output follows (its rate is close to the output's): the biggest one in the scene
+static std::shared_ptr<Input> PaceInput(const Scene* sc, int fps, int W, int H) {
+    if (!sc) return nullptr;
+    std::shared_ptr<Input> best;
+    double bestArea = 0;
+    for (const auto& it : sc->items) {
+        if (!it.visible || (it.type != IT_WEBCAM && it.type != IT_PHONE)) continue;
+        auto in = GetInput(InputKeyOf(it));
+        if (!in || in->status != 2) continue;
+        const int f = in->FpsX10();
+        if (f < fps * 10 * 88 / 100 || f > fps * 10 * 112 / 100) continue;  // only when the rates match (29.97 ≈ 30)
+        const double area = it.w * W * it.h * H;
+        if (area > bestArea) {
+            bestArea = area;
+            best = in;
+        }
+    }
+    return best;
 }
 
-static void PackBgra(const uint8_t* p, uint8_t* dst, size_t n) {
-    for (size_t i = 0; i < n; ++i, p += 4, dst += 3) {
-        dst[0] = p[0];
-        dst[1] = p[1];
-        dst[2] = p[2];
-    }
+static std::mutex g_statsMx;
+static std::wstring g_statsLine;
+
+std::wstring RenderStatsLine() {
+    std::lock_guard<std::mutex> lk(g_statsMx);
+    return g_statsLine;
 }
 
 // The render thread. Two transition channels:
@@ -1267,9 +1359,10 @@ static void PackBgra(const uint8_t* p, uint8_t* dst, size_t n) {
 //  B «камера»: start / stop / pause — only what the camera gets.
 static void RenderLoop(int W, int H, int fps) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     std::unique_ptr<Renderer> rnd(new Renderer());
     OutputStage stage;
-    Surface canvas, out, pubTmp, nextSurf, soloSurf, pauseSurf, trPub;
+    Surface canvas, out, nextSurf, soloSurf, pauseSurf;
     const size_t npx = static_cast<size_t>(W) * H;
     std::vector<uint8_t> camBGR(npx * 3, 0), lastLive(npx * 4, 0), lastCam(npx * 4, 0);
     bool haveLastLive = false, haveLastCam = false, haveShownA = false;
@@ -1277,18 +1370,19 @@ static void RenderLoop(int W, int H, int fps) {
     TransEngine trA, trB;
     std::wstring keyA, keyB, pauseKey;
     int frames = 0, tick = 0;
-    ULONGLONG fpsT0 = GetTickCount64();
+    ULONGLONG fpsT0 = GetTickCount64(), logAt = GetTickCount64();
     int ver = -1;
     Project p;
-    const DWORD period = static_cast<DWORD>(1000 / (std::max)(1, fps));
+    // timing: QPC, the frame period in ticks (1000/60 is not a whole number of ms)
+    LARGE_INTEGER qf, qn;
+    QueryPerformanceFrequency(&qf);
+    const double tickMs = 1000.0 / static_cast<double>(qf.QuadPart);
+    const double periodMs = 1000.0 / (std::max)(1, fps);
+    double composeSum = 0, composeMax = 0, waitSum = 0;
+    int composeN = 0, pacedFrames = 0;
+    std::shared_ptr<Input> pace;
     LogMsg(L"Камера: " + std::to_wstring(W) + L"×" + std::to_wstring(H) + L", " + std::to_wstring(fps) + L" к/с");
     while (!g_renderQuit) {
-        const ULONGLONG t0 = GetTickCount64();
-        if (g_resetCapture.exchange(false) || rnd->screenFails > 15) {
-            if (rnd->screenFails > 15) LogErr(L"Захват экрана не удался 15 раз подряд — пересоздаю");
-            rnd.reset(new Renderer());
-            pauseKey.clear();
-        }
         const int v = g_projVer;
         if (v != ver) {
             p = ProjSnapshot();
@@ -1297,6 +1391,29 @@ static void RenderLoop(int W, int H, int fps) {
         ++tick;
         const bool live = g_streaming && !g_paused;
         const Scene* cur = CurSceneC(p);
+        // follow the camera: wait for its next picture, so every camera frame is sent exactly once (no beat between
+        // two 30 fps clocks that shows as a skipped / doubled frame)
+        if (tick % 15 == 1) pace = (p.outPace == 0 && live) ? PaceInput(cur, fps, W, H) : nullptr;
+        bool paced = false;
+        if (pace && live && g_cam && !trA.Active() && !trB.Active()) {
+            LARGE_INTEGER w0, w1;
+            QueryPerformanceCounter(&w0);
+            paced = WaitForSingleObject(pace->newFrameEv, static_cast<DWORD>(periodMs * 1.5) + 2) == WAIT_OBJECT_0;
+            QueryPerformanceCounter(&w1);
+            waitSum += (w1.QuadPart - w0.QuadPart) * tickMs;
+        }
+        g_pacedByInput = paced;
+        if (paced) ++pacedFrames;
+        QueryPerformanceCounter(&qn);
+        const LONGLONG t0 = qn.QuadPart;
+        if (g_resetCapture.exchange(false) || rnd->screenFails > 15) {
+            if (rnd->screenFails > 15) LogErr(L"Захват экрана не удался 15 раз подряд — пересоздаю");
+            rnd.reset(new Renderer());
+            pauseKey.clear();
+        }
+        rnd->scaleMode = p.scaleMode;
+        rnd->captureMode = p.captureMode;
+        rnd->cap.NewFrame();
         const bool wantProg = live || g_pubProgram.wantW > 0 || g_pubCanvas.wantW > 0;
         // --- channel A trigger: checked BEFORE the new scene is drawn, so the old picture is still in the buffers
         {
@@ -1311,14 +1428,13 @@ static void RenderLoop(int W, int H, int fps) {
         if (wantProg && canvas.Ensure(rnd->screenDC, W, H)) {
             rnd->screenFails = 0;
             rnd->RenderScene(cur, canvas, 0, true);
-            if (g_pubCanvas.wantW > 0) PublishScaled(g_pubCanvas, canvas, nullptr, pubTmp, rnd->screenDC);
+            if (g_pubCanvas.wantW > 0) PublishScaled(g_pubCanvas, canvas, nullptr);
             RECT V = stage.Apply(p.out, canvas, rnd->screenDC);
             const bool full = V.left == 0 && V.top == 0 && V.right == W && V.bottom == H;
             if (full) {
                 progFrame = canvas.bits;
             } else if (out.Ensure(rnd->screenDC, W, H)) {
-                StretchBlt(out.dc, 0, 0, W, H, canvas.dc, V.left, V.top, V.right - V.left, V.bottom - V.top, SRCCOPY);
-                GdiFlush();
+                ResampleBgra(canvas.bits, W * 4, W, H, V.left, V.top, V.right, V.bottom, out.bits, W * 4, W, H, false);
                 progFrame = out.bits;
             }
             const uint8_t* shown = progFrame ? trA.Step(progFrame, W, H, SceneReady(cur), rnd->screenDC) : nullptr;
@@ -1326,9 +1442,9 @@ static void RenderLoop(int W, int H, int fps) {
             haveShownA = shown != nullptr;
             if (g_pubProgram.wantW > 0 && (tick % 2 == 0 || fps <= 30)) {
                 if (shown && shown != progFrame)
-                    PublishBgra(g_pubProgram, shown, W, H, trPub, pubTmp, rnd->screenDC);  // transition in the preview
+                    PublishBgra(g_pubProgram, shown, W, H);  // transition in the preview
                 else
-                    PublishScaled(g_pubProgram, canvas, nullptr, pubTmp, rnd->screenDC);
+                    PublishScaled(g_pubProgram, canvas, nullptr);
             }
             progFrame = shown;
         } else {
@@ -1372,8 +1488,10 @@ static void RenderLoop(int W, int H, int fps) {
         const uint8_t* camIn = nullptr;
         if (live && progFrame) {
             camIn = progFrame;
-            std::memcpy(lastLive.data(), progFrame, npx * 4);
-            haveLastLive = true;
+            if (p.pauseMode == 0) {  // «последний кадр» on pause needs a copy; other pause modes do not
+                std::memcpy(lastLive.data(), progFrame, npx * 4);
+                haveLastLive = true;
+            }
             pauseKey.clear();
         } else if (!live) {
             if (p.pauseMode == 0) {
@@ -1403,20 +1521,61 @@ static void RenderLoop(int W, int H, int fps) {
         if (send) {
             if (send != lastCam.data()) std::memcpy(lastCam.data(), send, npx * 4);
             haveLastCam = true;
-            PackBgra(lastCam.data(), camBGR.data(), npx);
+            if (g_cam) PackBgraToBgr(lastCam.data(), camBGR.data(), W, H);
         }
+        QueryPerformanceCounter(&qn);
+        const double ms = (qn.QuadPart - t0) * tickMs;
+        composeSum += ms;
+        composeMax = (std::max)(composeMax, ms);
+        ++composeN;
         const ULONGLONG now = GetTickCount64();
         ++frames;
         if (now - fpsT0 >= 1000) {
             g_fpsX10 = static_cast<int>(frames * 10000 / (now - fpsT0));
+            g_composeAvgX10 = composeN ? static_cast<int>(composeSum / composeN * 10) : 0;
+            g_composeMaxX10 = static_cast<int>(composeMax * 10);
+            wchar_t b[200];
+            swprintf(b, 200, L"Вывод %.1f к/с из %d · кадр %.1f мс (макс. %.1f)%ls", g_fpsX10 / 10.0, fps, g_composeAvgX10 / 10.0,
+                     g_composeMaxX10 / 10.0, pacedFrames * 2 > frames ? L" · темп по камере" : L"");
+            std::wstring line = b;
+            // sources of the scene on air
+            if (cur)
+                for (const auto& it : cur->items) {
+                    if (!it.visible || (it.type != IT_WEBCAM && it.type != IT_PHONE && it.type != IT_MEDIA)) continue;
+                    const InputStats st = InputStatsFor(InputKeyOf(it));
+                    if (!st.exists) continue;
+                    swprintf(b, 200, L" · «%ls» %.1f к/с", it.name.substr(0, 24).c_str(), st.fpsX10 / 10.0);
+                    line += b;
+                }
+            {
+                std::lock_guard<std::mutex> lk(g_statsMx);
+                g_statsLine = line;
+            }
+            if (live && now - logAt >= 10000) {
+                logAt = now;
+                swprintf(b, 200, L" · ожидание камеры %.1f мс/кадр", frames ? waitSum / frames : 0.0);
+                LogMsg(line + (pacedFrames ? std::wstring(b) : std::wstring()) + L" · экран: " + rnd->cap.Status());
+                if (cur)
+                    for (const auto& it : cur->items) {
+                        if (!it.visible || it.type != IT_WEBCAM) continue;
+                        const InputStats st = InputStatsFor(InputKeyOf(it));
+                        if (st.exists && !st.info.empty()) LogMsg(L"  «" + it.name + L"»: " + st.info + L", получено " +
+                                                                  std::to_wstring(st.fpsX10 / 10) + L"." +
+                                                                  std::to_wstring(st.fpsX10 % 10) + L" к/с");
+                    }
+            }
             frames = 0;
             fpsT0 = now;
+            composeSum = composeMax = waitSum = 0;
+            composeN = pacedFrames = 0;
         }
         if (g_cam && pSend) {
-            pSend(g_cam, camBGR.data());  // paces itself to the camera FPS
+            if (paced && pSendNow) pSendNow(g_cam, camBGR.data());  // the camera set the pace
+            else pSend(g_cam, camBGR.data());                       // paces itself to the camera FPS
         } else {
-            const ULONGLONG spent = GetTickCount64() - t0;
-            if (spent < period) Sleep(static_cast<DWORD>(period - spent));
+            QueryPerformanceCounter(&qn);
+            const double spent = (qn.QuadPart - t0) * tickMs;
+            if (spent < periodMs) Sleep(static_cast<DWORD>(periodMs - spent));
         }
         if (!g_cam && !wantProg) Sleep(30);
     }
@@ -1445,6 +1604,7 @@ void RenderStart() {
     }
     if (!g_camOk && pCreate) LogErr(L"Не удалось создать виртуальную камеру (scCreateCamera)");
     g_renderQuit = false;
+    timeBeginPeriod(1);  // 1 ms sleeps and timers while the camera runs
     g_renderTh = std::thread(RenderLoop, W, H, p.out.fps);
 }
 
@@ -1452,6 +1612,7 @@ void RenderStop() {
     if (g_renderTh.joinable()) {
         g_renderQuit = true;
         g_renderTh.join();
+        timeEndPeriod(1);
     }
     if (g_cam) {
         pDelete(g_cam);

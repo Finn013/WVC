@@ -386,6 +386,7 @@ enum {
     S_HK0 = 400, S_HKCLR0 = 450, S_HKDEF = 499,
     S_PCONN = 500, S_PRES, S_PCODEC, S_PROT,
     S_GLARE = 250, S_UPDCHECK, S_UPDNOW, S_PHOLDER, S_PHOLDER_BTN, S_PHOLDER_CLR, S_LOGWIN,
+    S_NEXTFRAME = 260, S_PACE, S_SCALE, S_CAPTURE,
     S_KEEPCAM = 600, S_INSTALL, S_UNINSTALL, S_CAMSTATE, S_EXPORT, S_IMPORT, S_OPENDIR,
 };
 const int kPages = 5;
@@ -441,6 +442,10 @@ void SyncAll() {
     BSet(S_MINTRAY, p.minToTray);
     BSet(S_CLOSETRAY, p.closeToTray);
     BSet(S_IDLEFRAME, p.idleFrame);
+    BSet(S_NEXTFRAME, p.nextFrame);
+    CSet(S_PACE, p.outPace);
+    CSet(S_SCALE, p.scaleMode);
+    CSet(S_CAPTURE, p.captureMode);
     BSet(S_LIVE, p.liveWhenStopped);
     BSet(S_GLARE, p.hideStartGlare);
     BSet(S_UPDCHECK, p.checkUpdates);
@@ -466,7 +471,7 @@ void SyncAll() {
         }
     SendMessageW(nc, CB_SETCURSEL, sel, 0);
     EnableWindow(nc, p.out.native);
-    CSet(S_FPS, p.out.fps == 60 ? 1 : 0);
+    CSet(S_FPS, p.out.fps == 24 ? 0 : p.out.fps == 50 ? 2 : p.out.fps == 60 ? 3 : 1);
     CSet(S_OSHAPE, p.out.shape.kind);
     SendMessageW(Q(S_ORADIUS), TBM_SETPOS, TRUE, p.out.shape.radius);
     SendMessageW(Q(S_OFEATHER), TBM_SETPOS, TRUE, p.out.shape.feather);
@@ -499,6 +504,10 @@ void ReadAll() {
     p.minToTray = BGet(S_MINTRAY);
     p.closeToTray = BGet(S_CLOSETRAY);
     p.idleFrame = BGet(S_IDLEFRAME);
+    p.nextFrame = BGet(S_NEXTFRAME);
+    p.outPace = std::clamp(CGet(S_PACE), 0, 1);
+    p.scaleMode = std::clamp(CGet(S_SCALE), 0, 1);
+    p.captureMode = std::clamp(CGet(S_CAPTURE), 0, 1);
     p.liveWhenStopped = BGet(S_LIVE);
     p.hideStartGlare = BGet(S_GLARE);
     p.checkUpdates = BGet(S_UPDCHECK);
@@ -512,7 +521,11 @@ void ReadAll() {
     const int ni = CGet(S_NATIVE);
     if (ni >= 0 && ni < static_cast<int>(s.nativeUids.size())) p.out.nativeUid = s.nativeUids[static_cast<size_t>(ni)];
     if (p.out.native && !FindItemC(p, p.out.nativeUid)) p.out.native = false;
-    p.out.fps = CGet(S_FPS) == 1 ? 60 : 30;
+    {
+        static const int kFps[4] = {24, 30, 50, 60};
+        const int fi = CGet(S_FPS);
+        p.out.fps = fi >= 0 && fi < 4 ? kFps[fi] : 30;
+    }
     p.out.shape.kind = std::clamp(CGet(S_OSHAPE), 0, SH_COUNT - 1);
     p.out.shape.radius = static_cast<int>(SendMessageW(Q(S_ORADIUS), TBM_GETPOS, 0, 0));
     p.out.shape.feather = static_cast<int>(SendMessageW(Q(S_OFEATHER), TBM_GETPOS, 0, 0));
@@ -549,6 +562,10 @@ bool Apply() {
         p.pauseText = w.pauseText;
         p.pauseImage = w.pauseImage;
         p.idleFrame = w.idleFrame;
+        p.nextFrame = w.nextFrame;
+        p.outPace = w.outPace;
+        p.scaleMode = w.scaleMode;
+        p.captureMode = w.captureMode;
         p.keepCamOn = w.keepCamOn;
         p.liveWhenStopped = w.liveWhenStopped;
         p.minToTray = w.minToTray;
@@ -824,6 +841,9 @@ void BuildPages(SetState& s, int formW, int formH, int formX) {
         keep(S_MINTRAY, f.Check(L"Сворачивать в трей", S_MINTRAY));
         keep(S_CLOSETRAY, f.Check(L"Крестик прячет окно в трей (выход — «Выход»)", S_CLOSETRAY));
         keep(S_IDLEFRAME, f.Check(L"Зелёная рамка вокруг области, пока камера остановлена", S_IDLEFRAME));
+        keep(S_NEXTFRAME, f.Check(L"Показывать пунктир следующей сцены", S_NEXTFRAME));
+        f.Hint(L"Синий пунктир на экране — какой участок (и в какой форме) возьмёт сцена в «Следующий». Область можно "
+               L"заранее двигать за ярлык и растягивать за края. В эфир пунктир не попадает.", 2);
         keep(S_LIVE, f.Check(L"Живой предпросмотр, пока камера остановлена (источники включены)", S_LIVE));
         f.Hint(L"Без живого предпросмотра веб-камера и телефон включаются только во время трансляции, как раньше.", 2);
         keep(S_GLARE, f.Check(L"Скрывать засвет при старте веб-камеры и камеры телефона", S_GLARE));
@@ -862,10 +882,18 @@ void BuildPages(SetState& s, int formW, int formH, int formX) {
         keep(S_QUALITY, f.Combo(L"Размер:", S_QUALITY, {L"720p (1280×720 при 16:9)", L"1080p (1920×1080 при 16:9)", L"Как у источника"}, 240));
         keep(S_ASPECT, f.Combo(L"Пропорции:", S_ASPECT, {L"16:9", L"4:3", L"1:1", L"9:16 (вертикально)"}, 240));
         keep(S_NATIVE, f.Combo(L"Источник (для «как у»):", S_NATIVE, {}));
-        keep(S_FPS, f.Combo(L"Кадров в секунду:", S_FPS, {L"30", L"60"}, 120));
+        keep(S_FPS, f.Combo(L"Кадров в секунду:", S_FPS, {L"24", L"30", L"50", L"60"}, 120));
         f.Hint(L"«Как у источника» — размер камеры = размер картинки выбранного источника (напр. веб-камера 1280×720, "
                L"телефон 1080×1920), не больше 1920 по длинной стороне. Смена формата перезапускает камеру: в "
                L"Zoom/Telegram выключите и включите видео.", 3);
+        f.Header(L"Плавность");
+        keep(S_PACE, f.Combo(L"Темп вывода:", S_PACE, {L"Авто: по веб-камере / телефону", L"Ровный таймер"}, 260));
+        f.Hint(L"«Авто»: если частота камеры в сцене близка к выбранной, WVC отдаёт каждый её кадр сразу, как он пришёл "
+               L"(без пропусков и повторов). Иначе — ровный таймер.", 2);
+        keep(S_SCALE, f.Combo(L"Масштабирование:", S_SCALE, {L"Быстрое, сглаженное (рекомендуется)", L"GDI, как в 0.12 (медленнее)"}, 260));
+        keep(S_CAPTURE, f.Combo(L"Захват экрана:", S_CAPTURE, {L"Авто: DXGI (быстро), иначе GDI", L"Только GDI (совместимость)"}, 260));
+        f.Hint(L"Фактические к/с вывода, время сборки кадра и к/с каждой камеры — в строке состояния и в «Журнале» "
+               L"(каждые 10 с во время эфира).", 2);
         f.Header(L"Кадр камеры (вывод)");
         keep(S_OUTPREV, f.Make(L"WVCOutPrev", L"", 0, S_OUTPREV, f.lx, f.y, f.cx + f.cw - f.lx, 190));
         f.y += 196;
