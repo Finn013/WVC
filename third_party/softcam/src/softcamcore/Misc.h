@@ -48,6 +48,8 @@ class SharedMemory
     SharedMemory() {}
     static SharedMemory create(const char* name, unsigned long size);
     static SharedMemory open(const char* name);
+    // WVC 0.14: create, or map the existing block of that name (*existed = true) instead of failing
+    static SharedMemory createOrOpen(const char* name, unsigned long size, bool* existed);
 
     explicit operator bool() const { return get() != nullptr; }
 
@@ -62,6 +64,7 @@ class SharedMemory
 
     explicit SharedMemory(const char* name, unsigned long size);
     explicit SharedMemory(const char* name);
+    void    mapExisting();
     void    release();
 
     static void closeHandle(void*);

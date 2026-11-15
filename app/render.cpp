@@ -12,8 +12,9 @@ std::atomic<bool> g_pacedByInput{false};
 std::atomic<bool> g_resetCapture{false}, g_pauseDirty{false};
 std::atomic<int> g_transGen{0};
 std::atomic<bool> g_editingNext{false};
-int g_camW = 0, g_camH = 0, g_camFps = 0;
-bool g_camOk = false;
+std::atomic<int> g_camW{0}, g_camH{0}, g_camFps{0};
+int g_outW = 0, g_outH = 0, g_outFps = 0;
+std::atomic<bool> g_camOk{false};
 
 static const COLORREF kTextColors[8] = {RGB(255, 255, 255), RGB(255, 220, 0), RGB(0, 0, 0),     RGB(230, 40, 40),
                                         RGB(40, 200, 80),   RGB(60, 120, 255), RGB(255, 140, 0), RGB(0, 220, 230)};
@@ -1382,7 +1383,26 @@ static void RenderLoop(int W, int H, int fps) {
     int composeN = 0, pacedFrames = 0;
     std::shared_ptr<Input> pace;
     LogMsg(L"Камера: " + std::to_wstring(W) + L"×" + std::to_wstring(H) + L", " + std::to_wstring(fps) + L" к/с");
+    ULONGLONG camTryAt = GetTickCount64();
+    int camTries = 0;
     while (!g_renderQuit) {
+        // 0.14: no camera yet (the old block was still held, or the DLL refused): try again every 300 ms
+        if (!g_cam && pCreate && GetTickCount64() - camTryAt >= 300) {
+            camTryAt = GetTickCount64();
+            ++camTries;
+            if (scCamera c = pCreate(W, H, static_cast<float>(fps))) {
+                g_cam = c;
+                g_camW = W;
+                g_camH = H;
+                g_camFps = fps;
+                g_camOk = true;
+                LogMsg(L"Виртуальная камера создана с повторной попытки (" + std::to_wstring(camTries + 1) + L"): " +
+                       std::to_wstring(W) + L"×" + std::to_wstring(H) + L", " + std::to_wstring(fps) + L" к/с");
+            } else if (camTries % 100 == 0) {
+                LogErr(L"Виртуальная камера всё ещё не создана (" + std::to_wstring(W) + L"×" + std::to_wstring(H) + L", " +
+                       std::to_wstring(fps) + L" к/с), попыток: " + std::to_wstring(camTries + 1));
+            }
+        }
         const int v = g_projVer;
         if (v != ver) {
             p = ProjSnapshot();
@@ -1591,9 +1611,15 @@ void RenderStart() {
         g_cam = pCreate(W, H, static_cast<float>(p.out.fps));
         g_camOk = g_cam != nullptr;
     }
-    g_camW = W;
-    g_camH = H;
-    g_camFps = p.out.fps;
+    // 0.14: g_camW/H/Fps describe the camera that really exists; on failure the render thread keeps retrying
+    if (g_camOk) {
+        g_camW = W;
+        g_camH = H;
+        g_camFps = p.out.fps;
+    }
+    g_outW = W;
+    g_outH = H;
+    g_outFps = p.out.fps;
     // the camera DLL shows its placeholder at this size while WVC is closed
     HKEY k;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\WVC", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
@@ -1602,7 +1628,10 @@ void RenderStart() {
         for (int i = 0; i < 3; ++i) RegSetValueExW(k, names[i], 0, REG_DWORD, reinterpret_cast<const BYTE*>(&vals[i]), sizeof(DWORD));
         RegCloseKey(k);
     }
-    if (!g_camOk && pCreate) LogErr(L"Не удалось создать виртуальную камеру (scCreateCamera)");
+    if (!g_camOk && pCreate)
+        LogErr(L"Не удалось создать виртуальную камеру (scCreateCamera) " + std::to_wstring(W) + L"×" + std::to_wstring(H) + L", " +
+               std::to_wstring(p.out.fps) + L" к/с" + ((W % 4 || H % 4) ? L" — размер не кратен 4" : L"") +
+               L"; повторяю каждые 0,3 с");
     g_renderQuit = false;
     timeBeginPeriod(1);  // 1 ms sleeps and timers while the camera runs
     g_renderTh = std::thread(RenderLoop, W, H, p.out.fps);

@@ -23,6 +23,7 @@ class FrameBuffer
                         int             height,
                         float           framerate = 0.0f);
     static FrameBuffer open();
+    static FrameBuffer none();   // WVC 0.14: an empty one (no shared memory held)
 
     FrameBuffer& operator =(const FrameBuffer&);
     explicit operator bool() const { return handle() != nullptr; }
@@ -40,6 +41,10 @@ class FrameBuffer
     void            transferToDIB(void* image_bits, uint64_t* out_frame_counter);
     // WVC: the sender's picture fitted (keeping proportions, black bars) into a DIB of another size
     void            transferToDIBScaled(void* image_bits, int dst_width, int dst_height, uint64_t* out_frame_counter);
+    // WVC 0.14: the same into a rectangle (top-down coordinates) of a bottom-up RGB24 DIB with any stride;
+    // the rectangle is cleared to black around the picture, the rest of the DIB is not touched
+    void            transferToDIBRect(void* image_bits, int dst_stride, int dst_rows,
+                                      int rx, int ry, int rw, int rh, uint64_t* out_frame_counter);
     bool            waitForNewFrame(uint64_t frame_counter, float time_out = 0.5f);
 
     void            release();

@@ -1,2 +1,28 @@
+#include <winres.h>
+
 // WVC Camera DLL: the icon drawn on the placeholder frame while WVC is closed
 1 ICON "wvc.ico"
+
+// WVC 0.14: the version WVC checks against the registered camera (keep in step with app/common.h WVC_VERSION)
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,14,0,0
+ PRODUCTVERSION 0,14,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "WVC Camera - virtual camera filter (DirectShow)"
+            VALUE "FileVersion", "0.14.0"
+            VALUE "ProductName", "WVC"
+            VALUE "ProductVersion", "0.14.0"
+            VALUE "LegalCopyright", "MIT (based on tshino/softcam)"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

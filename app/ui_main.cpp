@@ -91,9 +91,9 @@ static void SetEditNext(bool on) {
 }
 
 void UiOutputSize(int* W, int* H) {
-    if (g_camW > 0 && g_camH > 0) {
-        *W = g_camW;
-        *H = g_camH;
+    if (g_outW > 0 && g_outH > 0) {
+        *W = g_outW;
+        *H = g_outH;
         return;
     }
     Project p = ProjSnapshot();
@@ -621,10 +621,9 @@ static void ItemContextMenu(int uid, POINT pt) {
 // Streaming control
 // ---------------------------------------------------------------------------
 static void ToggleStreaming() {
-    if (!g_streaming && !g_camOk) {
+    if (!g_streaming && !CameraDllLoaded()) {
         MessageBoxW(g_main,
-                    CameraDllLoaded() ? L"Не удалось запустить виртуальную камеру." :
-                                        L"Не найден WVCCam.dll рядом с WVC.exe — распакуйте WVC.zip целиком.",
+                    L"Не найден WVCCam.dll рядом с WVC.exe — распакуйте WVC.zip целиком.",
                     L"WVC", MB_ICONERROR);
         return;
     }
@@ -2104,7 +2103,7 @@ void UiStatus() {
     if (!CameraDllLoaded())
         s = L"Нет WVCCam.dll рядом с WVC.exe — камера недоступна. ";
     else if (!g_camOk)
-        s = L"Камера не запустилась. ";
+        s = L"Камера ещё не создана — WVC повторяет попытку (см. «Журнал»). ";
     else {
         const int inst = CameraInstallState();
         if (inst == 0) s = L"Камера «WVC Camera» не установлена в Windows: «Настройки → Дополнительно → Установить». ";
@@ -2792,7 +2791,7 @@ void FollowTick() {
         int nw = 0, nh = 0;
         if (it && NativeSize(it->uid, &nw, &nh)) {
             const RectD d1 = ItemSourceRect(*it, nw, nh);
-            int w = static_cast<int>(d1.W()) & ~1, h = static_cast<int>(d1.H()) & ~1;
+            int w = static_cast<int>(d1.W()) & ~3, h = static_cast<int>(d1.H()) & ~3;  // 0.14: the camera needs multiples of 4
             if (w >= 64 && h >= 64 && (w != p.out.nativeW || h != p.out.nativeH)) {
                 if (g_nativeCand != std::make_pair(w, h)) {
                     g_nativeCand = {w, h};
@@ -2809,7 +2808,7 @@ void FollowTick() {
     }
     int ow, oh;
     OutSizeFor(p.out, &ow, &oh);
-    if (ow != g_camW || oh != g_camH || p.out.fps != g_camFps) {
+    if (ow != g_outW || oh != g_outH || p.out.fps != g_outFps) {
         RestartCameraForFormat(p.out.native ? L"Формат камеры теперь как у источника: " : nullptr);
         structural = true;
     }
@@ -3334,7 +3333,8 @@ void RestartCameraForFormat(const wchar_t* note) {
     UiOutputSize(&W, &H);
     std::wstring n = note ? note : L"Формат камеры изменён: ";
     n += std::to_wstring(W) + L"×" + std::to_wstring(H) + L". В Zoom/Telegram может понадобиться выключить и включить видео.";
-    if (!g_camOk && CameraDllLoaded()) n = L"Не удалось перезапустить камеру.";
+    if (!g_camOk && CameraDllLoaded())
+        n = L"Камера пока не создана (старый формат ещё занят приложением?) — WVC повторяет попытку каждые 0,3 с, подробности в «Журнале».";
     SetNote(n);
 }
 
@@ -3496,7 +3496,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
         g_uiVisible = false;
     }
     UiStatus();
-    if (g_ini.Int(L"WVC", L"AutoStream", 0) && g_camOk) ToggleStreaming();
+    CheckCameraRegistration();  // 0.14: an old / other-folder registration is the usual reason Zoom can't start the camera
+    UiStatus();
+    if (g_ini.Int(L"WVC", L"AutoStream", 0) && CameraDllLoaded()) ToggleStreaming();
     if (ProjSnapshot().checkUpdates) CheckUpdates(false);
 
     MSG msg;

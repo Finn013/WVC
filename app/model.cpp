@@ -133,8 +133,8 @@ void OutSizeFor(const OutputCfg& o, int* w, int* h) {
             nw = static_cast<int>(nw * lim);
             nh = static_cast<int>(nh * lim);
         }
-        *w = (std::max)(64, nw & ~1);
-        *h = (std::max)(64, nh & ~1);
+        *w = (std::max)(64, nw & ~3);  // 0.14: the camera DLL needs multiples of 4
+        *h = (std::max)(64, nh & ~3);
         return;
     }
     static const int sz[2][4][2] = {

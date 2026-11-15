@@ -1,12 +1,23 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 #include <baseclasses/streams.h>
 #include "FrameBuffer.h"
 
 
 namespace softcam {
 
+
+// WVC 0.14: one video format the camera offers (RGB24)
+struct VideoFormat
+{
+    int     width;
+    int     height;
+    float   framerate;
+};
+
+class SoftcamStream;
 
 class Softcam : public CSource, public IAMStreamConfig
 {
@@ -27,20 +38,25 @@ public:
     HRESULT STDMETHODCALLTYPE GetStreamCaps(int index, AM_MEDIA_TYPE **out_pmt, BYTE *out_scc) override;
 
     FrameBuffer*    getFrameBuffer();
-    bool            valid() const { return m_valid; }
-    int             width() const { return m_width; }
-    int             height() const { return m_height; }
-    float           framerate() const { return m_framerate; }
     void            releaseFrameBuffer();
+
+    // WVC 0.14: a fixed list of formats that does not depend on whether WVC is running
+    const std::vector<VideoFormat>& formats() const { return m_formats; }
+    VideoFormat     defaultFormat() const { return m_formats.front(); }
+    VideoFormat     preferredFormat();          // the one set by SetFormat, else the default
+    bool            setFormat(VideoFormat* out); // true when SetFormat chose one
 
 private:
     CCritSec    m_critsec;
     FrameBuffer m_frame_buffer;
     unsigned long m_last_open_try = 0;  // WVC: GetTickCount of the last attempt to find the sender
-    const bool  m_valid;
-    const int   m_width;
-    const int   m_height;
-    const float m_framerate;
+
+    CCritSec    m_fmt_lock;
+    std::vector<VideoFormat> m_formats;
+    bool        m_has_set = false;
+    VideoFormat m_set{};
+
+    SoftcamStream*  stream();
 
     Softcam(LPUNKNOWN lpunk, const GUID& clsid, HRESULT *phr);
 };
@@ -58,6 +74,7 @@ class SoftcamStream : public CSourceStream, public IKsPropertySet, public IAMStr
 
     // CBasePin
     STDMETHODIMP Notify(IBaseFilter * pSender, Quality q) override;
+    HRESULT SetMediaType(const CMediaType *pmt) override;
 
     // CBaseOutputPin
     // Ask for buffers of the size appropriate to the agreed media type
@@ -67,7 +84,10 @@ class SoftcamStream : public CSourceStream, public IKsPropertySet, public IAMStr
     // CSourceStream
     HRESULT FillBuffer(IMediaSample *pms) override;
     HRESULT GetMediaType(CMediaType *pMediaType) override;
+    HRESULT GetMediaType(int iPosition, CMediaType *pMediaType) override;
+    HRESULT CheckMediaType(const CMediaType *pMediaType) override;
     HRESULT OnThreadCreate(void) override;
+    HRESULT OnThreadDestroy(void) override;
 
     //  IKsPropertySet
     HRESULT STDMETHODCALLTYPE Set(REFGUID guidPropSet, DWORD dwPropID,
@@ -85,18 +105,25 @@ class SoftcamStream : public CSourceStream, public IKsPropertySet, public IAMStr
     HRESULT STDMETHODCALLTYPE GetNumberOfCapabilities(int *out_count, int *out_size) override;
     HRESULT STDMETHODCALLTYPE GetStreamCaps(int index, AM_MEDIA_TYPE **out_pmt, BYTE *out_scc) override;
 
+    // WVC 0.14: after SetFormat — reconnect with the new size if the pin is already connected
+    void    reconnectFor(const VideoFormat& f);
+    HRESULT copyConnectedType(AM_MEDIA_TYPE **out_pmt);
+
 private:
-    const bool  m_valid;
-    const int   m_width;
-    const int   m_height;
     uint64_t    m_frame_counter = 0;
-    std::unique_ptr<uint8_t[]>  m_screenshot;   // WVC: the placeholder frame (DIB), built when first needed
+    std::unique_ptr<uint8_t[]>  m_screenshot;   // WVC: the placeholder frame (DIB rw x rh), built when first needed
+    int         m_ph_w = 0;
+    int         m_ph_h = 0;
     bool        m_placeholder_ready = false;
-    void        buildPlaceholder();
+    void        buildPlaceholder(int w, int h);
+    std::vector<uint8_t> m_scratch;             // when the sample is smaller than the frame
 
     CCritSec m_critsec;
-    CRefTime m_sample_time;
-    long m_interval_time_msec = 10;
+    LONGLONG m_sample_time = 0;                  // 100 ns
+    long m_interval_time_msec = 33;
+    Timer   m_run_timer;                         // since the first sample of this run
+    Timer   m_pace_timer;                        // since the last delivered sample
+    bool    m_first_sample = true;
 
     Softcam*        getParent();
 };

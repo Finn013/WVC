@@ -117,6 +117,56 @@ SharedMemory::open(const char* name)
     return SharedMemory(name);
 }
 
+SharedMemory
+SharedMemory::createOrOpen(const char* name, unsigned long size, bool* existed)
+{
+    SharedMemory m;
+    if (existed) *existed = false;
+    m.m_handle.reset(
+        CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, size, name),
+        closeHandle);
+    const DWORD err = GetLastError();
+    if (!m.m_handle)
+    {
+        m.release();
+        return m;
+    }
+    if (err == ERROR_ALREADY_EXISTS)
+    {
+        if (existed) *existed = true;
+        m.mapExisting();  // the size is the one the block was created with
+        return m;
+    }
+    m.m_address.reset(
+        MapViewOfFile(m.m_handle.get(), FILE_MAP_WRITE, 0, 0, 0),
+        unmap);
+    if (m.m_address)
+    {
+        m.m_size = size;
+        return m;
+    }
+    m.release();
+    return m;
+}
+
+void
+SharedMemory::mapExisting()
+{
+    m_address.reset(
+        MapViewOfFile(m_handle.get(), FILE_MAP_WRITE, 0, 0, 0),
+        unmap);
+    if (m_address)
+    {
+        MEMORY_BASIC_INFORMATION meminfo;
+        if (0 < VirtualQuery(m_address.get(), &meminfo, sizeof(meminfo)))
+        {
+            m_size = (unsigned long)meminfo.RegionSize;
+            return;
+        }
+    }
+    release();
+}
+
 SharedMemory::SharedMemory(const char* name, unsigned long size)
 {
     m_handle.reset(
@@ -143,18 +193,8 @@ SharedMemory::SharedMemory(const char* name)
         closeHandle);
     if (m_handle)
     {
-        m_address.reset(
-            MapViewOfFile(m_handle.get(), FILE_MAP_WRITE, 0, 0, 0),
-            unmap);
-        if (m_address)
-        {
-            MEMORY_BASIC_INFORMATION meminfo;
-            if (0 < VirtualQuery(m_address.get(), &meminfo, sizeof(meminfo)))
-            {
-                m_size = (unsigned long)meminfo.RegionSize;
-                return;
-            }
-        }
+        mapExisting();
+        return;
     }
     release();
 }

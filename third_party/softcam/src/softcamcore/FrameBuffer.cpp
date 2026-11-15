@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <mutex> // lock_guard
 #include <cstring>
+#include <algorithm>
+#include <vector>
 
 
 namespace softcam {
@@ -52,22 +54,58 @@ FrameBuffer FrameBuffer::create(
         return fb;
     }
 
-    auto shmem_size = calcMemorySize((uint16_t)width, (uint16_t)height);
-    fb.m_shmem = SharedMemory::create(SharedMemoryName, shmem_size);
+    // WVC 0.14: the block is made big enough for any WVC output (up to 1920x1920), so that a block still held by
+    // Zoom/Telegram after WVC restarted its camera can be taken over at a new size instead of failing
+    const uint32_t needed = calcMemorySize((uint16_t)width, (uint16_t)height);
+    const uint32_t shmem_size = (std::max)(needed, calcMemorySize(1920, 1920));
+    bool existed = false;
+    fb.m_shmem = SharedMemory::createOrOpen(SharedMemoryName, shmem_size, &existed);
+    if (fb.m_shmem && existed)
+    {
+        // somebody (a camera user, or a WVC that crashed) still holds the block
+        bool ok = fb.m_shmem.size() >= needed && fb.m_shmem.size() >= sizeof(Header);
+        if (ok)
+        {
+            uint8_t beat = 0, active = 0;
+            {
+                std::lock_guard<NamedMutex> lock(fb.m_mutex);
+                active = fb.header()->m_is_active;
+                beat = fb.header()->m_watchdog_sender_heartbeat;
+            }
+            if (active)
+            {
+                // still active: take it over only if its sender is dead (no heartbeat for 3 periods)
+                Timer::sleep(WATCHDOG_HEARTBEAT_INTERVAL * 4);
+                std::lock_guard<NamedMutex> lock(fb.m_mutex);
+                ok = fb.header()->m_is_active == 0 || fb.header()->m_watchdog_sender_heartbeat == beat;
+            }
+        }
+        if (!ok)
+        {
+            fb.m_shmem = {};
+            return fb;
+        }
+    }
     if (fb.m_shmem)
     {
         std::lock_guard<NamedMutex> lock(fb.m_mutex);
 
         auto frame = fb.header();
+        const uint64_t old_counter = existed ? frame->m_frame_counter : 0;
         frame->m_image_offset = sizeof(Header);
         frame->m_width = (uint16_t)width;
         frame->m_height = (uint16_t)height;
         frame->m_framerate = framerate;
         frame->m_is_active = 1;
-        frame->m_connected_min_version = 0;
-        frame->m_watchdog_sender_heartbeat = 0;
-        frame->m_watchdog_receiver_heartbeat = 0;
-        frame->m_frame_counter = 0;
+        if (!existed)
+        {
+            frame->m_connected_min_version = 0;
+            frame->m_watchdog_sender_heartbeat = 0;
+            frame->m_watchdog_receiver_heartbeat = 0;
+        }
+        // keep counting up on a takeover, so a waiting receiver sees the next frame as new
+        frame->m_frame_counter = old_counter;
+        std::memset(frame->imageData(), 0, (std::size_t)3 * width * height);
 
         auto mutex = fb.m_mutex;
         fb.m_sender_watchdog = Watchdog::createHeartbeat(
@@ -87,6 +125,11 @@ FrameBuffer FrameBuffer::create(
             });
     }
     return fb;
+}
+
+FrameBuffer FrameBuffer::none()
+{
+    return FrameBuffer(NamedMutexName);
 }
 
 FrameBuffer FrameBuffer::open()
@@ -264,35 +307,72 @@ void FrameBuffer::transferToDIB(void* image_bits, uint64_t* out_frame_counter)
 void FrameBuffer::transferToDIBScaled(void* image_bits, int dw, int dh, uint64_t* out_frame_counter)
 {
     const int dstride = (dw * 3 + 3) & ~3;
+    transferToDIBRect(image_bits, dstride, dh, 0, 0, dw, dh, out_frame_counter);
+}
+
+void FrameBuffer::transferToDIBRect(void* image_bits, int dstride, int rows,
+                                    int rx, int ry, int rw, int rh, uint64_t* out_frame_counter)
+{
     std::uint8_t* dest = (std::uint8_t*)image_bits;
-    std::memset(dest, 0, (std::size_t)dstride * (std::size_t)dh);
-    if (!m_shmem || dw <= 0 || dh <= 0)
+    if (!dest || dstride <= 0 || rows <= 0 || rw <= 0 || rh <= 0 || rx < 0 || ry < 0 ||
+        ry + rh > rows || (rx + rw) * 3 > dstride)
     {
+        *out_frame_counter = 0;
+        return;
+    }
+    auto rowPtr = [&](int y) { return dest + (std::size_t)dstride * (std::size_t)(rows - 1 - y); };  // y: top-down
+    if (!m_shmem)
+    {
+        for (int y = ry; y < ry + rh; y++) std::memset(rowPtr(y) + (std::size_t)rx * 3, 0, (std::size_t)rw * 3);
         *out_frame_counter = 0;
         return;
     }
     std::lock_guard<NamedMutex> lock(m_mutex);
     auto frame = header();
     const int sw = frame->m_width, sh = frame->m_height;
-    // fit
-    int fw = dw, fh = (int)((long long)dw * sh / (sw ? sw : 1));
-    if (fh > dh)
+    if (sw <= 0 || sh <= 0 || (uint64_t)m_shmem.size() < (uint64_t)frame->m_image_offset + 3ull * sw * sh)
     {
-        fh = dh;
-        fw = (int)((long long)dh * sw / (sh ? sh : 1));
+        for (int y = ry; y < ry + rh; y++) std::memset(rowPtr(y) + (std::size_t)rx * 3, 0, (std::size_t)rw * 3);
+        *out_frame_counter = frame->m_frame_counter;
+        return;
+    }
+    // fit, keeping proportions (black bars)
+    int fw = rw, fh = (int)((long long)rw * sh / sw);
+    if (fh > rh)
+    {
+        fh = rh;
+        fw = (int)((long long)rh * sw / sh);
     }
     if (fw < 1) fw = 1;
     if (fh < 1) fh = 1;
-    const int ox = (dw - fw) / 2, oy = (dh - fh) / 2;
+    if (fw > rw) fw = rw;
+    if (fh > rh) fh = rh;
+    const int ox = (rw - fw) / 2, oy = (rh - fh) / 2;
     const std::uint8_t* image = frame->imageData();
-    for (int y = 0; y < fh; y++)
+    thread_local std::vector<int> xs;
+    xs.resize((std::size_t)fw);
+    for (int x = 0; x < fw; x++) xs[(std::size_t)x] = 3 * (int)((long long)x * sw / fw);
+    for (int y = 0; y < rh; y++)
     {
-        const int sy = (int)((long long)y * sh / fh);              // top-down source row
-        std::uint8_t* d = dest + (std::size_t)dstride * (std::size_t)(dh - 1 - (oy + y)) + (std::size_t)ox * 3;
+        std::uint8_t* d = rowPtr(ry + y) + (std::size_t)rx * 3;
+        if (y < oy || y >= oy + fh)
+        {
+            std::memset(d, 0, (std::size_t)rw * 3);
+            continue;
+        }
+        if (ox > 0) std::memset(d, 0, (std::size_t)ox * 3);
+        if (rw - ox - fw > 0) std::memset(d + (std::size_t)(ox + fw) * 3, 0, (std::size_t)(rw - ox - fw) * 3);
+        d += (std::size_t)ox * 3;
+        const int sy = (int)((long long)(y - oy) * sh / fh);         // top-down source row
         const std::uint8_t* srow = image + (std::size_t)3 * sw * sy;
+        if (fw == sw)
+        {
+            std::memcpy(d, srow, (std::size_t)3 * fw);
+            continue;
+        }
         for (int x = 0; x < fw; x++)
         {
-            const std::uint8_t* s = srow + (std::size_t)3 * ((long long)x * sw / fw);
+            const std::uint8_t* s = srow + xs[(std::size_t)x];
             d[0] = s[0];
             d[1] = s[1];
             d[2] = s[2];

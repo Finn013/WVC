@@ -202,23 +202,140 @@ static int RunElevated(const wchar_t* args) {
     return static_cast<int>(code);
 }
 
-int CameraInstallState() {
+// ---------------------------------------------------------------------------
+// 0.14: which WVCCam.dll is registered (64- and 32-bit views) and is it this folder's, of this version
+// ---------------------------------------------------------------------------
+static std::wstring NormPath(std::wstring p) {
+    while (!p.empty() && (p.front() == L'"' || p.front() == L' ')) p.erase(p.begin());
+    while (!p.empty() && (p.back() == L'"' || p.back() == L' ')) p.pop_back();
+    if (p.empty()) return p;
+    wchar_t buf[2048] = {};
+    if (ExpandEnvironmentStringsW(p.c_str(), buf, 2048) && buf[0]) p = buf;
+    wchar_t full[2048] = {};
+    if (GetFullPathNameW(p.c_str(), 2048, full, nullptr)) p = full;
+    wchar_t lng[2048] = {};
+    if (GetLongPathNameW(p.c_str(), lng, 2048)) p = lng;
+    return p;
+}
+
+// "0.14.0.0", "" when the file has no version (0.13 and older), "нет файла" when it is missing
+static std::wstring DllVersion(const std::wstring& path) {
+    if (path.empty()) return L"";
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return L"нет файла";
+    DWORD dummy = 0;
+    const DWORD n = GetFileVersionInfoSizeW(path.c_str(), &dummy);
+    if (!n) return L"";
+    std::vector<uint8_t> buf(n);
+    if (!GetFileVersionInfoW(path.c_str(), 0, n, buf.data())) return L"";
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&fi), &len) || !fi || len < sizeof(VS_FIXEDFILEINFO)) return L"";
+    return std::to_wstring(HIWORD(fi->dwFileVersionMS)) + L"." + std::to_wstring(LOWORD(fi->dwFileVersionMS)) + L"." +
+           std::to_wstring(HIWORD(fi->dwFileVersionLS)) + L"." + std::to_wstring(LOWORD(fi->dwFileVersionLS));
+}
+
+static std::wstring RegisteredDll(bool wow32) {
     std::wstring key = std::wstring(L"CLSID\\") + kCamClsid + L"\\InprocServer32";
     HKEY hk;
-    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, key.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &hk) != ERROR_SUCCESS) return 0;
-    wchar_t buf[MAX_PATH * 2] = {};
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, key.c_str(), 0, KEY_READ | (wow32 ? KEY_WOW64_32KEY : KEY_WOW64_64KEY), &hk) != ERROR_SUCCESS)
+        return L"";
+    wchar_t buf[MAX_PATH * 4] = {};
     DWORD size = sizeof(buf) - sizeof(wchar_t), type = 0;
     LONG rc = RegQueryValueExW(hk, nullptr, nullptr, &type, reinterpret_cast<BYTE*>(buf), &size);
     RegCloseKey(hk);
-    if (rc != ERROR_SUCCESS) return 0;
-    std::wstring mine = ExeDir() + L"\\WVCCam.dll";
-    return _wcsicmp(buf, mine.c_str()) == 0 ? 1 : 2;
+    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return L"";
+    return buf;
+}
+
+struct CamRegCheck {
+    std::wstring reg64, reg32, ver64, ver32;      // registered path / its file version
+    std::wstring mine64, mine32, myVer64, myVer32; // next to WVC.exe
+    bool installed = false;  // 64-bit registration exists
+    bool bad64 = false, bad32 = false;
+    bool localOld = false;   // WVCCam.dll next to WVC.exe is not this version (a locked file was not replaced)
+};
+
+static std::wstring ExpectedDllVersion() { return std::wstring(WVC_VERSION) + L".0.0"; }
+
+static CamRegCheck CheckCamReg() {
+    CamRegCheck c;
+    const std::wstring dir = ExeDir();
+    c.mine64 = NormPath(dir + L"\\WVCCam.dll");
+    c.mine32 = NormPath(dir + L"\\WVCCam32.dll");
+    c.myVer64 = DllVersion(c.mine64);
+    c.myVer32 = DllVersion(c.mine32);
+    c.reg64 = NormPath(RegisteredDll(false));
+    c.reg32 = NormPath(RegisteredDll(true));
+    c.ver64 = DllVersion(c.reg64);
+    c.ver32 = DllVersion(c.reg32);
+    c.installed = !c.reg64.empty();
+    c.bad64 = c.installed && (_wcsicmp(c.reg64.c_str(), c.mine64.c_str()) != 0 || c.ver64 != c.myVer64);
+    // a 32-bit part that was never registered is not an error (only a warning at install time)
+    c.bad32 = !c.reg32.empty() && (_wcsicmp(c.reg32.c_str(), c.mine32.c_str()) != 0 || c.ver32 != c.myVer32);
+    c.localOld = c.myVer64 != ExpectedDllVersion();
+    return c;
+}
+
+static ULONGLONG g_camRegAt = 0;
+static int g_camRegState = 0;
+
+// 0 not installed, 1 installed from this folder (this version), 2 another folder or another version
+int CameraInstallState() {
+    const ULONGLONG now = GetTickCount64();
+    if (g_camRegAt && now - g_camRegAt < 5000) return g_camRegState;
+    const CamRegCheck c = CheckCamReg();
+    g_camRegState = !c.installed ? 0 : (c.bad64 || c.bad32) ? 2 : 1;
+    g_camRegAt = now;
+    return g_camRegState;
+}
+
+static std::wstring VerText(const std::wstring& v) { return v.empty() ? L"без версии (0.13 или старше)" : v; }
+
+// at startup: write what is registered to the log; offer to re-register when it is not this folder's DLL
+void CheckCameraRegistration() {
+    const CamRegCheck c = CheckCamReg();
+    LogMsg(L"WVCCam.dll рядом с WVC.exe: " + c.mine64 + L", версия " + VerText(c.myVer64) + L"; WVCCam32.dll: " +
+           VerText(c.myVer32));
+    LogMsg(L"Камера в реестре, 64-бит: " + (c.reg64.empty() ? std::wstring(L"не зарегистрирована") : c.reg64 + L", версия " + VerText(c.ver64)) +
+           (c.bad64 ? L" — НЕ совпадает" : L""));
+    LogMsg(L"Камера в реестре, 32-бит: " + (c.reg32.empty() ? std::wstring(L"не зарегистрирована") : c.reg32 + L", версия " + VerText(c.ver32)) +
+           (c.bad32 ? L" — НЕ совпадает" : L""));
+    g_camRegAt = 0;
+    if (c.localOld) {
+        LogErr(L"WVCCam.dll рядом с WVC.exe не версии " WVC_VERSION L" (" + VerText(c.myVer64) +
+               L") — файл, видимо, был занят при распаковке");
+        MessageBoxW(g_main,
+                    (L"Файл камеры WVCCam.dll рядом с WVC.exe — не версии " WVC_VERSION L" (" + VerText(c.myVer64) +
+                     L").\n\nСкорее всего, при распаковке он был занят: Zoom, Telegram или браузер держали камеру открытой.\n\n"
+                     L"Закройте WVC, полностью закройте Zoom/Telegram/браузер (в Zoom — значок в трее → «Выйти») и распакуйте "
+                     L"WVC.zip поверх ещё раз.")
+                        .c_str(),
+                    L"WVC — старый файл камеры", MB_ICONWARNING);
+        return;
+    }
+    if (!(c.bad64 || c.bad32)) return;
+    std::wstring t = L"Камера «WVC Camera» зарегистрирована из другой папки или старой версии.\n\n";
+    if (c.bad64) t += L"64-бит: " + c.reg64 + L" (версия " + VerText(c.ver64) + L")\n";
+    if (c.bad32) t += L"32-бит: " + c.reg32 + L" (версия " + VerText(c.ver32) + L")\n";
+    t += L"Эта копия WVC: " + ExeDir() + L" (версия " WVC_VERSION L")\n\n"
+         L"Из-за этого Zoom и другие программы могут не запускать камеру. Переустановить камеру из этой папки?\n"
+         L"(Windows попросит права администратора. Потом перезапустите Zoom/Telegram/браузер.)";
+    if (MessageBoxW(g_main, t.c_str(), L"WVC — переустановить камеру?", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        LogMsg(L"Переустановка камеры из этой папки (по запросу при запуске)");
+        DoInstall(true);
+        const CamRegCheck d = CheckCamReg();
+        LogMsg(L"После переустановки, 64-бит: " + (d.reg64.empty() ? std::wstring(L"не зарегистрирована") : d.reg64 + L", версия " + VerText(d.ver64)) +
+               L"; 32-бит: " + (d.reg32.empty() ? std::wstring(L"не зарегистрирована") : d.reg32 + L", версия " + VerText(d.ver32)));
+    } else {
+        LogMsg(L"Переустановку камеры отложили");
+    }
 }
 
 void DoInstall(bool install) {
     if (!install && MessageBoxW(g_main, L"Удалить камеру «WVC Camera» из системы?", L"WVC", MB_YESNO | MB_ICONQUESTION) != IDYES)
         return;
     const int rc = RunElevated(install ? L"--register" : L"--unregister");
+    g_camRegAt = 0;
     if (rc == -2) return;
     wchar_t buf[256];
     if (install) {

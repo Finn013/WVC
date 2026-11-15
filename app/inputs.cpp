@@ -376,7 +376,7 @@ struct WebcamInput : Input {
         CamWanted(link, &wantMode, &wantRgb);
         CamMode chosen;
         int result = 0;
-        const int autoFps = g_camFps > 0 ? g_camFps : 30;
+        const int autoFps = g_outFps > 0 ? g_outFps : 30;
         do {
             if (FAILED(MFCreateAttributes(&a, 2))) break;
             a->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
@@ -435,7 +435,7 @@ struct WebcamInput : Input {
                     if (modes[i].Key() == wantMode) best = static_cast<int>(i);
             if (best < 0) {
                 const int wantFps = autoFps;
-                const int targetH = std::clamp(g_camH > 0 ? (std::min)(g_camH, g_camW) : 1080, 480, 1080);
+                const int targetH = std::clamp(g_outH > 0 ? (std::min)(g_outH, g_outW) : 1080, 480, 1080);
                 double bs = 1e300;
                 for (size_t i = 0; i < modes.size(); ++i) {
                     const double sc = Score(modes[i], wantFps, targetH);
@@ -501,7 +501,7 @@ struct WebcamInput : Input {
                     std::wstring m;
                     bool rgb;
                     CamWanted(link, &m, &rgb);
-                    if (m != openedMode || rgb != wantRgb || (m.empty() && g_camFps > 0 && g_camFps != autoFps)) {
+                    if (m != openedMode || rgb != wantRgb || (m.empty() && g_outFps > 0 && g_outFps != autoFps)) {
                         LogMsg(L"Веб-камера: меняю режим");
                         result = 2;
                         break;
@@ -1708,7 +1708,7 @@ static std::shared_ptr<Input> CreateInput(const Item& it, const std::wstring& ke
         p->wantSrc = it.phoneSrc;
         p->wantRes = it.phoneRes;
         p->wantCodec = it.phoneCodec;
-        p->wantFps = g_camFps >= 50 ? 60 : 30;
+        p->wantFps = g_outFps >= 50 ? 60 : 30;
         in = p;
     }
     if (in) in->key = key;

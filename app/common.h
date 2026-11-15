@@ -1,4 +1,4 @@
-// WVC 0.13 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
+// WVC 0.14 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
 // Общие объявления для всех файлов приложения.
 #pragma once
 
@@ -40,8 +40,8 @@
 #include <thread>
 #include <vector>
 
-#define WVC_VERSION L"0.13"
-#define WVC_VERSION_NUM 13  // minor number, for the update check
+#define WVC_VERSION L"0.14"
+#define WVC_VERSION_NUM 14  // minor number, for the update check
 
 template <class T> static inline void SafeRelease(T*& p) {
     if (p) {
@@ -497,9 +497,10 @@ bool NativeSize(int uid, int* w, int* h);  // last native size seen by the rende
 void SetNativeSize(int uid, int w, int h);
 void RenderStart();
 void RenderStop();
-extern int g_camW, g_camH, g_camFps;
+extern std::atomic<int> g_camW, g_camH, g_camFps;  // the camera actually created (set only when scCreateCamera worked)
+extern int g_outW, g_outH, g_outFps;               // the format the render thread works in (what the camera should be)
 bool IsValidFps(int f);  // 24 / 30 / 50 / 60
-extern bool g_camOk;
+extern std::atomic<bool> g_camOk;
 bool CameraDllLoaded();
 bool LoadCameraDll();
 struct RectD {
@@ -599,6 +600,7 @@ bool AutostartOn();
 bool SetAutostart(bool on);
 void DoInstall(bool install);
 int CameraInstallState();
+void CheckCameraRegistration();  // 0.14: at startup — log the registered DLLs, offer to re-register
 void DoExportJson(HWND owner);
 void DoImportJson(HWND owner);
 void ReloadAfterImport();
