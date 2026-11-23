@@ -334,7 +334,8 @@ struct CamMode {
     std::wstring Key() const;    // "1280x720@30.00/MJPG"
     std::wstring Label() const;  // "1280×720, 30 к/с, MJPG"
 };
-std::vector<CamMode> CamModesFor(const std::wstring& link);  // seen when the camera was last opened
+std::vector<CamMode> CamModesFor(const std::wstring& link);
+void WebcamRestart(const std::wstring& link);  // «Перезапустить камеру»: reopen the device (after Zoom & co.)  // seen when the camera was last opened
 struct InputStats {
     bool exists = false;
     int status = 0, fpsX10 = 0, w = 0, h = 0;

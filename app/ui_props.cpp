@@ -17,7 +17,7 @@ enum {
     P_IMAGE, P_IMAGE_BTN,
     P_ASPECT, P_FIT, P_CROP0, P_CROP0_UD, P_CROP1, P_CROP1_UD, P_CROP2, P_CROP2_UD, P_CROP3, P_CROP3_UD,
     P_ROT, P_MIRROR, P_ZOOM, P_ZOOM_UD, P_SHAPE, P_RADIUS, P_FEATHER, P_MASK, P_MASK_BTN, P_OPACITY, P_BORDER,
-    P_WINFRAME, P_CC_EXP, P_CC_EXPV, P_CC_BR, P_CC_BRV, P_CC_WB, P_CC_WBV, P_CC_NOTE, P_CC_MODE, P_CC_RGB, P_CC_STAT,
+    P_WINFRAME, P_CC_EXP, P_CC_EXPV, P_CC_BR, P_CC_BRV, P_CC_WB, P_CC_WBV, P_CC_NOTE, P_CC_MODE, P_CC_RGB, P_CC_STAT, P_CC_RESTART,
     P_LAST
 };
 const UINT_PTR kTimerProps = 7;
@@ -476,7 +476,9 @@ void UpdateLive() {
         FillCamModes(false);
         const InputStats st = InputStatsFor(InputKeyOf(g_ps->edit));
         std::wstring t;
-        if (!st.exists || st.status != 2) {
+        if (st.exists && st.status != 2 && st.info.rfind(L"Камера ", 0) == 0) {
+            t = st.info;  // busy / not answering
+        } else if (!st.exists || st.status != 2) {
             t = L"Камера сейчас выключена.";
         } else {
             wchar_t b[200];
@@ -875,6 +877,10 @@ void OnCommand(int id, int code) {
     }
     }
     if (s.syncing) return;
+    if (id == P_CC_RESTART && code == BN_CLICKED) {
+        if (!s.edit.camLink.empty()) WebcamRestart(s.edit.camLink);
+        return;
+    }
     if ((id == P_CC_MODE && code == CBN_SELCHANGE) || (id == P_CC_RGB && code == BN_CLICKED)) {
         CamModeFromControls();
         FillCamModes(true);
@@ -1023,9 +1029,12 @@ void BuildForm(PropsState& s) {
         keep(P_CC_MODE, f.Combo(L"Режим:", P_CC_MODE, {}));
         keep(P_CC_RGB, f.Check(L"Совместимое преобразование цвета (RGB32, как в 0.12; медленнее)", P_CC_RGB));
         keep(P_CC_STAT, f.Row(L"Сейчас:", L"STATIC", L"", SS_LEFT, P_CC_STAT, 40));
+        keep(P_CC_RESTART, f.Make(L"BUTTON", L"Перезапустить камеру", WS_TABSTOP | BS_PUSHBUTTON, P_CC_RESTART, f.cx, f.y, 200, 28));
+        f.y += 34;
         f.Hint(L"«Авто» выбирает режим с частотой не ниже выбранной для камеры WVC (MJPG/NV12 при HD — быстрее YUY2). "
                L"Список появляется, когда камера включится (например, при открытом предпросмотре). Сохраняется для этой "
-               L"камеры.", 3);
+               L"камеры. Если в списке нет 60 к/с — их не даёт драйвер камеры (часто: порт USB 2.0 или эффекты Windows "
+               L"Studio). Камеру занял Zoom — выберите в Zoom «WVC Camera» и нажмите «Перезапустить камеру».", 4);
         break;
     case IT_MEDIA: {
         f.Header(L"Медиафайлы (картинки, GIF, видео без звука)");

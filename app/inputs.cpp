@@ -320,13 +320,45 @@ static void CamWanted(const std::wstring& link, std::wstring* mode, bool* rgb) {
 // ---------------------------------------------------------------------------
 // Webcam: native format with the needed frame rate, YUV converted by WVC (parallel) straight into a shared frame
 // ---------------------------------------------------------------------------
+static std::wstring HrText(HRESULT hr) {
+    wchar_t b[16];
+    swprintf(b, 16, L"0x%08X", static_cast<unsigned>(hr));
+    return b;
+}
+// a camera held by Zoom / Teams / another app: the text shown in «Сейчас:» while WVC keeps retrying
+static std::wstring BusyText(HRESULT hr) {
+    const unsigned u = static_cast<unsigned>(hr);
+    const bool busy = u == 0xC00DABE0u /*MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED*/ ||
+                      u == 0xC00DABE1u /*MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED*/ || u == 0x80070020u /*sharing violation*/ ||
+                      u == 0x800700AAu /*busy*/;
+    return busy ? L"Камера занята другой программой (Zoom?). В Zoom выберите «WVC Camera» — WVC подхватит камеру сама."
+                : L"Камера не отвечает (" + HrText(hr) + L"). Повтор каждые 3 с или «Перезапустить камеру».";
+}
+
 namespace {
 const GUID kLowLatencyAttr = {0x9c27891a, 0xed7a, 0x40e1, {0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee}};
 
 struct WebcamInput : Input {
     std::wstring link;
+    // the open device: another thread may shut it down so a ReadSample stuck on a busy camera returns at once
+    std::mutex smx;
+    IMFMediaSource* live = nullptr;
+    std::atomic<bool> restartNow{false};       // «Перезапустить камеру»: reopen at once, not after 3 s
+    std::atomic<ULONGLONG> sessionAt{0};       // when the current session opened the device (0 = none)
+    void Kick(bool reopen) {
+        if (reopen) restartNow = true;
+        std::lock_guard<std::mutex> lk(smx);
+        if (live) live->Shutdown();
+    }
+    void Halt() override {
+        stop = true;
+        Kick(false);
+        if (th.joinable()) th.join();
+        status = 0;
+    }
     void Start() override {
         stop = false;
+        restartNow = false;
         status = 1;
         if (g_hideGlare) gateArm = true;
         th = std::thread([this] { Run(); });
@@ -365,7 +397,7 @@ struct WebcamInput : Input {
         IMFSourceReader* rd = nullptr;
         IMFMediaType* outType = nullptr;
         IMFMediaType* cur = nullptr;
-        const DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+        DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
         bool ok = false;
         UINT32 fw = 0, fh = 0;
         LONG defStride = 0;
@@ -381,10 +413,18 @@ struct WebcamInput : Input {
             if (FAILED(MFCreateAttributes(&a, 2))) break;
             a->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
             a->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, link.c_str());
-            if (FAILED(MFCreateDeviceSource(a, &src))) {
-                if (round == 0) LogErr(L"Веб-камера не открылась: " + link.substr(0, 80));
+            const HRESULT hrOpen = MFCreateDeviceSource(a, &src);
+            if (FAILED(hrOpen)) {
+                if (round == 0) LogErr(L"Веб-камера не открылась (" + HrText(hrOpen) + L"): " + link.substr(0, 80));
+                std::lock_guard<std::mutex> lk(mx);
+                info = BusyText(hrOpen);
                 break;
             }
+            {
+                std::lock_guard<std::mutex> lk(smx);
+                live = src;
+            }
+            sessionAt = GetTickCount64();
             CamCtlOpened(link, src);
             if (FAILED(MFCreateAttributes(&ra, 3))) break;
             ra->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
@@ -392,10 +432,20 @@ struct WebcamInput : Input {
             if (FAILED(MFCreateSourceReaderFromMediaSource(src, ra, &rd))) break;
             // native formats
             std::vector<CamMode> modes;
-            std::vector<DWORD> idx;
+            std::vector<DWORD> idx, sidx;
+            // some cameras put their fast (60 к/с) formats on a second video stream: read them all
+            for (DWORD sn = 0; sn < 8; ++sn) {
+            BOOL selDummy = FALSE;
+            if (FAILED(rd->GetStreamSelection(sn, &selDummy))) break;
             for (DWORD i = 0;; ++i) {
                 IMFMediaType* t = nullptr;
-                if (FAILED(rd->GetNativeMediaType(stream, i, &t))) break;
+                if (FAILED(rd->GetNativeMediaType(sn, i, &t))) break;
+                GUID major{};
+                t->GetGUID(MF_MT_MAJOR_TYPE, &major);
+                if (major != MFMediaType_Video) {
+                    t->Release();
+                    break;
+                }
                 CamMode m;
                 GUID sub{};
                 t->GetGUID(MF_MT_SUBTYPE, &sub);
@@ -412,6 +462,14 @@ struct WebcamInput : Input {
                 if (!m.w || !m.h) continue;
                 modes.push_back(m);
                 idx.push_back(i);
+                sidx.push_back(sn);
+            }
+            }
+            if (round == 0 && !modes.empty()) {  // what the driver really offers: the answer to «где 60 к/с?»
+                double top = 0;
+                for (const auto& m : modes) top = (std::max)(top, m.Fps());
+                LogMsg(L"Веб-камера: драйвер даёт " + std::to_wstring(modes.size()) + L" режимов, максимум " +
+                       std::to_wstring(static_cast<int>(std::lround(top))) + L" к/с");
             }
             {
                 // the list for «Свойства» (unique by key, sorted: bigger first, then faster)
@@ -448,6 +506,9 @@ struct WebcamInput : Input {
             }
             if (best >= 0) {
                 chosen = modes[static_cast<size_t>(best)];
+                stream = sidx[static_cast<size_t>(best)];
+                rd->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+                rd->SetStreamSelection(stream, TRUE);
                 IMFMediaType* t = nullptr;
                 if (SUCCEEDED(rd->GetNativeMediaType(stream, idx[static_cast<size_t>(best)], &t))) {
                     if (chosen.num && (chosen.num != 0)) MFSetAttributeRatio(t, MF_MT_FRAME_RATE, chosen.num, chosen.den);
@@ -513,7 +574,15 @@ struct WebcamInput : Input {
                 HRESULT hr = rd->ReadSample(stream, 0, &si, &flags, &ts, &sample);
                 if (FAILED(hr) || (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
                     SafeRelease(sample);
-                    LogErr(L"Веб-камера перестала отдавать кадры");
+                    if (stop) break;
+                    if (restartNow.exchange(false)) {
+                        LogMsg(L"Веб-камера: перезапуск");
+                        result = 2;
+                        break;
+                    }
+                    LogErr(L"Веб-камера перестала отдавать кадры" + (FAILED(hr) ? L" (" + HrText(hr) + L")" : std::wstring()));
+                    std::lock_guard<std::mutex> lk(mx);
+                    info = BusyText(hr);
                     break;
                 }
                 if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
@@ -530,6 +599,12 @@ struct WebcamInput : Input {
         SafeRelease(rd);
         SafeRelease(ra);
         CamCtlClosed(link);
+        {
+            std::lock_guard<std::mutex> lk(smx);
+            live = nullptr;
+        }
+        sessionAt = 0;
+        if (restartNow.exchange(false) && !stop) result = 2;  // the button was pressed while opening
         if (src) src->Shutdown();
         SafeRelease(src);
         SafeRelease(a);
@@ -1830,6 +1905,16 @@ void InputsSync() {
         for (auto& kv : g_inputs) all.push_back(kv.second);
     }
     for (auto& in : all) {
+        // a camera taken over by another app may stop sending frames without any error: wake it up
+        if (auto* wc = dynamic_cast<WebcamInput*>(in.get())) {
+            const ULONGLONG t0 = wc->sessionAt, now2 = GetTickCount64(), lf = wc->lastFrameAt;
+            const ULONGLONG since = (std::max)(t0, lf);
+            if (t0 && (in->status == 1 || in->status == 2) && now2 > since + 5000) {
+                LogMsg(L"Веб-камера: 5 с без кадров — переоткрываю");
+                wc->sessionAt = 0;  // once per session
+                wc->Kick(true);
+            }
+        }
         if (in->status == 3 && GetTickCount64() - in->failedAt >= 3000) {
             in->Halt();
             in->Start();
@@ -1837,6 +1922,15 @@ void InputsSync() {
             in->Start();
         }
         if (auto* ph = dynamic_cast<PhoneInput*>(in.get())) ph->SyncWanted();
+    }
+}
+
+void WebcamRestart(const std::wstring& link) {
+    if (auto in = GetInput(L"cam|" + link)) {
+        if (auto* wc = dynamic_cast<WebcamInput*>(in.get())) {
+            if (in->status == 3) in->failedAt = 0;  // failed: the next tick starts it again
+            else wc->Kick(true);
+        }
     }
 }
 
