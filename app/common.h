@@ -1,4 +1,4 @@
-// WVC 0.14 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
+// WVC 0.15 — лёгкая виртуальная камера в стиле OBS: сцены, любое число источников, размещение мышью.
 // Общие объявления для всех файлов приложения.
 #pragma once
 
@@ -40,8 +40,8 @@
 #include <thread>
 #include <vector>
 
-#define WVC_VERSION L"0.14"
-#define WVC_VERSION_NUM 14  // minor number, for the update check
+#define WVC_VERSION L"0.15"
+#define WVC_VERSION_NUM 15  // minor number, for the update check
 
 template <class T> static inline void SafeRelease(T*& p) {
     if (p) {
